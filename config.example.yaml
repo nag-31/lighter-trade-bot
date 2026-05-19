@@ -1,0 +1,32 @@
+filters:
+  min_notional_usd: 1000
+
+recaps:
+  daily_utc_hour: 23
+  weekly_day: sunday   # UTC
+  weekly_utc_hour: 21
+
+triggers:
+  on_position_open: true
+  on_position_close: true
+  on_position_size_change: true
+
+links:
+  pool_url_template: "https://lighter.xyz/pools/{pool_id}"
+
+# Lighter market_id is numeric. We map the resolved symbol (e.g. "BTC") to a
+# tradingview symbol for chart-img.com. Override per-market here; the default
+# template assumes BINANCE:<SYMBOL>USDT.
+chart:
+  enabled: true
+  interval: "1h"
+  symbol_template: "BINANCE:{symbol}USDT"
+  symbol_overrides: {}   # e.g. {kPEPE: "BINANCE:PEPEUSDT"}
+  width: 1280
+  height: 720
+  theme: "dark"
+
+lighter:
+  ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
+  rest_base: "https://mainnet.zklighter.elliot.ai/api/v1"
+  rest_safety_poll_seconds: 60
