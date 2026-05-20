@@ -1,6 +1,7 @@
 from decimal import Decimal
+from typing import Optional
 
-from .types import Event, EventKind
+from .types import Event, EventKind, Position
 
 
 def _fmt_price(p: Decimal) -> str:
@@ -25,7 +26,12 @@ def _direction_emoji(side: str) -> str:
     return "🟢 LONG" if side == "long" else "🔴 SHORT"
 
 
-def format_event(event: Event, pool_url: str) -> str:
+def _header(source_name: str) -> str:
+    """Leading label line so each alert identifies which pool/wallet it's from."""
+    return f"📍 {source_name}\n" if source_name else ""
+
+
+def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
     t = event.trade
     direction = _direction_emoji(t.side)
     verb = _verb(event.kind)
@@ -50,4 +56,25 @@ def format_event(event: Event, pool_url: str) -> str:
     if event.leverage is not None:
         body += f"  |  {event.leverage:g}x"
 
-    return f"{body}\n{pool_url}"
+    return f"{_header(source_name)}{body}\n{pool_url}"
+
+
+def format_aggregate(
+    position: Position,
+    net_added_usd: Decimal,
+    n_fills: int,
+    leverage: Optional[float],
+    pool_url: str,
+    source_name: str = "",
+) -> str:
+    """Message for a batched SIZE_CHANGE: N fills → resulting position."""
+    direction = _direction_emoji(position.side)
+    fill_word = "fill" if n_fills == 1 else "fills"
+    body = (
+        f"Added {direction} {position.market_symbol}\n"
+        f"+${net_added_usd:,.0f} across {n_fills} {fill_word} → position now ${position.notional_usd:,.0f}\n"
+        f"Avg entry: {_fmt_price(position.avg_entry_price)}"
+    )
+    if leverage is not None:
+        body += f"  |  {leverage:g}x"
+    return f"{_header(source_name)}{body}\n{pool_url}"

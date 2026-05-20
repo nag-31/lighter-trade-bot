@@ -1,7 +1,8 @@
 """Dashboard + Telegram notifier.
 
-Watches the Lighter pool via WebSocket, updates the local dashboard,
-and posts OPEN / CLOSE / SIZE_CHANGE events to Telegram.
+Watches every tracked pool/wallet listed in config.yaml (Lighter pools and
+Hyperliquid wallets) via WebSocket, updates the local dashboard, and posts
+OPEN / CLOSE / SIZE_CHANGE events to Telegram.
 
 Run with:  python -m src.dashboard
 Then open: http://localhost:8080/
@@ -22,19 +23,20 @@ import httpx
 from aiohttp import WSMsgType, web
 from dotenv import load_dotenv
 
+from pathlib import Path
+
+from .db import init_db, load_recent_events, save_event
 from .filters import passes_min_notional
-from .formatter import format_event
-from .lighter_client import LighterClient
-from .position_tracker import PositionTracker
-from .types import Event, Position, Trade
+from .formatter import format_aggregate, format_event
+from .sources import Source, load_sources
+from .types import Event, EventKind, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
 
-REST_BASE = "https://mainnet.zklighter.elliot.ai/api/v1"
-WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 REST_POLL_SECONDS = 60
 MAX_RECENT_EVENTS = 200
+DB_PATH = Path(__file__).parent.parent / "data" / "events.db"
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -55,7 +57,7 @@ INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Lighter pool dashboard</title>
+<title>Trade tracker</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -83,20 +85,20 @@ INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>Lighter pool <span id="pool"></span></h1>
-<div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="last">no events yet</span></div>
+<h1>Trade tracker</h1>
+<div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="sources">no sources</span> &middot; <span id="last">no events yet</span></div>
 <div class="grid">
   <section>
     <h2>Open positions</h2>
     <table>
-      <thead><tr><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Notional</th></tr></thead>
+      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Notional</th></tr></thead>
       <tbody id="positions"></tbody>
     </table>
   </section>
   <section>
     <h2>Recent events</h2>
     <table>
-      <thead><tr><th>Time UTC</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
+      <thead><tr><th>Time UTC</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
       <tbody id="events"></tbody>
     </table>
   </section>
@@ -113,12 +115,14 @@ const setStatus = (ok, label) => {
   document.getElementById("status").innerHTML =
     `<span class="dot ${ok ? 'on' : 'off'}"></span>${label}`;
 };
+const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function renderPositions(positions) {
   const tb = document.getElementById("positions");
-  if (!positions.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">no open positions</td></tr>'; return; }
+  if (!positions.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no open positions</td></tr>'; return; }
   tb.innerHTML = positions.map(p => `
     <tr>
-      <td>${p.market_symbol}</td>
+      <td>${esc(p.source)}</td>
+      <td>${esc(p.market_symbol)}</td>
       <td class="${p.side}">${p.side.toUpperCase()}</td>
       <td class="num">${fmtSize(p.size)}</td>
       <td class="num">${fmtPrice(p.avg_entry_price)}</td>
@@ -127,21 +131,27 @@ function renderPositions(positions) {
 }
 function renderEvents(events) {
   const tb = document.getElementById("events");
-  if (!events.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">waiting for trades…</td></tr>'; return; }
+  if (!events.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">waiting for trades…</td></tr>'; return; }
   tb.innerHTML = events.map(e => {
     const t = e.trade;
     const time = new Date(t.timestamp).toISOString().slice(11, 19);
     const notional = Number(t.size) * Number(t.price);
     return `<tr>
       <td>${time}</td>
+      <td>${esc(t.source)}</td>
       <td class="kind-${e.kind}">${e.kind}</td>
-      <td>${t.market_symbol}</td>
+      <td>${esc(t.market_symbol)}</td>
       <td class="${t.side}">${t.side.toUpperCase()}</td>
       <td class="num">${fmtSize(t.size)}</td>
       <td class="num">${fmtPrice(t.price)}</td>
       <td class="num">${fmtUsd(notional)}</td>
     </tr>`;
   }).join("");
+}
+function renderSources(sources) {
+  const s = sources || [];
+  document.getElementById("sources").textContent =
+    s.length ? s.length + " source" + (s.length > 1 ? "s" : "") + ": " + s.join(", ") : "no sources";
 }
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -151,13 +161,14 @@ function connect() {
   ws.onmessage = (msg) => {
     const data = JSON.parse(msg.data);
     if (data.type === "snapshot") {
-      document.getElementById("pool").textContent = data.pool_id;
+      renderSources(data.sources);
       renderPositions(data.positions);
       renderEvents(data.recent_events);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
     } else if (data.type === "event") {
+      renderSources(data.sources);
       renderPositions(data.positions);
       renderEvents(data.recent_events);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
@@ -199,106 +210,184 @@ class Hub:
 
 async def run() -> None:
     load_dotenv()
-    pool_id = int(os.environ.get("LIGHTER_POOL_ID", "0"))
-    if not pool_id:
-        raise RuntimeError("LIGHTER_POOL_ID not set in .env")
 
-    lighter = LighterClient(pool_id, REST_BASE, WS_URL)
-    tracker = PositionTracker()
     hub = Hub()
-    recent_events: list[Event] = []
-    last_trade_id: int | None = None
+    sources: list[Source] = load_sources()
+    by_id: dict[str, Source] = {s.id: s for s in sources}
 
-    log.info("bootstrapping markets…")
-    await lighter.bootstrap_markets()
-    log.info("seeding positions…")
-    tracker.seed(await lighter.current_positions())
-    log.info("seeded with %d positions", len(tracker.snapshot()))
+    log.info("initialising database…")
+    await init_db(DB_PATH)
+    # recent_events holds Event objects (new this session) and dicts (loaded from DB).
+    # _to_jsonable handles both transparently.
+    recent_events: list[Any] = list(await load_recent_events(DB_PATH, MAX_RECENT_EVENTS))
+    log.info("loaded %d persisted events from db", len(recent_events))
 
-    # Anchor to most recent trade on first run so we don't replay everything.
-    latest = await lighter.fetch_trades_since(since_trade_id=None, limit=1)
-    if latest:
-        last_trade_id = latest[-1].trade_id
-        log.info("anchored last_trade_id=%d", last_trade_id)
+    # Bootstrap every source: markets, seed positions, anchor last_trade_id so
+    # we don't replay history.
+    for s in sources:
+        log.info("[%s] bootstrapping markets…", s.name)
+        await s.client.bootstrap_markets()
+        s.tracker.seed(await s.client.current_positions())
+        log.info("[%s] seeded with %d positions", s.name, len(s.tracker.snapshot()))
+        latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
+        if latest:
+            s.last_trade_id = latest[-1].trade_id
+            log.info("[%s] anchored last_trade_id=%d", s.name, s.last_trade_id)
 
     # --- Telegram ---
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_channel = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-    tg_owner = os.environ.get("TELEGRAM_OWNER_USER_ID", "")
-    min_notional = Decimal("1000")
     tg_client = httpx.AsyncClient(timeout=15.0)
-    pool_url = f"https://app.lighter.xyz/public-pools/{pool_id}"
-    TG_COOLDOWN_SECONDS = 30
-    _tg_last_fired: dict[int, float] = {}  # market_id -> monotonic time
+    AGGREGATE_WINDOW = 30  # seconds — SIZE_CHANGE fills accumulate before one alert fires
 
-    async def tg_send(chat_id: str, text: str) -> None:
+    # (source_id, market_id) -> {net_added: Decimal, n_fills: int,
+    #                            leverage: Optional[float], task: asyncio.Task}
+    _pending: dict[tuple[str, int], dict] = {}
+
+    async def tg_send(text: str) -> None:
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                data={"chat_id": chat_id, "text": text},
+                data={"chat_id": tg_channel, "text": text},
             )
             if not r.json().get("ok"):
                 log.warning("tg sendMessage failed: %s", r.text[:200])
         except Exception:
             log.exception("tg_send failed")
 
-    queue: asyncio.Queue[Trade] = asyncio.Queue()
+    async def flush_aggregate(key: tuple[str, int]) -> None:
+        buf = _pending.pop(key, None)
+        if buf is None:
+            return
+        source_id, market_id = key
+        src = by_id.get(source_id)
+        if src is None:
+            return
+        pos = src.tracker.snapshot().get(market_id)
+        if pos is None:
+            log.info("[%s] aggregate flush: market %d already closed, skipping",
+                     src.name, market_id)
+            return
+        if pos.notional_usd < src.min_notional:
+            log.info("[%s] aggregate flush: %s notional $%.0f below min, skipping",
+                     src.name, pos.market_symbol, pos.notional_usd)
+            return
+        text = format_aggregate(
+            position=pos,
+            net_added_usd=buf["net_added"],
+            n_fills=buf["n_fills"],
+            leverage=buf["leverage"],
+            pool_url=src.url,
+            source_name=src.name,
+        )
+        log.info("[%s] aggregate alert: %s +$%.0f across %d fills → $%.0f",
+                 src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
+                 pos.notional_usd)
+        await tg_send(text)
+
+    def _accumulate_size_change(source_id: str, ev: Event) -> None:
+        key = (source_id, ev.trade.market_id)
+        fill_notional = ev.trade.size * ev.trade.price
+        if key in _pending:
+            _pending[key]["net_added"] += fill_notional
+            _pending[key]["n_fills"] += 1
+            if ev.leverage is not None:
+                _pending[key]["leverage"] = ev.leverage
+        else:
+            task = asyncio.get_running_loop().create_task(
+                _delayed_flush(key, AGGREGATE_WINDOW)
+            )
+            _pending[key] = {
+                "net_added": fill_notional,
+                "n_fills": 1,
+                "leverage": ev.leverage,
+                "task": task,
+            }
+
+    def _cancel_pending(key: tuple[str, int]) -> None:
+        buf = _pending.pop(key, None)
+        if buf is not None:
+            buf["task"].cancel()
+
+    async def _delayed_flush(key: tuple[str, int], delay: float) -> None:
+        await asyncio.sleep(delay)
+        await flush_aggregate(key)
+
+    queue: asyncio.Queue[tuple[str, Trade]] = asyncio.Queue()
+
+    def all_positions() -> list[Position]:
+        out: list[Position] = []
+        for s in sources:
+            out.extend(s.tracker.snapshot().values())
+        return out
 
     def snapshot_payload(type_: str, extra: dict | None = None) -> dict:
         payload = {
             "type": type_,
-            "pool_id": pool_id,
-            "positions": list(tracker.snapshot().values()),
+            "sources": [s.name for s in sources],
+            "positions": all_positions(),
             "recent_events": recent_events[:MAX_RECENT_EVENTS],
         }
         if extra:
             payload.update(extra)
         return payload
 
-    async def ws_producer() -> None:
-        async for trade in lighter.stream_trades():
-            await queue.put(trade)
+    async def ws_producer(src: Source) -> None:
+        async for trade in src.client.stream_trades():
+            await queue.put((src.id, trade))
 
-    async def rest_safety_producer() -> None:
-        nonlocal last_trade_id
+    async def rest_safety_producer(src: Source) -> None:
         while True:
             await asyncio.sleep(REST_POLL_SECONDS)
             try:
-                trades = await lighter.fetch_trades_since(last_trade_id)
+                trades = await src.client.fetch_trades_since(src.last_trade_id)
                 for t in trades:
-                    await queue.put(t)
+                    await queue.put((src.id, t))
             except Exception:
-                log.exception("safety poll failed")
+                log.exception("[%s] safety poll failed", src.name)
 
     async def consumer() -> None:
-        nonlocal last_trade_id
         while True:
-            trade = await queue.get()
-            if last_trade_id is not None and trade.trade_id <= last_trade_id:
+            source_id, trade = await queue.get()
+            src = by_id.get(source_id)
+            if src is None:
                 continue
-            last_trade_id = trade.trade_id
-            events = tracker.apply(trade)
+            if src.last_trade_id is not None and trade.trade_id <= src.last_trade_id:
+                continue
+            src.last_trade_id = trade.trade_id
+            events = src.tracker.apply(trade)
             for ev in events:
-                ev.leverage = await lighter.fetch_leverage(ev.trade.market_id)
+                ev.leverage = await src.client.fetch_leverage(ev.trade.market_id)
                 recent_events.insert(0, ev)
                 del recent_events[MAX_RECENT_EVENTS:]
                 await hub.broadcast(snapshot_payload("event", {"event": ev}))
-                log.info("event %s %s %s @ %s size=%s", ev.kind, ev.trade.side,
-                         ev.trade.market_symbol, ev.trade.price, ev.trade.size)
-                if tg_token and tg_channel and passes_min_notional(ev, min_notional):
-                    import time as _time
-                    from .types import EventKind as _EK
-                    now = _time.monotonic()
-                    last = _tg_last_fired.get(ev.trade.market_id, 0)
-                    on_cooldown = (now - last) < TG_COOLDOWN_SECONDS
-                    # CLOSE always fires; everything else respects cooldown
-                    if ev.kind == _EK.CLOSE or not on_cooldown:
-                        await tg_send(tg_channel, format_event(ev, pool_url))
-                        _tg_last_fired[ev.trade.market_id] = now
-                    else:
-                        log.info("cooldown suppressed %s %s (%.0fs remaining)",
-                                 ev.kind, ev.trade.market_symbol,
-                                 TG_COOLDOWN_SECONDS - (now - last))
+                await save_event(
+                    DB_PATH,
+                    ev.trade.timestamp.isoformat(),
+                    json.dumps(_to_jsonable(ev)),
+                )
+                log.info("[%s] event %s %s %s @ %s size=%s", src.name, ev.kind,
+                         ev.trade.side, ev.trade.market_symbol, ev.trade.price,
+                         ev.trade.size)
+
+                if not (tg_token and tg_channel):
+                    continue
+
+                key = (source_id, ev.trade.market_id)
+
+                if ev.kind == EventKind.OPEN:
+                    # Cancel any pending aggregate for this market (position flipped)
+                    _cancel_pending(key)
+                    if passes_min_notional(ev, src.min_notional):
+                        await tg_send(format_event(ev, src.url, src.name))
+
+                elif ev.kind == EventKind.CLOSE:
+                    # Cancel pending aggregate — the position is gone
+                    _cancel_pending(key)
+                    await tg_send(format_event(ev, src.url, src.name))
+
+                elif ev.kind == EventKind.SIZE_CHANGE:
+                    _accumulate_size_change(source_id, ev)
 
     # --- HTTP routes ---
     async def index(_request: web.Request) -> web.Response:
@@ -329,9 +418,13 @@ async def run() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    log.info("dashboard on http://localhost:8080/  (pool %d)", pool_id)
+    log.info("dashboard on http://localhost:8080/  (%d source(s))", len(sources))
 
-    await asyncio.gather(ws_producer(), rest_safety_producer(), consumer())
+    tasks = [consumer()]
+    for s in sources:
+        tasks.append(ws_producer(s))
+        tasks.append(rest_safety_producer(s))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

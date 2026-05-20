@@ -1,0 +1,20 @@
+# Tracked sources — plug and play.
+# Add a pool or wallet below, restart the dashboard, done.
+#
+# Each entry needs:
+#   type: lighter | hyperliquid
+#   name: a label shown on the dashboard and in Telegram alerts
+#   lighter      -> pool_id
+#   hyperliquid  -> address (the wallet's actual address, 0x...)
+# Optional:
+#   min_notional_usd: per-source alert threshold (default 1000)
+
+sources:
+  - type: lighter
+    name: "My NK pool"
+    pool_id: 281474976684763
+
+  # - type: hyperliquid
+  #   name: "Whale A"
+  #   address: "0x0000000000000000000000000000000000000000"
+  #   min_notional_usd: 1000

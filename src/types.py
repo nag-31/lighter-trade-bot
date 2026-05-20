@@ -25,6 +25,7 @@ class Trade:
     size: Decimal
     price: Decimal
     tx_hash: str = ""
+    source: str = ""  # name of the tracked pool/wallet this trade belongs to
 
     @property
     def notional_usd(self) -> Decimal:
@@ -38,6 +39,7 @@ class Position:
     side: Side
     size: Decimal
     avg_entry_price: Decimal
+    source: str = ""  # name of the tracked pool/wallet this position belongs to
 
     @property
     def notional_usd(self) -> Decimal:

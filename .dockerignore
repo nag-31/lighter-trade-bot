@@ -1,0 +1,12 @@
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+data/
+.git/
+.gitignore
+*.md
+state.json

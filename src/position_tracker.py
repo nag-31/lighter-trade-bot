@@ -6,12 +6,16 @@ from .types import Event, EventKind, Position, Trade
 class PositionTracker:
     """Holds current position per market. Classifies each incoming trade.
 
-    Keyed by market_id (numeric) since Lighter's identifiers are numeric.
+    Keyed by market_id (numeric) since both Lighter and Hyperliquid expose
+    numeric asset ids. One tracker instance per tracked source, so market_id
+    keys never collide across sources.
+
     Leverage is NOT tracked here — it's fetched from the position snapshot
     by the orchestrator and stamped onto the Event before formatting.
     """
 
-    def __init__(self, initial: dict[int, Position] | None = None):
+    def __init__(self, source: str = "", initial: dict[int, Position] | None = None):
+        self._source = source
         self._positions: dict[int, Position] = dict(initial or {})
 
     def snapshot(self) -> dict[int, Position]:
@@ -30,6 +34,7 @@ class PositionTracker:
                 side=trade.side,
                 size=trade.size,
                 avg_entry_price=trade.price,
+                source=self._source,
             )
             self._positions[trade.market_id] = new_pos
             return [Event(kind=EventKind.OPEN, trade=trade, position_before=None, position_after=new_pos)]
@@ -43,6 +48,7 @@ class PositionTracker:
                 side=existing.side,
                 size=total_size,
                 avg_entry_price=new_avg,
+                source=self._source,
             )
             self._positions[trade.market_id] = after
             return [Event(kind=EventKind.SIZE_CHANGE, trade=trade, position_before=existing, position_after=after)]
@@ -55,6 +61,7 @@ class PositionTracker:
                 side=existing.side,
                 size=existing.size - trade.size,
                 avg_entry_price=existing.avg_entry_price,
+                source=self._source,
             )
             self._positions[trade.market_id] = after
             return [Event(kind=EventKind.SIZE_CHANGE, trade=trade, position_before=existing, position_after=after)]
@@ -72,6 +79,7 @@ class PositionTracker:
             side=trade.side,
             size=flip_size,
             avg_entry_price=trade.price,
+            source=self._source,
         )
         self._positions[trade.market_id] = flipped
         open_event = Event(kind=EventKind.OPEN, trade=trade, position_before=None, position_after=flipped)

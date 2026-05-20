@@ -32,8 +32,9 @@ log = logging.getLogger(__name__)
 
 
 class LighterClient:
-    def __init__(self, pool_id: int, rest_base: str, ws_url: str):
+    def __init__(self, pool_id: int, rest_base: str, ws_url: str, source: str = ""):
         self.pool_id = pool_id
+        self.source = source
         self._rest_base = rest_base.rstrip("/")
         self._ws_url = ws_url
         self._http = httpx.AsyncClient(timeout=20.0)
@@ -114,6 +115,7 @@ class LighterClient:
                     side=side,
                     size=abs(size),
                     avg_entry_price=avg,
+                    source=self.source,
                 )
             except Exception:
                 log.exception("could not parse position %r", p)
@@ -282,6 +284,7 @@ class LighterClient:
                 size=size,
                 price=price,
                 tx_hash=str(raw.get("tx_hash", "")),
+                source=self.source,
             )
         except (KeyError, ValueError, TypeError) as e:
             log.warning("could not parse trade %r: %s", raw, e)
