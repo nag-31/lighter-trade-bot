@@ -98,12 +98,16 @@ INDEX_HTML = """<!doctype html>
   <section>
     <h2>Recent events</h2>
     <table>
-      <thead><tr><th>Time UTC</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
+      <thead><tr><th>Time IST</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
       <tbody id="events"></tbody>
     </table>
   </section>
 </div>
 <script>
+const toIST = ts => {
+  const d = new Date(new Date(ts).getTime() + 5.5 * 60 * 60 * 1000);
+  return d.toISOString().slice(11, 19);
+};
 const fmtNum = (s, d=2) => {
   const n = Number(s); if (!isFinite(n)) return s;
   return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -134,7 +138,7 @@ function renderEvents(events) {
   if (!events.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">waiting for trades…</td></tr>'; return; }
   tb.innerHTML = events.map(e => {
     const t = e.trade;
-    const time = new Date(t.timestamp).toISOString().slice(11, 19);
+    const time = toIST(t.timestamp);
     const notional = Number(t.size) * Number(t.price);
     return `<tr>
       <td>${time}</td>
@@ -233,6 +237,9 @@ async def run() -> None:
         if latest:
             s.last_trade_id = latest[-1].trade_id
             log.info("[%s] anchored last_trade_id=%d", s.name, s.last_trade_id)
+        # Tell HL client the anchor so WS snapshot is filtered correctly
+        if hasattr(s.client, "set_anchor"):
+            s.client.set_anchor(s.last_trade_id)
 
     # --- Telegram ---
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -332,6 +339,37 @@ async def run() -> None:
             payload.update(extra)
         return payload
 
+    async def position_reconciler(src: Source) -> None:
+        """Every 60s: compare tracker state with live API snapshot.
+        If a position exists in tracker but not in API it was closed while
+        the bot wasn't watching — clear it and update the dashboard."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                actual = await src.client.current_positions()
+                tracked = src.tracker.snapshot()
+                for market_id, pos in list(tracked.items()):
+                    if market_id not in actual:
+                        log.warning(
+                            "[%s] reconcile: %s %s was closed while unobserved — removing from tracker",
+                            src.name, pos.side, pos.market_symbol,
+                        )
+                        # Rebuild tracker state without this position
+                        src.tracker.seed({mid: p for mid, p in tracked.items() if mid != market_id})
+                        tracked = src.tracker.snapshot()
+                        await hub.broadcast(snapshot_payload("snapshot"))
+                for market_id, pos in actual.items():
+                    if market_id not in tracked:
+                        log.warning(
+                            "[%s] reconcile: %s %s found in API but not in tracker — seeding",
+                            src.name, pos.side, pos.market_symbol,
+                        )
+                        src.tracker.seed({**tracked, market_id: pos})
+                        tracked = src.tracker.snapshot()
+                        await hub.broadcast(snapshot_payload("snapshot"))
+            except Exception:
+                log.exception("[%s] position reconciler failed", src.name)
+
     async def ws_producer(src: Source) -> None:
         async for trade in src.client.stream_trades():
             await queue.put((src.id, trade))
@@ -354,7 +392,7 @@ async def run() -> None:
                 continue
             if src.last_trade_id is not None and trade.trade_id <= src.last_trade_id:
                 continue
-            src.last_trade_id = trade.trade_id
+            src.last_trade_id = max(src.last_trade_id or 0, trade.trade_id)
             events = src.tracker.apply(trade)
             for ev in events:
                 ev.leverage = await src.client.fetch_leverage(ev.trade.market_id)
@@ -387,7 +425,15 @@ async def run() -> None:
                     await tg_send(format_event(ev, src.url, src.name))
 
                 elif ev.kind == EventKind.SIZE_CHANGE:
-                    _accumulate_size_change(source_id, ev)
+                    # Only batch same-side fills (scaling in).
+                    # Opposite-side fills are partial reduces — update the tracker
+                    # silently and wait for the eventual CLOSE to announce it.
+                    is_add = (
+                        ev.position_before is not None
+                        and ev.trade.side == ev.position_before.side
+                    )
+                    if is_add:
+                        _accumulate_size_change(source_id, ev)
 
     # --- HTTP routes ---
     async def index(_request: web.Request) -> web.Response:
@@ -424,6 +470,7 @@ async def run() -> None:
     for s in sources:
         tasks.append(ws_producer(s))
         tasks.append(rest_safety_producer(s))
+        tasks.append(position_reconciler(s))
     await asyncio.gather(*tasks)
 
 

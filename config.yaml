@@ -14,7 +14,7 @@ sources:
     name: "My NK pool"
     pool_id: 281474976684763
 
-  # - type: hyperliquid
-  #   name: "Whale A"
-  #   address: "0x0000000000000000000000000000000000000000"
-  #   min_notional_usd: 1000
+  - type: hyperliquid
+    name: "HL"
+    address: "0xDE95B007e425cacD9C1aEDdb8415F936B4D84C74"
+    min_notional_usd: 10
