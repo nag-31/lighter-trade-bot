@@ -9,23 +9,22 @@ Side = Literal["long", "short"]
 
 @dataclass(frozen=True)
 class Trade:
-    """A single trade on the pool, normalized from Lighter's REST/WS schema.
+    """A single normalised fill from any exchange source.
 
-    Lighter's trade record has no native `side` field — it's derived by comparing
-    the pool's account_index with ask_account_id / bid_account_id. Leverage and
-    reduce_only flags are NOT on the trade record; leverage is fetched from the
-    position snapshot at event time.
+    `realized_pnl` is populated for HL fills that carry `closedPnl`.
+    Lighter fills don't expose per-fill PnL so it stays None there.
     """
 
     trade_id: int
     timestamp: datetime
     market_id: int
-    market_symbol: str  # resolved from order_book metadata at startup
+    market_symbol: str
     side: Side
     size: Decimal
     price: Decimal
     tx_hash: str = ""
-    source: str = ""  # name of the tracked pool/wallet this trade belongs to
+    source: str = ""
+    realized_pnl: Optional[Decimal] = None  # HL closedPnl; None for Lighter
 
     @property
     def notional_usd(self) -> Decimal:
@@ -39,7 +38,9 @@ class Position:
     side: Side
     size: Decimal
     avg_entry_price: Decimal
-    source: str = ""  # name of the tracked pool/wallet this position belongs to
+    source: str = ""
+    unrealized_pnl: Optional[Decimal] = None   # from clearinghouseState
+    liquidation_px: Optional[Decimal] = None    # from clearinghouseState
 
     @property
     def notional_usd(self) -> Decimal:
@@ -49,7 +50,8 @@ class Position:
 class EventKind(str, Enum):
     OPEN = "OPEN"
     CLOSE = "CLOSE"
-    SIZE_CHANGE = "SIZE_CHANGE"
+    SIZE_CHANGE = "SIZE_CHANGE"   # same-side add
+    REDUCE = "REDUCE"             # opposite-side partial close (position still open)
 
 
 @dataclass
@@ -58,6 +60,4 @@ class Event:
     trade: Trade
     position_before: Optional[Position]
     position_after: Optional[Position]
-    # Filled in by orchestrator from position snapshot at trade time. May stay
-    # None if the snapshot fetch failed — formatter will omit leverage line.
     leverage: Optional[float] = None

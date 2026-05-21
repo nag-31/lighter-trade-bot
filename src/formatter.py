@@ -18,8 +18,9 @@ def _fmt_size(s: Decimal) -> str:
     return f"{s:,.6f}"
 
 
-def _verb(kind: EventKind) -> str:
-    return {EventKind.OPEN: "Opened", EventKind.CLOSE: "Closed", EventKind.SIZE_CHANGE: "Updated"}[kind]
+def _fmt_pnl(pnl: Decimal) -> str:
+    sign = "+" if pnl >= 0 else ""
+    return f"{sign}${pnl:,.2f}"
 
 
 def _direction_emoji(side: str) -> str:
@@ -27,34 +28,48 @@ def _direction_emoji(side: str) -> str:
 
 
 def _header(source_name: str) -> str:
-    """Leading label line so each alert identifies which pool/wallet it's from."""
     return f"📍 {source_name}\n" if source_name else ""
 
 
 def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
     t = event.trade
     direction = _direction_emoji(t.side)
-    verb = _verb(event.kind)
 
     if event.kind == EventKind.CLOSE and event.position_before is not None:
         pos = event.position_before
-        notional_str = f"${pos.notional_usd:,.0f}"
         body = (
-            f"{verb} {direction} {pos.market_symbol}\n"
+            f"Closed {_direction_emoji(pos.side)} {pos.market_symbol}\n"
             f"Exit: {_fmt_price(t.price)}  |  Size: {_fmt_size(pos.size)}\n"
-            f"Notional: {notional_str}"
+            f"Notional: ${pos.notional_usd:,.0f}"
         )
+        if event.leverage is not None:
+            body += f"  |  {event.leverage:g}x"
+        if t.realized_pnl is not None:
+            body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+
+    elif event.kind == EventKind.REDUCE and event.position_before is not None and event.position_after is not None:
+        pos_b = event.position_before
+        pos_a = event.position_after
+        body = (
+            f"Reduced {_direction_emoji(pos_b.side)} {pos_b.market_symbol}\n"
+            f"−{_fmt_size(t.size)} @ {_fmt_price(t.price)}\n"
+            f"Remaining: ${pos_a.notional_usd:,.0f}  (was ${pos_b.notional_usd:,.0f})"
+        )
+        if event.leverage is not None:
+            body += f"  |  {event.leverage:g}x"
+        if t.realized_pnl is not None:
+            body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+
     else:
         notional = t.size * t.price
-        notional_str = f"${notional:,.0f}"
+        verb = {EventKind.OPEN: "Opened", EventKind.SIZE_CHANGE: "Added to"}.get(event.kind, "Updated")
         body = (
             f"{verb} {direction} {t.market_symbol}\n"
             f"Price: {_fmt_price(t.price)}  |  Size: {_fmt_size(t.size)}\n"
-            f"Notional: {notional_str}"
+            f"Notional: ${notional:,.0f}"
         )
-
-    if event.leverage is not None:
-        body += f"  |  {event.leverage:g}x"
+        if event.leverage is not None:
+            body += f"  |  {event.leverage:g}x"
 
     return f"{_header(source_name)}{body}\n{pool_url}"
 

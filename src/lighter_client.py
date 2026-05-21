@@ -109,6 +109,23 @@ class LighterClient:
                 side = "long" if sign > 0 else "short"
                 symbol = str(p.get("symbol") or self.market_symbol(mid))
                 avg = Decimal(str(p.get("avg_entry_price", "0")))
+
+                unrealized_pnl: Optional[Decimal] = None
+                upnl_str = p.get("unrealized_pnl") or p.get("unrealizedPnl")
+                if upnl_str is not None:
+                    try:
+                        unrealized_pnl = Decimal(str(upnl_str))
+                    except Exception:
+                        pass
+
+                liquidation_px: Optional[Decimal] = None
+                liq_str = p.get("liquidation_price") or p.get("liquidationPx")
+                if liq_str is not None:
+                    try:
+                        liquidation_px = Decimal(str(liq_str))
+                    except Exception:
+                        pass
+
                 out[mid] = Position(
                     market_id=mid,
                     market_symbol=symbol,
@@ -116,6 +133,8 @@ class LighterClient:
                     size=abs(size),
                     avg_entry_price=avg,
                     source=self.source,
+                    unrealized_pnl=unrealized_pnl,
+                    liquidation_px=liquidation_px,
                 )
             except Exception:
                 log.exception("could not parse position %r", p)

@@ -79,6 +79,7 @@ INDEX_HTML = """<!doctype html>
   .kind-OPEN { color: #60a5fa; }
   .kind-CLOSE { color: #f59e0b; }
   .kind-SIZE_CHANGE { color: #a78bfa; }
+  .kind-REDUCE { color: #fb923c; }
   .empty { color:#4b5563; font-style: italic; padding: 8px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
@@ -91,7 +92,7 @@ INDEX_HTML = """<!doctype html>
   <section>
     <h2>Open positions</h2>
     <table>
-      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Notional</th></tr></thead>
+      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">Liq. Price</th></tr></thead>
       <tbody id="positions"></tbody>
     </table>
   </section>
@@ -120,9 +121,15 @@ const setStatus = (ok, label) => {
     `<span class="dot ${ok ? 'on' : 'off'}"></span>${label}`;
 };
 const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const fmtPnl = v => {
+  if (v == null || v === "") return "—";
+  const n = Number(v); if (!isFinite(n)) return "—";
+  const sign = n >= 0 ? "+" : "";
+  return `<span style="color:${n >= 0 ? '#22c55e' : '#ef4444'}">${sign}$${Math.abs(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}</span>`;
+};
 function renderPositions(positions) {
   const tb = document.getElementById("positions");
-  if (!positions.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no open positions</td></tr>'; return; }
+  if (!positions.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">no open positions</td></tr>'; return; }
   tb.innerHTML = positions.map(p => `
     <tr>
       <td>${esc(p.source)}</td>
@@ -131,6 +138,8 @@ function renderPositions(positions) {
       <td class="num">${fmtSize(p.size)}</td>
       <td class="num">${fmtPrice(p.avg_entry_price)}</td>
       <td class="num">${fmtUsd(Number(p.size) * Number(p.avg_entry_price))}</td>
+      <td class="num">${fmtPnl(p.unrealized_pnl)}</td>
+      <td class="num">${p.liquidation_px != null ? fmtPrice(p.liquidation_px) : "—"}</td>
     </tr>`).join("");
 }
 function renderEvents(events) {
@@ -390,8 +399,10 @@ async def run() -> None:
             src = by_id.get(source_id)
             if src is None:
                 continue
-            if src.last_trade_id is not None and trade.trade_id <= src.last_trade_id:
+            # Set-based dedup catches WS replay and REST/WS overlap regardless of order.
+            if trade.trade_id in src.seen_tids:
                 continue
+            src.seen_tids.add(trade.trade_id)
             src.last_trade_id = max(src.last_trade_id or 0, trade.trade_id)
             events = src.tracker.apply(trade)
             for ev in events:
@@ -424,16 +435,15 @@ async def run() -> None:
                     _cancel_pending(key)
                     await tg_send(format_event(ev, src.url, src.name))
 
+                elif ev.kind == EventKind.REDUCE:
+                    # Partial close — fire immediately (no batching).
+                    # The position is still open but smaller; user always wants to know.
+                    if passes_min_notional(ev, src.min_notional):
+                        await tg_send(format_event(ev, src.url, src.name))
+
                 elif ev.kind == EventKind.SIZE_CHANGE:
-                    # Only batch same-side fills (scaling in).
-                    # Opposite-side fills are partial reduces — update the tracker
-                    # silently and wait for the eventual CLOSE to announce it.
-                    is_add = (
-                        ev.position_before is not None
-                        and ev.trade.side == ev.position_before.side
-                    )
-                    if is_add:
-                        _accumulate_size_change(source_id, ev)
+                    # Batch same-side adds over 30s — avoids spam for rapid scaling in.
+                    _accumulate_size_change(source_id, ev)
 
     # --- HTTP routes ---
     async def index(_request: web.Request) -> web.Response:

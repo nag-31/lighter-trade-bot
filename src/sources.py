@@ -65,6 +65,9 @@ class Source:
     url: str
     min_notional: Decimal
     last_trade_id: Optional[int] = None
+    # Set-based dedup: protects against WS replay and REST/WS overlap.
+    # Using a set catches duplicates with any tid, not just the last one.
+    seen_tids: set[int] = field(default_factory=set)
 
 
 def _build_source(raw: dict) -> Optional[Source]:

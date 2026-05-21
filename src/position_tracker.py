@@ -53,7 +53,7 @@ class PositionTracker:
             self._positions[trade.market_id] = after
             return [Event(kind=EventKind.SIZE_CHANGE, trade=trade, position_before=existing, position_after=after)]
 
-        # opposite side
+        # opposite side — partial reduce (REDUCE) or full close
         if trade.size < existing.size:
             after = Position(
                 market_id=existing.market_id,
@@ -64,7 +64,7 @@ class PositionTracker:
                 source=self._source,
             )
             self._positions[trade.market_id] = after
-            return [Event(kind=EventKind.SIZE_CHANGE, trade=trade, position_before=existing, position_after=after)]
+            return [Event(kind=EventKind.REDUCE, trade=trade, position_before=existing, position_after=after)]
 
         if trade.size == existing.size:
             del self._positions[trade.market_id]

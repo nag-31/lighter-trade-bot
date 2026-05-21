@@ -179,6 +179,23 @@ class HyperliquidClient:
                 mid = self.market_id(coin)
                 side = "long" if szi > 0 else "short"
                 avg = Decimal(str(pos.get("entryPx") or "0"))
+
+                unrealized_pnl: Optional[Decimal] = None
+                upnl_str = pos.get("unrealizedPnl")
+                if upnl_str is not None:
+                    try:
+                        unrealized_pnl = Decimal(str(upnl_str))
+                    except Exception:
+                        pass
+
+                liquidation_px: Optional[Decimal] = None
+                liq_str = pos.get("liquidationPx")
+                if liq_str is not None:
+                    try:
+                        liquidation_px = Decimal(str(liq_str))
+                    except Exception:
+                        pass
+
                 out[mid] = Position(
                     market_id=mid,
                     market_symbol=coin.upper(),
@@ -186,6 +203,8 @@ class HyperliquidClient:
                     size=abs(szi),
                     avg_entry_price=avg,
                     source=self.source,
+                    unrealized_pnl=unrealized_pnl,
+                    liquidation_px=liquidation_px,
                 )
             except Exception:
                 log.exception("[%s] could not parse HL position %r", self.source, ap)
@@ -374,6 +393,16 @@ class HyperliquidClient:
             # "B" = buy (long direction), "A" = sell (short direction)
             side = "long" if str(raw.get("side", "")).upper() == "B" else "short"
 
+            # closedPnl is present on fills that close or reduce a position.
+            # It's a string like "12.345" or "-5.0" on HL.
+            realized_pnl: Optional[Decimal] = None
+            pnl_str = raw.get("closedPnl")
+            if pnl_str is not None:
+                try:
+                    realized_pnl = Decimal(str(pnl_str))
+                except Exception:
+                    pass
+
             return Trade(
                 trade_id=trade_id,
                 timestamp=ts,
@@ -384,6 +413,7 @@ class HyperliquidClient:
                 price=price,
                 tx_hash=str(raw.get("hash", "")),
                 source=self.source,
+                realized_pnl=realized_pnl,
             )
         except (KeyError, ValueError, TypeError) as e:
             log.warning("[%s] could not parse HL fill %r: %s", self.source, raw, e)
