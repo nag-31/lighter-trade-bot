@@ -349,33 +349,58 @@ async def run() -> None:
         return payload
 
     async def position_reconciler(src: Source) -> None:
-        """Every 60s: compare tracker state with live API snapshot.
-        If a position exists in tracker but not in API it was closed while
-        the bot wasn't watching — clear it and update the dashboard."""
+        """Every 60s: pull ground-truth positions from the exchange API and
+        reconcile against the local tracker.
+
+        Positions are ALWAYS replaced by API data — the tracker's calculated
+        state is only used for fill-by-fill event classification.  This ensures
+        the dashboard and Telegram always reflect blockchain reality.
+
+        If a position disappeared from the API while we weren't watching (e.g.
+        closed via many small REDUCE fills each below min_notional), we send a
+        TG alert so the user is always notified of a close.
+        """
         while True:
             await asyncio.sleep(60)
             try:
                 actual = await src.client.current_positions()
                 tracked = src.tracker.snapshot()
-                for market_id, pos in list(tracked.items()):
+
+                # --- detect silently-closed positions ---
+                for market_id, pos in tracked.items():
                     if market_id not in actual:
                         log.warning(
-                            "[%s] reconcile: %s %s was closed while unobserved — removing from tracker",
+                            "[%s] reconcile: %s %s closed while unobserved",
                             src.name, pos.side, pos.market_symbol,
                         )
-                        # Rebuild tracker state without this position
-                        src.tracker.seed({mid: p for mid, p in tracked.items() if mid != market_id})
-                        tracked = src.tracker.snapshot()
-                        await hub.broadcast(snapshot_payload("snapshot"))
+                        if tg_token and tg_channel:
+                            direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
+                            notional = pos.notional_usd
+                            msg = (
+                                f"📍 {src.name}\n"
+                                f"Closed {direction} {pos.market_symbol}\n"
+                                f"Size: {pos.size:,.4f}  |  Entry: ${pos.avg_entry_price:,.2f}\n"
+                                f"Notional: ${notional:,.0f}  (close price unavailable)\n"
+                                f"{src.url}"
+                            )
+                            await tg_send(msg)
+
+                # --- detect positions the tracker missed entirely ---
                 for market_id, pos in actual.items():
                     if market_id not in tracked:
                         log.warning(
-                            "[%s] reconcile: %s %s found in API but not in tracker — seeding",
+                            "[%s] reconcile: %s %s found in API but missing from tracker — seeding",
                             src.name, pos.side, pos.market_symbol,
                         )
-                        src.tracker.seed({**tracked, market_id: pos})
-                        tracked = src.tracker.snapshot()
-                        await hub.broadcast(snapshot_payload("snapshot"))
+
+                # --- always sync tracker to API truth ---
+                # Replaces tracker's internally-calculated positions with the
+                # real on-chain values (size, entry, unrealizedPnl, liquidationPx).
+                src.tracker.seed(actual)
+
+                # Broadcast fresh position snapshot to all dashboard clients
+                await hub.broadcast(snapshot_payload("snapshot"))
+
             except Exception:
                 log.exception("[%s] position reconciler failed", src.name)
 

@@ -208,7 +208,7 @@ class HyperliquidClient:
                 )
             except Exception:
                 log.exception("[%s] could not parse HL position %r", self.source, ap)
-        log.info("[%s] %d open HL positions seeded", self.source, len(out))
+        log.debug("[%s] %d open HL positions loaded from API", self.source, len(out))
         return out
 
     async def fetch_leverage(self, market_id: int) -> Optional[float]:
