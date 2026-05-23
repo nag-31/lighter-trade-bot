@@ -16,5 +16,5 @@ sources:
 
   - type: hyperliquid
     name: "HL"
-    address: "0xDE95B007e425cacD9C1aEDdb8415F936B4D84C74"
+    # address loaded from HL_ADDRESS env var
     min_notional_usd: 10

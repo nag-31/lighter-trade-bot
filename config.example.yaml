@@ -30,3 +30,14 @@ lighter:
   ws_url: "wss://mainnet.zklighter.elliot.ai/stream"
   rest_base: "https://mainnet.zklighter.elliot.ai/api/v1"
   rest_safety_poll_seconds: 60
+
+# Example sources block (copy into config.yaml and fill in real values):
+# sources:
+#   - type: lighter
+#     name: "My NK pool"
+#     pool_id: 281474976684763
+#
+#   - type: hyperliquid
+#     name: "HL"
+#     # address loaded from HL_ADDRESS env var
+#     min_notional_usd: 10

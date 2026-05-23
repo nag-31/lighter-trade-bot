@@ -25,6 +25,8 @@ class Trade:
     tx_hash: str = ""
     source: str = ""
     realized_pnl: Optional[Decimal] = None  # HL closedPnl; None for Lighter
+    dir: Optional[str] = None               # HL intent string e.g. "Open Long", "Close Short"; None for Lighter
+    closed_pnl: Optional[Decimal] = None    # Alias for realized_pnl from HL fill; None for Lighter
 
     @property
     def notional_usd(self) -> Decimal:

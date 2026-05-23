@@ -19,6 +19,7 @@ config.yaml shape:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -100,9 +101,15 @@ def _build_source(raw: dict) -> Optional[Source]:
         )
 
     if stype == "hyperliquid":
-        address = str(raw.get("address", "")).strip()
+        # Address is loaded from the HL_ADDRESS env var, not from config.yaml,
+        # to keep the wallet address out of version control.
+        address = os.getenv("HL_ADDRESS", "").strip()
         if not address:
-            log.warning("hyperliquid source '%s' missing 'address' — skipping", name)
+            log.warning(
+                "hyperliquid source '%s': HL_ADDRESS env var is missing or empty — "
+                "skipping HL source (Lighter continues unaffected)",
+                name,
+            )
             return None
         client = HyperliquidClient(address, source=name)
         return Source(
