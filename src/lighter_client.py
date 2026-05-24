@@ -216,7 +216,7 @@ class LighterClient:
                     self._ws_url,
                     ping_interval=20,
                     ping_timeout=20,
-                    extra_headers={"Origin": "https://app.lighter.xyz"},
+                    additional_headers={"Origin": "https://app.lighter.xyz"},
                 ) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
