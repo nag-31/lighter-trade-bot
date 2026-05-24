@@ -339,6 +339,38 @@ calculation is only used for fill-by-fill event classification, never for displa
 
 ---
 
+### BUG-010 — Lighter WS + Binance geo-blocked (Azure India VM)
+**Date**: 2026-05-24  
+**Symptom**: Lighter WS → CloudFront 400 `code 20558 "restricted jurisdiction"`;
+Binance REST + WS → HTTP 451. HL unaffected.  
+**Root cause**: Azure India DC IP ranges flagged by CloudFront geo-filter (financial
+services IP reputation scoring) and Binance's India compliance block.  
+**Fix**: SOCKS5 proxy support added per-client.
+
+**Dante SOCKS5 server setup on VPS (Ubuntu):**
+```bash
+sudo apt install dante-server
+sudo tee /etc/danted.conf << 'EOF'
+logoutput: syslog
+internal: 0.0.0.0 port = 1080
+external: eth0
+clientmethod: none
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+EOF
+sudo systemctl enable --now danted
+# Lock to Azure VM IP only:
+sudo ufw allow from <AZURE_VM_IP> to any port 1080
+sudo ufw enable
+```
+
+**Bot side:** add to `.env`: `SOCKS_PROXY_URL=socks5h://vps_ip:1080`  
+**Test:** `curl --socks5-hostname vps_ip:1080 https://api.binance.com/fapi/v1/ping`  
+**Files**: `src/lighter_client.py`, `src/binance_client.py`, `src/sources.py`, `requirements.txt`
+
+---
+
 ## 8. Known Limitations
 
 ### LIMIT-001 — Lighter WS + Binance geo-blocked on current VM
@@ -347,15 +379,18 @@ calculation is only used for fill-by-fill event classification, never for displa
 (`code 20558: "restricted jurisdiction"`) and Binance's terms (`HTTP 451`).
 HL is unaffected.
 
-**Current state**:
-- Lighter REST poller (60 s) + reconciler working → position tracking active, ~60 s lag
-- Lighter real-time WS → blocked
-- Binance REST + WS → fully blocked
-- HL → fully operational
+**Resolution**: SOCKS5 proxy support added to Lighter + Binance clients.
+Set `SOCKS_PROXY_URL=socks5h://vps_ip:1080` in `.env`.
+HL never uses the proxy (it works fine directly).
 
-**Workaround options**:
-1. Move Azure VM to US East or West EU region
-2. Install a VPN/proxy on the VM (e.g. `gost`, `tun2socks`) to route Binance + Lighter traffic
+**VPS setup** (one-time, ~20 min):
+1. Spin up Vultr/Hetzner VPS in **Singapore** (~$3.50/mo)
+2. On VPS: `sudo apt install dante-server` + configure `/etc/danted.conf` (see BUG-010)
+3. On Azure VM: add `SOCKS_PROXY_URL=socks5h://vps_ip:1080` to `.env`, restart bot
+4. Verify: `curl --socks5-hostname vps_ip:1080 https://api.binance.com/fapi/v1/ping`
+
+**Cloudflare WARP is NOT recommended** — WARP IPs are on CloudFront's
+abuse/reputation blocklist, same block as without WARP. Avoid.
 
 ---
 
@@ -409,3 +444,4 @@ This may differ slightly from exchange-calculated PnL due to fee deduction.
 | 2026-05-24 | Add Binance USDT-M Futures source | `binance_client.py`, `sources.py`, `config.yaml` |
 | 2026-05-24 | Fix `extra_headers` → `additional_headers` for websockets 16.x | `lighter_client.py` |
 | 2026-05-24 | Discover geo-blocking: Lighter WS + Binance blocked on Azure VM | — (no code change) |
+| 2026-05-24 | Add SOCKS5 proxy support (geo-unblock Lighter WS + Binance) | `lighter_client.py`, `binance_client.py`, `sources.py`, `requirements.txt` |
