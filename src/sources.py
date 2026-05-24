@@ -117,7 +117,7 @@ def _build_source(raw: dict) -> Optional[Source]:
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
-            url=f"https://app.hyperliquid.xyz/explorer/address/{address}",
+            url="",          # never expose wallet address in public TG messages
             min_notional=min_notional,
         )
 

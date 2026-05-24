@@ -453,12 +453,13 @@ async def run() -> None:
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
                             notional = pos.notional_usd
+                            footer = f"\n{src.url}" if src.url else ""
                             msg = (
                                 f"📍 {src.name}\n"
                                 f"Closed {direction} {pos.market_symbol}\n"
                                 f"Size: {pos.size:,.4f}  |  Entry: ${pos.avg_entry_price:,.2f}\n"
-                                f"Notional: ${notional:,.0f}  (close price unavailable)\n"
-                                f"{src.url}"
+                                f"Notional: ${notional:,.0f}  (close price unavailable)"
+                                f"{footer}"
                             )
                             await tg_send(msg)
 

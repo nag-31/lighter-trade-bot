@@ -31,6 +31,10 @@ def _header(source_name: str) -> str:
     return f"📍 {source_name}\n" if source_name else ""
 
 
+def _footer(pool_url: str) -> str:
+    return f"\n{pool_url}" if pool_url else ""
+
+
 def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
     t = event.trade
     direction = _direction_emoji(t.side)
@@ -71,7 +75,7 @@ def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
         if event.leverage is not None:
             body += f"  |  {event.leverage:g}x"
 
-    return f"{_header(source_name)}{body}\n{pool_url}"
+    return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
 
 def format_aggregate(
@@ -92,7 +96,7 @@ def format_aggregate(
     )
     if leverage is not None:
         body += f"  |  {leverage:g}x"
-    return f"{_header(source_name)}{body}\n{pool_url}"
+    return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
 
 def format_reduce_aggregate(
@@ -115,4 +119,4 @@ def format_reduce_aggregate(
         body += f"  |  {leverage:g}x"
     if realized_pnl is not None:
         body += f"\nP&L: {_fmt_pnl(realized_pnl)}"
-    return f"{_header(source_name)}{body}\n{pool_url}"
+    return f"{_header(source_name)}{body}{_footer(pool_url)}"
