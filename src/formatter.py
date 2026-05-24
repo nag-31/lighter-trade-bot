@@ -93,3 +93,26 @@ def format_aggregate(
     if leverage is not None:
         body += f"  |  {leverage:g}x"
     return f"{_header(source_name)}{body}\n{pool_url}"
+
+
+def format_reduce_aggregate(
+    position: Position,
+    net_reduced_usd: Decimal,
+    n_fills: int,
+    realized_pnl: Optional[Decimal],
+    leverage: Optional[float],
+    pool_url: str,
+    source_name: str = "",
+) -> str:
+    """Message for batched REDUCE fills: N partial-close fills → remaining position."""
+    direction = _direction_emoji(position.side)
+    fill_word = "fill" if n_fills == 1 else "fills"
+    body = (
+        f"Reduced {direction} {position.market_symbol}\n"
+        f"−${net_reduced_usd:,.0f} across {n_fills} {fill_word} → remaining ${position.notional_usd:,.0f}"
+    )
+    if leverage is not None:
+        body += f"  |  {leverage:g}x"
+    if realized_pnl is not None:
+        body += f"\nP&L: {_fmt_pnl(realized_pnl)}"
+    return f"{_header(source_name)}{body}\n{pool_url}"

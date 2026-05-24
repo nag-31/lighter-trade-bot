@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .db import init_db, load_recent_events, save_event
 from .filters import passes_min_notional
-from .formatter import format_aggregate, format_event
+from .formatter import format_aggregate, format_event, format_reduce_aggregate
 from .sources import Source, load_sources
 from .types import Event, EventKind, Position, Trade
 
@@ -256,9 +256,13 @@ async def run() -> None:
     tg_client = httpx.AsyncClient(timeout=15.0)
     AGGREGATE_WINDOW = 30  # seconds — SIZE_CHANGE fills accumulate before one alert fires
 
-    # (source_id, market_id) -> {net_added: Decimal, n_fills: int,
-    #                            leverage: Optional[float], task: asyncio.Task}
+    # SIZE_CHANGE aggregate buffer
+    # (source_id, market_id) -> {net_added, n_fills, leverage, task}
     _pending: dict[tuple[str, int], dict] = {}
+
+    # REDUCE aggregate buffer — same structure, separate dict
+    # (source_id, market_id) -> {net_reduced, n_fills, total_pnl, leverage, task}
+    _pending_reduces: dict[tuple[str, int], dict] = {}
 
     async def tg_send(text: str) -> None:
         try:
@@ -300,6 +304,61 @@ async def run() -> None:
                  src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
                  pos.notional_usd)
         await tg_send(text)
+
+    async def flush_reduce_aggregate(key: tuple[str, int]) -> None:
+        buf = _pending_reduces.pop(key, None)
+        if buf is None:
+            return
+        source_id, market_id = key
+        src = by_id.get(source_id)
+        if src is None:
+            return
+        pos = src.tracker.snapshot().get(market_id)
+        if pos is None:
+            log.info("[%s] reduce aggregate flush: market %d already closed, skipping",
+                     src.name, market_id)
+            return
+        text = format_reduce_aggregate(
+            position=pos,
+            net_reduced_usd=buf["net_reduced"],
+            n_fills=buf["n_fills"],
+            realized_pnl=buf["total_pnl"],
+            leverage=buf["leverage"],
+            pool_url=src.url,
+            source_name=src.name,
+        )
+        log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
+                 src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
+                 pos.notional_usd)
+        await tg_send(text)
+
+    def _accumulate_reduce(source_id: str, ev: Event) -> None:
+        key = (source_id, ev.trade.market_id)
+        fill_notional = ev.trade.size * ev.trade.price
+        pnl = ev.trade.realized_pnl
+        if key in _pending_reduces:
+            _pending_reduces[key]["net_reduced"] += fill_notional
+            _pending_reduces[key]["n_fills"] += 1
+            if pnl is not None:
+                prev = _pending_reduces[key]["total_pnl"]
+                _pending_reduces[key]["total_pnl"] = (prev or Decimal(0)) + pnl
+            if ev.leverage is not None:
+                _pending_reduces[key]["leverage"] = ev.leverage
+        else:
+            task = asyncio.get_running_loop().create_task(
+                _delayed_flush_reduce(key, AGGREGATE_WINDOW)
+            )
+            _pending_reduces[key] = {
+                "net_reduced": fill_notional,
+                "n_fills": 1,
+                "total_pnl": pnl,
+                "leverage": ev.leverage,
+                "task": task,
+            }
+
+    async def _delayed_flush_reduce(key: tuple[str, int], delay: float) -> None:
+        await asyncio.sleep(delay)
+        await flush_reduce_aggregate(key)
 
     def _accumulate_size_change(source_id: str, ev: Event) -> None:
         key = (source_id, ev.trade.market_id)
@@ -456,15 +515,18 @@ async def run() -> None:
                         await tg_send(format_event(ev, src.url, src.name))
 
                 elif ev.kind == EventKind.CLOSE:
-                    # Cancel pending aggregate — the position is gone
+                    # Cancel any pending SIZE_CHANGE or REDUCE aggregate — position gone
                     _cancel_pending(key)
+                    buf = _pending_reduces.pop(key, None)
+                    if buf:
+                        buf["task"].cancel()
                     await tg_send(format_event(ev, src.url, src.name))
 
                 elif ev.kind == EventKind.REDUCE:
-                    # Partial close — fire immediately (no batching).
-                    # The position is still open but smaller; user always wants to know.
+                    # Batch partial-close fills over 30s — avoids spam when many
+                    # small fills close a position incrementally.
                     if passes_min_notional(ev, src.min_notional):
-                        await tg_send(format_event(ev, src.url, src.name))
+                        _accumulate_reduce(source_id, ev)
 
                 elif ev.kind == EventKind.SIZE_CHANGE:
                     # Batch same-side adds over 30s — avoids spam for rapid scaling in.
