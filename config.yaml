@@ -26,10 +26,7 @@ sources:
     # address loaded from HL_ADDRESS env var
     min_notional_usd: 10
 
-  # Binance USDT-M Futures example — uncomment and fill in env vars to enable:
-  # - type: binance
-  #   name: "Binance"
-  #   min_notional_usd: 100
-  #   # Add to .env:
-  #   #   BINANCE_API_KEY=your_key_here
-  #   #   BINANCE_API_SECRET=your_secret_here
+  - type: binance
+    name: "Binance"
+    min_notional_usd: 100
+    # credentials in .env: BINANCE_API_KEY + BINANCE_API_SECRET
