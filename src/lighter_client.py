@@ -212,7 +212,12 @@ class LighterClient:
         backoff = 1.0
         while True:
             try:
-                async with websockets.connect(self._ws_url, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    extra_headers={"Origin": "https://app.lighter.xyz"},
+                ) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
                         "channel": f"account_all_trades/{self.pool_id}",
