@@ -27,6 +27,7 @@ from typing import AsyncIterator, Optional, Protocol
 
 import yaml
 
+from .binance_client import BinanceClient
 from .hyperliquid_client import HyperliquidClient
 from .lighter_client import LighterClient
 from .position_tracker import PositionTracker
@@ -118,6 +119,28 @@ def _build_source(raw: dict) -> Optional[Source]:
             client=client,
             tracker=PositionTracker(source=name),
             url="",          # never expose wallet address in public TG messages
+            min_notional=min_notional,
+        )
+
+    if stype == "binance":
+        # API key + secret loaded from env vars — never put credentials in config.yaml.
+        api_key    = os.getenv("BINANCE_API_KEY", "").strip()
+        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            log.warning(
+                "binance source '%s': BINANCE_API_KEY and/or BINANCE_API_SECRET "
+                "env vars are missing or empty — skipping Binance source "
+                "(other sources continue unaffected)",
+                name,
+            )
+            return None
+        client = BinanceClient(api_key, api_secret, source=name)
+        return Source(
+            id=f"binance:{name.lower().replace(' ', '_')}",
+            name=name,
+            client=client,
+            tracker=PositionTracker(source=name),
+            url="",          # never expose API keys or account info in public TG messages
             min_notional=min_notional,
         )
 
