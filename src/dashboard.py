@@ -28,6 +28,7 @@ from pathlib import Path
 from .db import init_db, load_recent_events, save_event
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate
+from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import Source, load_sources
 from .types import Event, EventKind, Position, Trade
 
@@ -275,6 +276,23 @@ async def run() -> None:
         except Exception:
             log.exception("tg_send failed")
 
+    async def tg_send_photo(image_bytes: bytes, caption: str = "") -> None:
+        """Send a PNG image to Telegram. Falls back to plain text on error."""
+        try:
+            r = await tg_client.post(
+                f"https://api.telegram.org/bot{tg_token}/sendPhoto",
+                data={"chat_id": tg_channel, "caption": caption},
+                files={"photo": ("card.png", image_bytes, "image/png")},
+            )
+            if not r.json().get("ok"):
+                log.warning("tg sendPhoto failed: %s", r.text[:200])
+                if caption:
+                    await tg_send(caption)
+        except Exception:
+            log.exception("tg_send_photo failed")
+            if caption:
+                await tg_send(caption)
+
     async def flush_aggregate(key: tuple[str, int]) -> None:
         buf = _pending.pop(key, None)
         if buf is None:
@@ -520,7 +538,15 @@ async def run() -> None:
                     buf = _pending_reduces.pop(key, None)
                     if buf:
                         buf["task"].cancel()
-                    await tg_send(format_event(ev, src.url, src.name))
+                    # Generate PnL card and send as photo; fall back to text
+                    pnl = calculate_pnl(ev)
+                    is_win = pnl is not None and pnl > 0
+                    wins, total = record_result(is_win)
+                    card_bytes = generate_pnl_card(ev, src.name, wins, total)
+                    if card_bytes:
+                        await tg_send_photo(card_bytes, caption=src.url)
+                    else:
+                        await tg_send(format_event(ev, src.url, src.name))
 
                 elif ev.kind == EventKind.REDUCE:
                     # Batch partial-close fills over 30s — avoids spam when many
