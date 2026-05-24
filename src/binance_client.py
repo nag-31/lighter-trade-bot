@@ -84,12 +84,14 @@ class BinanceClient:
         source: str = "",
         rest_base: str = _REST_BASE,
         ws_base: str = _WS_BASE,
+        proxy_url: Optional[str] = None,
     ) -> None:
         self.source = source
         self._api_key    = api_key
         self._api_secret = api_secret.encode()   # bytes for hmac
         self._rest_base  = rest_base.rstrip("/")
         self._ws_base    = ws_base.rstrip("/")
+        self._proxy_url  = proxy_url   # e.g. "socks5h://host:1080" or None
 
         # Market maps ---------------------------------------------------
         # _sym_to_id : "BTCUSDT" → int   (full Binance symbol)
@@ -110,13 +112,16 @@ class BinanceClient:
         self._closed:     bool = False
         self._listen_key: Optional[str] = None
 
-        # Async HTTP client (shared across all calls)
+        # Async HTTP client — routes through proxy if configured
         self._http = httpx.AsyncClient(
             base_url=self._rest_base,
             headers={"X-MBX-APIKEY": self._api_key},
             timeout=10.0,
+            **({"proxy": proxy_url} if proxy_url else {}),
         )
 
+        if proxy_url:
+            log.info("[%s] Binance REST will route via proxy %s", source, proxy_url)
         log.info("[%s] Binance client initialized", source)
 
     # ------------------------------------------------------------------ #
@@ -475,11 +480,10 @@ class BinanceClient:
                 ws_url = f"{self._ws_base}/{listen_key}"
                 log.info("[%s] Binance WS connecting to user data stream…", self.source)
 
-                async with websockets.connect(
-                    ws_url,
-                    ping_interval=20,
-                    ping_timeout=30,
-                ) as ws:
+                connect_kwargs: dict = {"ping_interval": 20, "ping_timeout": 30}
+                if self._proxy_url:
+                    connect_kwargs["proxy"] = self._proxy_url
+                async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     log.info("[%s] Binance WS connected", self.source)
                     backoff = _BACKOFF_INITIAL  # reset on successful connect
 

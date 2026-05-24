@@ -72,6 +72,18 @@ class Source:
     seen_tids: set[int] = field(default_factory=set)
 
 
+def _proxy_url() -> Optional[str]:
+    """Return the SOCKS5 proxy URL from env, or None if not set.
+
+    Set SOCKS_PROXY_URL=socks5h://host:1080 in .env to route Lighter and
+    Binance traffic through a proxy in a non-restricted jurisdiction.
+    Hyperliquid does NOT use this proxy (it is not geo-blocked).
+    Use socks5h:// (not socks5://) so DNS resolves on the proxy side.
+    """
+    url = os.getenv("SOCKS_PROXY_URL", "").strip()
+    return url if url else None
+
+
 def _build_source(raw: dict) -> Optional[Source]:
     stype = str(raw.get("type", "")).lower().strip()
     name = str(raw.get("name", "")).strip()
@@ -91,7 +103,10 @@ def _build_source(raw: dict) -> Optional[Source]:
             log.warning("lighter source '%s' missing 'pool_id' — skipping", name)
             return None
         pool_id = int(pool_id)
-        client = LighterClient(pool_id, LIGHTER_REST_BASE, LIGHTER_WS_URL, source=name)
+        client = LighterClient(
+            pool_id, LIGHTER_REST_BASE, LIGHTER_WS_URL,
+            source=name, proxy_url=_proxy_url(),
+        )
         return Source(
             id=f"lighter:{pool_id}",
             name=name,
@@ -134,7 +149,7 @@ def _build_source(raw: dict) -> Optional[Source]:
                 name,
             )
             return None
-        client = BinanceClient(api_key, api_secret, source=name)
+        client = BinanceClient(api_key, api_secret, source=name, proxy_url=_proxy_url())
         return Source(
             id=f"binance:{name.lower().replace(' ', '_')}",
             name=name,

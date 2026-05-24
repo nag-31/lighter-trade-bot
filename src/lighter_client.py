@@ -32,12 +32,28 @@ log = logging.getLogger(__name__)
 
 
 class LighterClient:
-    def __init__(self, pool_id: int, rest_base: str, ws_url: str, source: str = ""):
+    def __init__(
+        self,
+        pool_id: int,
+        rest_base: str,
+        ws_url: str,
+        source: str = "",
+        proxy_url: Optional[str] = None,
+    ):
         self.pool_id = pool_id
         self.source = source
         self._rest_base = rest_base.rstrip("/")
         self._ws_url = ws_url
-        self._http = httpx.AsyncClient(timeout=20.0)
+        self._proxy_url = proxy_url  # e.g. "socks5h://host:1080" or None
+
+        # httpx AsyncClient — routes through proxy if configured
+        self._http = httpx.AsyncClient(
+            timeout=20.0,
+            **({"proxy": proxy_url} if proxy_url else {}),
+        )
+        if proxy_url:
+            log.info("[%s] Lighter REST will route via proxy %s", source, proxy_url)
+
         # market_id -> human symbol (e.g. 0 -> "BTC"); populated by bootstrap_markets()
         self._symbols: dict[int, str] = {}
 
@@ -212,12 +228,14 @@ class LighterClient:
         backoff = 1.0
         while True:
             try:
-                async with websockets.connect(
-                    self._ws_url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    additional_headers={"Origin": "https://app.lighter.xyz"},
-                ) as ws:
+                connect_kwargs: dict = {
+                    "ping_interval": 20,
+                    "ping_timeout": 20,
+                    "additional_headers": {"Origin": "https://app.lighter.xyz"},
+                }
+                if self._proxy_url:
+                    connect_kwargs["proxy"] = self._proxy_url
+                async with websockets.connect(self._ws_url, **connect_kwargs) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
                         "channel": f"account_all_trades/{self.pool_id}",
