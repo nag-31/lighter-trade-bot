@@ -445,3 +445,4 @@ This may differ slightly from exchange-calculated PnL due to fee deduction.
 | 2026-05-24 | Fix `extra_headers` → `additional_headers` for websockets 16.x | `lighter_client.py` |
 | 2026-05-24 | Discover geo-blocking: Lighter WS + Binance blocked on Azure VM | — (no code change) |
 | 2026-05-24 | Add SOCKS5 proxy support (geo-unblock Lighter WS + Binance) | `lighter_client.py`, `binance_client.py`, `sources.py`, `requirements.txt` |
+| 2026-05-25 | Add SL/TP to alerts (OPEN, SIZE_CHANGE, REDUCE) | `hyperliquid_client.py`, `binance_client.py`, `lighter_client.py`, `formatter.py`, `dashboard.py` |
