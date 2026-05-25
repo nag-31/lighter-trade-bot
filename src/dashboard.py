@@ -11,9 +11,12 @@ Then open: http://localhost:8080/
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import signal
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -38,6 +41,29 @@ log = logging.getLogger("dashboard")
 REST_POLL_SECONDS = 60
 MAX_RECENT_EVENTS = 200
 DB_PATH = Path(__file__).parent.parent / "data" / "events.db"
+PIDFILE = Path("/tmp/lighterbot.pid")
+TG_DEDUP_WINDOW = 90.0  # suppress identical TG messages within this many seconds
+
+
+def _acquire_pid_lock() -> bool:
+    """Return True if we successfully claimed the singleton lock, False if another instance is running."""
+    if PIDFILE.exists():
+        try:
+            pid = int(PIDFILE.read_text().strip())
+            os.kill(pid, 0)  # signal 0 = probe only; raises if process doesn't exist
+            log.error("Another lighterbot instance is already running (PID %d). Exiting.", pid)
+            return False
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass  # stale PID file — previous instance died without cleanup
+    PIDFILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock() -> None:
+    try:
+        PIDFILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -225,6 +251,15 @@ class Hub:
 async def run() -> None:
     load_dotenv()
 
+    if not _acquire_pid_lock():
+        return
+    try:
+        await _run()
+    finally:
+        _release_pid_lock()
+
+
+async def _run() -> None:
     hub = Hub()
     sources: list[Source] = load_sources()
     by_id: dict[str, Source] = {s.id: s for s in sources}
@@ -258,14 +293,27 @@ async def run() -> None:
     AGGREGATE_WINDOW = 30  # seconds — SIZE_CHANGE fills accumulate before one alert fires
 
     # SIZE_CHANGE aggregate buffer
-    # (source_id, market_id) -> {net_added, n_fills, leverage, task}
+    # (source_id, market_id) -> {net_added, n_fills, leverage, position, task}
     _pending: dict[tuple[str, int], dict] = {}
 
     # REDUCE aggregate buffer — same structure, separate dict
-    # (source_id, market_id) -> {net_reduced, n_fills, total_pnl, leverage, task}
+    # (source_id, market_id) -> {net_reduced, n_fills, total_pnl, leverage, position, task}
     _pending_reduces: dict[tuple[str, int], dict] = {}
 
+    # Dedup guard: MD5(alert text) -> monotonic timestamp of last send
+    _tg_sent: dict[str, float] = {}
+
     async def tg_send(text: str) -> None:
+        h = hashlib.md5(text.encode()).hexdigest()
+        now = time.monotonic()
+        # Evict expired entries to prevent unbounded growth
+        expired = [k for k, t in _tg_sent.items() if now - t > TG_DEDUP_WINDOW]
+        for k in expired:
+            del _tg_sent[k]
+        if h in _tg_sent:
+            log.warning("tg_send: suppressed duplicate alert (%.0fs since last send)", now - _tg_sent[h])
+            return
+        _tg_sent[h] = now
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -308,7 +356,10 @@ async def run() -> None:
         src = by_id.get(source_id)
         if src is None:
             return
-        pos = src.tracker.snapshot().get(market_id)
+        # Use the position snapshot captured at fill time; fall back to live tracker
+        # state only if somehow missing. This prevents reconciler interference from
+        # altering the position shown in the alert during the 30s accumulation window.
+        pos = buf.get("position") or src.tracker.snapshot().get(market_id)
         if pos is None:
             log.info("[%s] aggregate flush: market %d already closed, skipping",
                      src.name, market_id)
@@ -341,7 +392,7 @@ async def run() -> None:
         src = by_id.get(source_id)
         if src is None:
             return
-        pos = src.tracker.snapshot().get(market_id)
+        pos = buf.get("position") or src.tracker.snapshot().get(market_id)
         if pos is None:
             log.info("[%s] reduce aggregate flush: market %d already closed, skipping",
                      src.name, market_id)
@@ -367,6 +418,7 @@ async def run() -> None:
         key = (source_id, ev.trade.market_id)
         fill_notional = ev.trade.size * ev.trade.price
         pnl = ev.trade.realized_pnl
+        current_pos = by_id[source_id].tracker.snapshot().get(ev.trade.market_id)
         if key in _pending_reduces:
             _pending_reduces[key]["net_reduced"] += fill_notional
             _pending_reduces[key]["n_fills"] += 1
@@ -375,6 +427,8 @@ async def run() -> None:
                 _pending_reduces[key]["total_pnl"] = (prev or Decimal(0)) + pnl
             if ev.leverage is not None:
                 _pending_reduces[key]["leverage"] = ev.leverage
+            if current_pos is not None:
+                _pending_reduces[key]["position"] = current_pos
         else:
             task = asyncio.get_running_loop().create_task(
                 _delayed_flush_reduce(key, AGGREGATE_WINDOW)
@@ -384,6 +438,7 @@ async def run() -> None:
                 "n_fills": 1,
                 "total_pnl": pnl,
                 "leverage": ev.leverage,
+                "position": current_pos,
                 "task": task,
             }
 
@@ -394,11 +449,17 @@ async def run() -> None:
     def _accumulate_size_change(source_id: str, ev: Event) -> None:
         key = (source_id, ev.trade.market_id)
         fill_notional = ev.trade.size * ev.trade.price
+        # Always refresh the position snapshot — tracker just applied this fill,
+        # so we capture the most up-to-date post-fill state before the reconciler
+        # can overwrite it during the 30s accumulation window.
+        current_pos = by_id[source_id].tracker.snapshot().get(ev.trade.market_id)
         if key in _pending:
             _pending[key]["net_added"] += fill_notional
             _pending[key]["n_fills"] += 1
             if ev.leverage is not None:
                 _pending[key]["leverage"] = ev.leverage
+            if current_pos is not None:
+                _pending[key]["position"] = current_pos
         else:
             task = asyncio.get_running_loop().create_task(
                 _delayed_flush(key, AGGREGATE_WINDOW)
@@ -407,6 +468,7 @@ async def run() -> None:
                 "net_added": fill_notional,
                 "n_fills": 1,
                 "leverage": ev.leverage,
+                "position": current_pos,
                 "task": task,
             }
 
