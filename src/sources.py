@@ -40,6 +40,86 @@ LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 DEFAULT_MIN_NOTIONAL = Decimal("1000")
 
 
+@dataclass(frozen=True)
+class BotSettings:
+    """All runtime-tunable knobs loaded from config.yaml → settings: block.
+
+    Every field has a safe default so the bot starts even if settings: is
+    missing or partially filled in.
+    """
+    default_min_notional_usd: Decimal = DEFAULT_MIN_NOTIONAL
+
+    # Alert toggles
+    alert_on_open: bool        = True
+    alert_on_close: bool       = True
+    alert_on_size_change: bool = True
+    alert_on_reduce: bool      = True
+
+    # Timing (seconds)
+    aggregate_window_seconds:    int = 30
+    rest_poll_seconds:           int = 60
+    reconciler_interval_seconds: int = 60
+    tg_dedup_window_seconds:     int = 90
+
+    # Dashboard
+    dashboard_port:      int = 8080
+    max_recent_events:   int = 200
+
+
+def load_settings(path: str | Path = "config.yaml") -> BotSettings:
+    """Read the optional 'settings:' block from config.yaml.
+
+    Missing keys fall back to BotSettings defaults, so this is always safe.
+    """
+    p = Path(path)
+    raw: dict = {}
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        raw = cfg.get("settings") or {}
+
+    def _bool(key: str, default: bool) -> bool:
+        v = raw.get(key, default)
+        return bool(v)
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(raw.get(key, default))
+        except (TypeError, ValueError):
+            log.warning("settings.%s must be an integer — using default %d", key, default)
+            return default
+
+    def _decimal(key: str, default: Decimal) -> Decimal:
+        try:
+            return Decimal(str(raw.get(key, default)))
+        except Exception:
+            log.warning("settings.%s must be a number — using default %s", key, default)
+            return default
+
+    settings = BotSettings(
+        default_min_notional_usd    = _decimal("default_min_notional_usd", DEFAULT_MIN_NOTIONAL),
+        alert_on_open               = _bool("alert_on_open",        True),
+        alert_on_close              = _bool("alert_on_close",        True),
+        alert_on_size_change        = _bool("alert_on_size_change",  True),
+        alert_on_reduce             = _bool("alert_on_reduce",       True),
+        aggregate_window_seconds    = _int("aggregate_window_seconds",    30),
+        rest_poll_seconds           = _int("rest_poll_seconds",           60),
+        reconciler_interval_seconds = _int("reconciler_interval_seconds", 60),
+        tg_dedup_window_seconds     = _int("tg_dedup_window_seconds",     90),
+        dashboard_port              = _int("dashboard_port",              8080),
+        max_recent_events           = _int("max_recent_events",           200),
+    )
+    log.info(
+        "settings loaded — min_notional=$%s  window=%ds  poll=%ds  dedup=%ds  port=%d",
+        settings.default_min_notional_usd,
+        settings.aggregate_window_seconds,
+        settings.rest_poll_seconds,
+        settings.tg_dedup_window_seconds,
+        settings.dashboard_port,
+    )
+    return settings
+
+
 class ExchangeClient(Protocol):
     """The interface the dashboard depends on. LighterClient and
     HyperliquidClient both satisfy this via duck typing."""
@@ -85,17 +165,18 @@ def _proxy_url() -> Optional[str]:
     return url if url else None
 
 
-def _build_source(raw: dict) -> Optional[Source]:
+def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[Source]:
     stype = str(raw.get("type", "")).lower().strip()
     name = str(raw.get("name", "")).strip()
     if not name:
         log.warning("source entry missing 'name' — skipping: %r", raw)
         return None
 
+    global_min = (settings.default_min_notional_usd if settings else DEFAULT_MIN_NOTIONAL)
     min_notional = (
         Decimal(str(raw["min_notional_usd"]))
         if raw.get("min_notional_usd") is not None
-        else DEFAULT_MIN_NOTIONAL
+        else global_min
     )
 
     if stype == "lighter":
@@ -168,7 +249,10 @@ def _build_source(raw: dict) -> Optional[Source]:
     return None
 
 
-def load_sources(path: str | Path = "config.yaml") -> list[Source]:
+def load_sources(
+    path: str | Path = "config.yaml",
+    settings: "BotSettings | None" = None,
+) -> list[Source]:
     """Parse config.yaml and build a Source per entry. Raises if no valid source."""
     p = Path(path)
     if not p.exists():
@@ -185,7 +269,7 @@ def load_sources(path: str | Path = "config.yaml") -> list[Source]:
     for raw in raw_sources:
         if not isinstance(raw, dict):
             continue
-        src = _build_source(raw)
+        src = _build_source(raw, settings=settings)
         if src is None:
             continue
         if src.id in seen_ids:

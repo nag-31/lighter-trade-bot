@@ -32,17 +32,14 @@ from .db import init_db, load_recent_events, save_event
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
-from .sources import Source, load_sources
+from .sources import BotSettings, Source, load_settings, load_sources
 from .types import Event, EventKind, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
 
-REST_POLL_SECONDS = 60
-MAX_RECENT_EVENTS = 200
 DB_PATH = Path(__file__).parent.parent / "data" / "events.db"
 PIDFILE = Path("/tmp/lighterbot.pid")
-TG_DEDUP_WINDOW = 90.0  # suppress identical TG messages within this many seconds
 
 
 def _acquire_pid_lock() -> bool:
@@ -260,15 +257,16 @@ async def run() -> None:
 
 
 async def _run() -> None:
+    cfg = load_settings()
     hub = Hub()
-    sources: list[Source] = load_sources()
+    sources: list[Source] = load_sources(settings=cfg)
     by_id: dict[str, Source] = {s.id: s for s in sources}
 
     log.info("initialising database…")
     await init_db(DB_PATH)
     # recent_events holds Event objects (new this session) and dicts (loaded from DB).
     # _to_jsonable handles both transparently.
-    recent_events: list[Any] = list(await load_recent_events(DB_PATH, MAX_RECENT_EVENTS))
+    recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
 
     # Bootstrap every source: markets, seed positions, anchor last_trade_id so
@@ -290,7 +288,7 @@ async def _run() -> None:
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_channel = os.environ.get("TELEGRAM_CHANNEL_ID", "")
     tg_client = httpx.AsyncClient(timeout=15.0)
-    AGGREGATE_WINDOW = 30  # seconds — SIZE_CHANGE fills accumulate before one alert fires
+    AGGREGATE_WINDOW = cfg.aggregate_window_seconds
 
     # SIZE_CHANGE aggregate buffer
     # (source_id, market_id) -> {net_added, n_fills, leverage, position, task}
@@ -306,12 +304,14 @@ async def _run() -> None:
     async def tg_send(text: str) -> None:
         h = hashlib.md5(text.encode()).hexdigest()
         now = time.monotonic()
+        dedup_window = cfg.tg_dedup_window_seconds
         # Evict expired entries to prevent unbounded growth
-        expired = [k for k, t in _tg_sent.items() if now - t > TG_DEDUP_WINDOW]
+        expired = [k for k, t in _tg_sent.items() if now - t > dedup_window]
         for k in expired:
             del _tg_sent[k]
         if h in _tg_sent:
-            log.warning("tg_send: suppressed duplicate alert (%.0fs since last send)", now - _tg_sent[h])
+            log.warning("tg_send: suppressed duplicate alert (%.0fs since last send, window=%ds)",
+                        now - _tg_sent[h], dedup_window)
             return
         _tg_sent[h] = now
         try:
@@ -513,7 +513,7 @@ async def _run() -> None:
         TG alert so the user is always notified of a close.
         """
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(cfg.reconciler_interval_seconds)
             try:
                 actual = await src.client.current_positions()
                 tracked = src.tracker.snapshot()
@@ -563,7 +563,7 @@ async def _run() -> None:
 
     async def rest_safety_producer(src: Source) -> None:
         while True:
-            await asyncio.sleep(REST_POLL_SECONDS)
+            await asyncio.sleep(cfg.rest_poll_seconds)
             try:
                 trades = await src.client.fetch_trades_since(src.last_trade_id)
                 for t in trades:
@@ -586,7 +586,7 @@ async def _run() -> None:
             for ev in events:
                 ev.leverage = await src.client.fetch_leverage(ev.trade.market_id)
                 recent_events.insert(0, ev)
-                del recent_events[MAX_RECENT_EVENTS:]
+                del recent_events[cfg.max_recent_events:]
                 await hub.broadcast(snapshot_payload("event", {"event": ev}))
                 await save_event(
                     DB_PATH,
@@ -605,7 +605,7 @@ async def _run() -> None:
                 if ev.kind == EventKind.OPEN:
                     # Cancel any pending aggregate for this market (position flipped)
                     _cancel_pending(key)
-                    if passes_min_notional(ev, src.min_notional):
+                    if cfg.alert_on_open and passes_min_notional(ev, src.min_notional):
                         sl, tp = await _get_sl_tp(src, ev.trade.market_id)
                         await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
 
@@ -615,25 +615,26 @@ async def _run() -> None:
                     buf = _pending_reduces.pop(key, None)
                     if buf:
                         buf["task"].cancel()
-                    # Generate PnL card and send as photo; fall back to text
-                    pnl = calculate_pnl(ev)
-                    is_win = pnl is not None and pnl > 0
-                    wins, total = record_result(is_win)
-                    card_bytes = generate_pnl_card(ev, src.name, wins, total)
-                    if card_bytes:
-                        await tg_send_photo(card_bytes, caption=src.url)
-                    else:
-                        await tg_send(format_event(ev, src.url, src.name))
+                    if cfg.alert_on_close:
+                        # Generate PnL card and send as photo; fall back to text
+                        pnl = calculate_pnl(ev)
+                        is_win = pnl is not None and pnl > 0
+                        wins, total = record_result(is_win)
+                        card_bytes = generate_pnl_card(ev, src.name, wins, total)
+                        if card_bytes:
+                            await tg_send_photo(card_bytes, caption=src.url)
+                        else:
+                            await tg_send(format_event(ev, src.url, src.name))
 
                 elif ev.kind == EventKind.REDUCE:
-                    # Batch partial-close fills over 30s — avoids spam when many
-                    # small fills close a position incrementally.
-                    if passes_min_notional(ev, src.min_notional):
+                    # Batch partial-close fills — avoids spam on incremental closes.
+                    if cfg.alert_on_reduce and passes_min_notional(ev, src.min_notional):
                         _accumulate_reduce(source_id, ev)
 
                 elif ev.kind == EventKind.SIZE_CHANGE:
-                    # Batch same-side adds over 30s — avoids spam for rapid scaling in.
-                    _accumulate_size_change(source_id, ev)
+                    # Batch same-side adds — avoids spam for rapid scaling in.
+                    if cfg.alert_on_size_change:
+                        _accumulate_size_change(source_id, ev)
 
     # --- HTTP routes ---
     async def index(_request: web.Request) -> web.Response:
@@ -662,9 +663,9 @@ async def _run() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    site = web.TCPSite(runner, "0.0.0.0", cfg.dashboard_port)
     await site.start()
-    log.info("dashboard on http://localhost:8080/  (%d source(s))", len(sources))
+    log.info("dashboard on http://localhost:%d/  (%d source(s))", cfg.dashboard_port, len(sources))
 
     tasks = [consumer()]
     for s in sources:

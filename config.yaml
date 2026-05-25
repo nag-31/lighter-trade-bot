@@ -1,21 +1,67 @@
-# Tracked sources — plug and play.
-# Add any entry below, restart the dashboard, done.
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETTINGS — tweak these without touching any Python code
+# Restart the bot after any change: sudo systemctl restart lighterbot
+# ═══════════════════════════════════════════════════════════════════════════════
+
+settings:
+
+  # ── Position size filter ─────────────────────────────────────────────────
+  # Minimum position notional (USD) to fire a Telegram alert.
+  # Per-source overrides in the sources list below take priority.
+  # Set to 0 to alert on every fill regardless of size.
+  default_min_notional_usd: 1000
+
+  # ── Alert types ──────────────────────────────────────────────────────────
+  # Toggle which events send a Telegram message.
+  # The dashboard always shows all events regardless of these flags.
+  alert_on_open: true          # new position opened
+  alert_on_close: true         # position fully closed  (always fires — position is gone)
+  alert_on_size_change: true   # same-side adds to an existing position (batched)
+  alert_on_reduce: true        # partial closes / reduce-only fills (batched)
+
+  # ── Batching window ──────────────────────────────────────────────────────
+  # SIZE_CHANGE and REDUCE fills that arrive within this window are merged into
+  # a single alert showing total notional + fill count.
+  # Lower = more real-time but noisier. Higher = cleaner but delayed.
+  aggregate_window_seconds: 30
+
+  # ── Timing ───────────────────────────────────────────────────────────────
+  # How often the REST safety-net polls for any fills the WebSocket missed.
+  rest_poll_seconds: 60
+
+  # How often positions are re-synced from the exchange API to catch silent closes.
+  reconciler_interval_seconds: 60
+
+  # ── Duplicate suppression ────────────────────────────────────────────────
+  # Identical Telegram messages within this window are silently dropped.
+  # Protects against double-alerts when two bot instances briefly overlap.
+  tg_dedup_window_seconds: 90
+
+  # ── Dashboard ────────────────────────────────────────────────────────────
+  dashboard_port: 8080
+  max_recent_events: 200       # rows visible in the browser event table
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCES — one entry per tracked pool / wallet / account
+# ═══════════════════════════════════════════════════════════════════════════════
 #
 # Supported types:
-#   lighter     -> pool_id (public pool — URL shown in alerts)
-#   hyperliquid -> address loaded from HL_ADDRESS env var
-#   binance     -> credentials loaded from BINANCE_API_KEY + BINANCE_API_SECRET env vars
-#                  (one-way mode only; hedge mode → source skipped with a clear error)
+#   lighter     → pool_id required (public pool URL shown in alerts)
+#   hyperliquid → wallet address loaded from HL_ADDRESS env var (never put it here)
+#   binance     → credentials loaded from BINANCE_API_KEY + BINANCE_API_SECRET env vars
+#                 (one-way / BOTH mode only; hedge mode → source disabled with clear error)
 #
-# All types share:
+# All source types share:
 #   name              — label shown on dashboard and in Telegram alerts
-#   min_notional_usd  — optional per-source alert threshold (default 1000)
+#   min_notional_usd  — per-source override (default: settings.default_min_notional_usd)
+#   footer_url        — optional public URL appended to alerts (HL/Binance only)
 #
 # Security rules (enforced in code):
-#   - HL wallet address  → lives in .env only (HL_ADDRESS); never in this file
-#   - Binance API creds  → live in .env only (BINANCE_API_KEY / BINANCE_API_SECRET)
-#   - footer_url         → optional public website appended to HL/Binance alerts
-#                          (wallet address is NEVER used here — only explicit public URLs)
+#   - HL wallet address  → .env only (HL_ADDRESS);                     never here
+#   - Binance API creds  → .env only (BINANCE_API_KEY / _SECRET);      never here
+#   - Lighter pool URL   → safe to show (it's a public URL)
+#   - footer_url         → only put a public website here, NOT an account URL
 
 sources:
   - type: lighter
@@ -26,7 +72,7 @@ sources:
     name: "HL"
     # address loaded from HL_ADDRESS env var
     min_notional_usd: 10
-    footer_url: ""   # ← put your website URL here e.g. https://enkapital.com
+    footer_url: ""   # ← your public website e.g. https://enkapital.com
 
   - type: binance
     name: "Binance"
