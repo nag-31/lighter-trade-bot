@@ -35,7 +35,23 @@ def _footer(pool_url: str) -> str:
     return f"\n{pool_url}" if pool_url else ""
 
 
-def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
+def _fmt_sl_tp(sl: Optional[Decimal], tp: Optional[Decimal]) -> str:
+    """Return '\nSL: $x  |  TP: $y' line, or '' if neither is set."""
+    parts = []
+    if sl is not None:
+        parts.append(f"SL: {_fmt_price(sl)}")
+    if tp is not None:
+        parts.append(f"TP: {_fmt_price(tp)}")
+    return ("\n" + "  |  ".join(parts)) if parts else ""
+
+
+def format_event(
+    event: Event,
+    pool_url: str,
+    source_name: str = "",
+    sl: Optional[Decimal] = None,
+    tp: Optional[Decimal] = None,
+) -> str:
     t = event.trade
     direction = _direction_emoji(t.side)
 
@@ -50,6 +66,7 @@ def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
             body += f"  |  {event.leverage:g}x"
         if t.realized_pnl is not None:
             body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+        # No SL/TP on CLOSE — orders are cancelled when position closes
 
     elif event.kind == EventKind.REDUCE and event.position_before is not None and event.position_after is not None:
         pos_b = event.position_before
@@ -63,6 +80,7 @@ def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
             body += f"  |  {event.leverage:g}x"
         if t.realized_pnl is not None:
             body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+        body += _fmt_sl_tp(sl, tp)
 
     else:
         notional = t.size * t.price
@@ -74,6 +92,7 @@ def format_event(event: Event, pool_url: str, source_name: str = "") -> str:
         )
         if event.leverage is not None:
             body += f"  |  {event.leverage:g}x"
+        body += _fmt_sl_tp(sl, tp)
 
     return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
@@ -85,6 +104,8 @@ def format_aggregate(
     leverage: Optional[float],
     pool_url: str,
     source_name: str = "",
+    sl: Optional[Decimal] = None,
+    tp: Optional[Decimal] = None,
 ) -> str:
     """Message for a batched SIZE_CHANGE: N fills → resulting position."""
     direction = _direction_emoji(position.side)
@@ -96,6 +117,7 @@ def format_aggregate(
     )
     if leverage is not None:
         body += f"  |  {leverage:g}x"
+    body += _fmt_sl_tp(sl, tp)
     return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
 
@@ -107,6 +129,8 @@ def format_reduce_aggregate(
     leverage: Optional[float],
     pool_url: str,
     source_name: str = "",
+    sl: Optional[Decimal] = None,
+    tp: Optional[Decimal] = None,
 ) -> str:
     """Message for batched REDUCE fills: N partial-close fills → remaining position."""
     direction = _direction_emoji(position.side)
@@ -119,4 +143,5 @@ def format_reduce_aggregate(
         body += f"  |  {leverage:g}x"
     if realized_pnl is not None:
         body += f"\nP&L: {_fmt_pnl(realized_pnl)}"
+    body += _fmt_sl_tp(sl, tp)
     return f"{_header(source_name)}{body}{_footer(pool_url)}"

@@ -258,6 +258,55 @@ class HyperliquidClient:
         return None
 
     # ------------------------------------------------------------------ #
+    # Protocol: fetch_sl_tp                                               #
+    # ------------------------------------------------------------------ #
+
+    async def fetch_sl_tp(
+        self, market_id: int
+    ) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Return (stop_loss_price, take_profit_price) from open trigger orders.
+
+        HL includes SL/TP in the standard open_orders response as orders with
+        triggerCondition='sl'/'tp' and a non-zero triggerPx.
+        Returns (None, None) on any error — alerts still fire without SL/TP.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            orders = await loop.run_in_executor(
+                None, self._info.open_orders, self.address
+            )
+        except Exception:
+            log.debug("[%s] HL fetch_sl_tp failed", self.source)
+            return None, None
+
+        if not isinstance(orders, list):
+            return None, None
+
+        coin = self._market_symbol(market_id).upper()
+        sl: Optional[Decimal] = None
+        tp: Optional[Decimal] = None
+
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("coin", "")).upper() != coin:
+                continue
+
+            trigger_px = _to_decimal(order.get("triggerPx"))
+            if trigger_px is None or trigger_px == 0:
+                continue
+
+            cond = str(order.get("triggerCondition", "")).lower()
+            otype = str(order.get("orderType", "")).lower()
+
+            if cond == "sl" or "stop" in otype:
+                sl = trigger_px
+            elif cond == "tp" or "take profit" in otype:
+                tp = trigger_px
+
+        return sl, tp
+
+    # ------------------------------------------------------------------ #
     # Protocol: fetch_trades_since (REST gap-fill)                        #
     # ------------------------------------------------------------------ #
 

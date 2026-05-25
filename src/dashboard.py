@@ -293,6 +293,13 @@ async def run() -> None:
             if caption:
                 await tg_send(caption)
 
+    async def _get_sl_tp(src: Source, market_id: int):
+        """Fetch SL/TP from client; returns (None, None) silently on any error."""
+        try:
+            return await src.client.fetch_sl_tp(market_id)
+        except Exception:
+            return None, None
+
     async def flush_aggregate(key: tuple[str, int]) -> None:
         buf = _pending.pop(key, None)
         if buf is None:
@@ -310,6 +317,7 @@ async def run() -> None:
             log.info("[%s] aggregate flush: %s notional $%.0f below min, skipping",
                      src.name, pos.market_symbol, pos.notional_usd)
             return
+        sl, tp = await _get_sl_tp(src, market_id)
         text = format_aggregate(
             position=pos,
             net_added_usd=buf["net_added"],
@@ -317,6 +325,8 @@ async def run() -> None:
             leverage=buf["leverage"],
             pool_url=src.url,
             source_name=src.name,
+            sl=sl,
+            tp=tp,
         )
         log.info("[%s] aggregate alert: %s +$%.0f across %d fills → $%.0f",
                  src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
@@ -336,6 +346,7 @@ async def run() -> None:
             log.info("[%s] reduce aggregate flush: market %d already closed, skipping",
                      src.name, market_id)
             return
+        sl, tp = await _get_sl_tp(src, market_id)
         text = format_reduce_aggregate(
             position=pos,
             net_reduced_usd=buf["net_reduced"],
@@ -344,6 +355,8 @@ async def run() -> None:
             leverage=buf["leverage"],
             pool_url=src.url,
             source_name=src.name,
+            sl=sl,
+            tp=tp,
         )
         log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
                  src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
@@ -531,7 +544,8 @@ async def run() -> None:
                     # Cancel any pending aggregate for this market (position flipped)
                     _cancel_pending(key)
                     if passes_min_notional(ev, src.min_notional):
-                        await tg_send(format_event(ev, src.url, src.name))
+                        sl, tp = await _get_sl_tp(src, ev.trade.market_id)
+                        await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
 
                 elif ev.kind == EventKind.CLOSE:
                     # Cancel any pending SIZE_CHANGE or REDUCE aggregate — position gone

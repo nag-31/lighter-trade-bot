@@ -180,6 +180,64 @@ class LighterClient:
                         pass
         return None
 
+    # ----- SL / TP -----
+
+    async def fetch_sl_tp(
+        self, market_id: int
+    ) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Best-effort fetch of SL/TP from Lighter open conditional orders.
+
+        Tries GET /orders with status=open. If the endpoint doesn't exist or
+        returns an unexpected shape, silently returns (None, None) — alerts
+        still fire without SL/TP.
+        """
+        try:
+            r = await self._http.get(
+                f"{self._rest_base}/orders",
+                params={"account_index": self.pool_id, "status": "open"},
+            )
+            if r.status_code != 200:
+                return None, None
+            body = r.json()
+        except Exception:
+            return None, None
+
+        orders = body if isinstance(body, list) else (
+            body.get("orders") or body.get("data") or []
+        )
+        if not isinstance(orders, list):
+            return None, None
+
+        sl: Optional[Decimal] = None
+        tp: Optional[Decimal] = None
+
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if int(order.get("market_id", -1)) != market_id:
+                continue
+
+            otype = str(
+                order.get("type") or order.get("order_type") or ""
+            ).lower()
+            # Lighter uses "trigger_price" or "price" depending on order type
+            px_str = order.get("trigger_price") or order.get("price")
+            price = None
+            if px_str is not None:
+                try:
+                    price = Decimal(str(px_str))
+                except Exception:
+                    pass
+            if price is None or price == 0:
+                continue
+
+            if "stop" in otype or otype in ("sl", "stop_loss"):
+                sl = price
+            elif "take_profit" in otype or otype in ("tp", "take_profit"):
+                tp = price
+
+        return sl, tp
+
     # ----- trades: REST safety net -----
 
     async def fetch_trades_since(self, since_trade_id: Optional[int], limit: int = 100) -> list[Trade]:

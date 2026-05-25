@@ -371,6 +371,44 @@ class BinanceClient:
         return None
 
     # ------------------------------------------------------------------ #
+    # Protocol: fetch_sl_tp                                               #
+    # ------------------------------------------------------------------ #
+
+    async def fetch_sl_tp(
+        self, market_id: int
+    ) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Return (stop_loss_price, take_profit_price) from open reduce-only orders.
+
+        Looks for STOP_MARKET / STOP (SL) and TAKE_PROFIT_MARKET / TAKE_PROFIT (TP)
+        orders on the given symbol. Returns (None, None) on any error.
+        """
+        if self._hedge_mode:
+            return None, None
+
+        full = self._full_symbol(market_id)
+        data = await self._get("/fapi/v1/openOrders", {"symbol": full})
+        if not isinstance(data, list):
+            return None, None
+
+        sl: Optional[Decimal] = None
+        tp: Optional[Decimal] = None
+
+        for order in data:
+            if not isinstance(order, dict):
+                continue
+            otype = str(order.get("type", ""))
+            stop_px = _to_decimal(order.get("stopPrice"))
+            if stop_px is None or stop_px == 0:
+                continue
+
+            if otype in ("STOP_MARKET", "STOP"):
+                sl = stop_px
+            elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                tp = stop_px
+
+        return sl, tp
+
+    # ------------------------------------------------------------------ #
     # Protocol: fetch_trades_since (REST safety net)                      #
     # ------------------------------------------------------------------ #
 
