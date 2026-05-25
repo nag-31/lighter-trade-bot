@@ -4,7 +4,7 @@
 > Captures architecture decisions, bugs found, fixes applied, and lessons learned
 > as the bot evolves. Updated after every significant change.
 >
-> **Last updated**: 2026-05-24
+> **Last updated**: 2026-05-25
 
 ---
 
@@ -336,6 +336,40 @@ fill corrupted the local view
 **Fix**: Reconciler always calls `tracker.seed(actual)` with API data. Tracker local
 calculation is only used for fill-by-fill event classification, never for display  
 **File**: `src/dashboard.py`
+
+---
+
+### BUG-011 — Double alert: same fills fired twice with different position sizes
+**Date**: 2026-05-25  
+**Symptom**: Two Telegram alerts at the same time for DOGE LONG SIZE_CHANGE:
+- Alert 1: 8 fills, +$4,986, position now **$9,148**
+- Alert 2: 8 fills, +$4,986, position now **$5,002**
+- Same source ("My NK pool"), same avg entry ($0.102488), same leverage (10x)
+- Dashboard briefly showed 9 open positions then corrected
+
+**Root cause (most likely)**: Two bot instances briefly running simultaneously.
+When systemd restarts the bot (e.g. after a crash), the old process may still be
+alive for several seconds. Both instances have independent in-memory `seen_tids`
+sets, so neither deduplicates the other's fills. Both process all 8 fills,
+create separate `_pending` buffers, and fire separate alerts 30 seconds later.
+The different final positions reflect the two instances' tracker states diverging.
+
+**Secondary cause**: `flush_aggregate` was reading `src.tracker.snapshot()` at
+flush time (30s after fills) rather than at fill time — the reconciler could
+have changed tracker state during that window.
+
+**Fix applied** (commit `7ff6ea7`):
+1. **PID lock** (`/tmp/lighterbot.pid`): new instance checks if a process with
+   the stored PID is alive; if yes, logs error and exits immediately.
+2. **TG alert dedup** (90s window): MD5 of message text is checked before every
+   `tg_send`; identical message within 90s is suppressed with a log warning.
+3. **Position snapshot in buffer**: `_accumulate_size_change` / `_accumulate_reduce`
+   now store `tracker.snapshot()` in the buffer at fill time (refreshed with each
+   fill). `flush_aggregate` uses `buf["position"]` instead of re-querying the
+   tracker, ensuring the alert always shows the post-fill position regardless
+   of what the reconciler does during the 30s window.
+
+**Files**: `src/dashboard.py`
 
 ---
 
