@@ -14,7 +14,8 @@
 # Security rules (enforced in code):
 #   - HL wallet address  → lives in .env only (HL_ADDRESS); never in this file
 #   - Binance API creds  → live in .env only (BINANCE_API_KEY / BINANCE_API_SECRET)
-#   - url=""             → HL and Binance sources never expose account info in TG
+#   - footer_url         → optional public website appended to HL/Binance alerts
+#                          (wallet address is NEVER used here — only explicit public URLs)
 
 sources:
   - type: lighter
@@ -25,6 +26,7 @@ sources:
     name: "HL"
     # address loaded from HL_ADDRESS env var
     min_notional_usd: 10
+    footer_url: ""   # ← put your website URL here e.g. https://enkapital.com
 
   - type: binance
     name: "Binance"

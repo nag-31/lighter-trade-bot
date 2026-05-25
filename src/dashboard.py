@@ -53,7 +53,7 @@ def _acquire_pid_lock() -> bool:
             os.kill(pid, 0)  # signal 0 = probe only; raises if process doesn't exist
             log.error("Another lighterbot instance is already running (PID %d). Exiting.", pid)
             return False
-        except (ProcessLookupError, PermissionError, ValueError):
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
             pass  # stale PID file — previous instance died without cleanup
     PIDFILE.write_text(str(os.getpid()))
     return True

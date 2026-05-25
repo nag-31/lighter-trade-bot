@@ -128,13 +128,16 @@ def _build_source(raw: dict) -> Optional[Source]:
                 name,
             )
             return None
+        # footer_url is an optional public website to append to HL alerts.
+        # The HL explorer URL is intentionally NOT used here — it exposes the wallet address.
+        footer_url = str(raw.get("footer_url", "")).strip()
         client = HyperliquidClient(address, source=name)
         return Source(
             id=f"hyperliquid:{address.lower()}",
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
-            url="",          # never expose wallet address in public TG messages
+            url=footer_url,   # wallet address is NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
         )
 
@@ -150,13 +153,14 @@ def _build_source(raw: dict) -> Optional[Source]:
                 name,
             )
             return None
+        footer_url = str(raw.get("footer_url", "")).strip()
         client = BinanceClient(api_key, api_secret, source=name, proxy_url=_proxy_url())
         return Source(
             id=f"binance:{name.lower().replace(' ', '_')}",
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
-            url="",          # never expose API keys or account info in public TG messages
+            url=footer_url,  # API keys/account info are NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
         )
 
