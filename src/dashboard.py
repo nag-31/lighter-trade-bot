@@ -494,7 +494,7 @@ async def _run() -> None:
             "type": type_,
             "sources": [s.name for s in sources],
             "positions": all_positions(),
-            "recent_events": recent_events[:MAX_RECENT_EVENTS],
+            "recent_events": recent_events[:cfg.max_recent_events],
         }
         if extra:
             payload.update(extra)
