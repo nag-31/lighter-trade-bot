@@ -635,87 +635,71 @@ class TestEdgeCases:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rapid open+close suppression
+# Fill-based OPEN trust (do NOT suppress based on _dash_positions)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRapidOpenCloseSuppression:
-    """Position opened and closed within one REST poll cycle (< 60s).
-    Both fills arrive together in the same poll batch.
-    The stale OPEN alert must be suppressed; PnL card still fires from CLOSE fill.
+class TestFillBasedOpenTrust:
+    """The fill-based OPEN handler should send the alert whenever:
+      - the reconciler flag is not set (reconciler hasn't already alerted), and
+      - the fill passes the min-notional filter.
+
+    It must NOT consult _dash_positions, because on Lighter pool the /account
+    endpoint can lag /trades by 30-90s (ZK rollup settlement). Suppressing
+    OPEN alerts based on a stale /account snapshot silently drops legitimate
+    opens — this regression was introduced 2026-05-28 and reverted.
     """
 
     def _should_send_open(
         self,
         source_id: str,
         market_id: int,
-        dash_positions: dict,
         reconciler_alerted: set,
     ) -> bool:
-        """Replicate the fill-based OPEN alert decision from dashboard._run()."""
+        """Replicate the fill-based OPEN alert decision (post-revert)."""
         key = (source_id, market_id)
         if key in reconciler_alerted:
-            return False  # reconciler already alerted — suppress
-        if market_id not in dash_positions.get(source_id, {}):
-            return False  # position already gone — rapid open+close, suppress
-        return True
+            return False
+        return True   # _dash_positions is intentionally NOT consulted
 
-    def test_open_fill_suppressed_when_position_already_closed(self):
-        """REST poll delivers open fill but position is already gone from API snapshot."""
-        dash_positions = {"src": {}}   # empty — position closed before reconciler saw it
+    def test_open_sent_when_dash_positions_empty(self):
+        """Critical regression test: /account is laggy, _dash_positions empty,
+        but the fill arrived → still send the OPEN alert."""
         reconciler_alerted: set = set()
-        assert self._should_send_open("src", 0, dash_positions, reconciler_alerted) is False
+        assert self._should_send_open("src", 0, reconciler_alerted) is True
 
-    def test_open_fill_sent_when_position_still_open(self):
-        """Normal case: REST poll delivers fill and position is still open."""
-        pos = make_position(market_id=0)
-        dash_positions = {"src": {0: pos}}
+    def test_open_sent_when_position_still_open(self):
+        """Normal case."""
         reconciler_alerted: set = set()
-        assert self._should_send_open("src", 0, dash_positions, reconciler_alerted) is True
+        assert self._should_send_open("src", 0, reconciler_alerted) is True
 
-    def test_reconciler_alerted_suppresses_before_dash_check(self):
-        """If reconciler flag is set, suppress even if _dash_positions still has position."""
-        pos = make_position(market_id=0)
-        dash_positions = {"src": {0: pos}}
-        reconciler_alerted = {("src", 0)}   # reconciler already sent the alert
-        assert self._should_send_open("src", 0, dash_positions, reconciler_alerted) is False
+    def test_reconciler_flag_still_suppresses(self):
+        """If reconciler already alerted, fill-based path must still suppress."""
+        reconciler_alerted = {("src", 0)}
+        assert self._should_send_open("src", 0, reconciler_alerted) is False
 
-    def test_different_market_not_affected(self):
-        """Position closed on market 0 doesn't suppress OPEN for market 1."""
-        pos1 = make_position(market_id=1)
-        dash_positions = {"src": {1: pos1}}   # market 0 is gone, market 1 is open
-        reconciler_alerted: set = set()
-        assert self._should_send_open("src", 0, dash_positions, reconciler_alerted) is False
-        assert self._should_send_open("src", 1, dash_positions, reconciler_alerted) is True
+    def test_reconciler_flag_only_for_matching_key(self):
+        """Flag for one market doesn't suppress OPEN on another market."""
+        reconciler_alerted = {("src", 0)}
+        assert self._should_send_open("src", 1, reconciler_alerted) is True
 
-    def test_different_source_not_affected(self):
-        """Position closed on src_a doesn't suppress OPEN for same market on src_b."""
-        pos = make_position(market_id=0)
-        dash_positions = {
-            "src_a": {},        # position gone on src_a
-            "src_b": {0: pos},  # still open on src_b
-        }
-        reconciler_alerted: set = set()
-        assert self._should_send_open("src_a", 0, dash_positions, reconciler_alerted) is False
-        assert self._should_send_open("src_b", 0, dash_positions, reconciler_alerted) is True
+    def test_reconciler_flag_isolated_per_source(self):
+        """Flag for src_a doesn't suppress OPEN on src_b for the same market."""
+        reconciler_alerted = {("src_a", 0)}
+        assert self._should_send_open("src_b", 0, reconciler_alerted) is True
 
-    def test_rapid_close_fill_still_fires_pnl_card(self):
-        """Even when OPEN is suppressed, the CLOSE fill from the same batch
-        still triggers the PnL card (CLOSE handler is independent of this check)."""
+    def test_rapid_open_close_sends_stale_open_alert(self):
+        """Documented tradeoff: when /trades delivers both open and close fills
+        in the same poll batch, we send the (stale) OPEN alert then the PnL
+        card. This matches the May 26 working behaviour. The alternative —
+        consulting /account — caused worse bugs on Lighter pool."""
         tracker = PositionTracker(source="test")
-        # Open fill processed → OPEN event (would be suppressed in dashboard)
-        events_open = tracker.apply(
+        # Open fill → OPEN event (alert sent)
+        ev_open = tracker.apply(
             make_trade(trade_id=1, side="long", size="10", price="100")
         )
-        assert events_open[0].kind == EventKind.OPEN
-
-        # Close fill processed → CLOSE event (PnL card fires regardless)
-        events_close = tracker.apply(
+        assert ev_open[0].kind == EventKind.OPEN
+        # Close fill → CLOSE event (PnL card sent)
+        ev_close = tracker.apply(
             make_trade(trade_id=2, side="short", size="10", price="110")
         )
-        assert events_close[0].kind == EventKind.CLOSE
-
-    def test_no_dash_positions_entry_for_source_suppresses(self):
-        """If _dash_positions doesn't have the source at all (edge case), suppress."""
-        dash_positions: dict = {}   # source not even in dict
-        reconciler_alerted: set = set()
-        assert self._should_send_open("src", 0, dash_positions, reconciler_alerted) is False
+        assert ev_close[0].kind == EventKind.CLOSE
