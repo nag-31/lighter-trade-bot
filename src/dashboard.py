@@ -434,6 +434,12 @@ async def _run() -> None:
                 _pending_reduces[key]["leverage"] = ev.leverage
             if current_pos is not None:
                 _pending_reduces[key]["position"] = current_pos
+            # Debounce: reset timer on every new fill (same reason as SIZE_CHANGE)
+            _pending_reduces[key]["task"].cancel()
+            task = asyncio.get_running_loop().create_task(
+                _delayed_flush_reduce(key, AGGREGATE_WINDOW)
+            )
+            _pending_reduces[key]["task"] = task
         else:
             task = asyncio.get_running_loop().create_task(
                 _delayed_flush_reduce(key, AGGREGATE_WINDOW)
@@ -456,7 +462,7 @@ async def _run() -> None:
         fill_notional = ev.trade.size * ev.trade.price
         # Always refresh the position snapshot — tracker just applied this fill,
         # so we capture the most up-to-date post-fill state before the reconciler
-        # can overwrite it during the 30s accumulation window.
+        # can overwrite it during the accumulation window.
         current_pos = by_id[source_id].tracker.snapshot().get(ev.trade.market_id)
         if key in _pending:
             _pending[key]["net_added"] += fill_notional
@@ -465,6 +471,15 @@ async def _run() -> None:
                 _pending[key]["leverage"] = ev.leverage
             if current_pos is not None:
                 _pending[key]["position"] = current_pos
+            # Debounce: reset the timer on every new fill so that fills
+            # arriving across REST poll boundaries (or a WS burst after a
+            # reconnect) are all batched into one alert rather than spilling
+            # into a second window and firing a duplicate alert.
+            _pending[key]["task"].cancel()
+            task = asyncio.get_running_loop().create_task(
+                _delayed_flush(key, AGGREGATE_WINDOW)
+            )
+            _pending[key]["task"] = task
         else:
             task = asyncio.get_running_loop().create_task(
                 _delayed_flush(key, AGGREGATE_WINDOW)

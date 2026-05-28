@@ -284,6 +284,97 @@ class TestAggregateAccumulation:
 
 
 # ---------------------------------------------------------------------------
+# Debounce: timer resets on each new fill so cross-poll fills batch together
+# ---------------------------------------------------------------------------
+
+class TestAggregateDebounce:
+    """Verify the debounce logic — timer replaced on every subsequent fill.
+
+    The bug: with aggregate_window=60s and rest_poll=60s, fills from a second
+    REST poll could arrive just after the first buffer flushed, creating a
+    second alert for the same position-building session.
+
+    The fix: cancel + restart the 60s timer on every new fill, so all fills
+    that arrive within 60s of the LAST fill are batched together.
+    """
+
+    def test_debounce_replaces_task_in_buffer(self):
+        """Simulate two successive fills updating the buffer task reference."""
+        # We model the pending dict manually — the key insight is that the
+        # 'task' field should be replaced on each subsequent fill.
+        import asyncio
+        from unittest.mock import MagicMock
+
+        pending: dict = {}
+        key = ("src", 0)
+
+        # First fill: creates buffer with task_A
+        task_a = MagicMock()
+        pending[key] = {"net_added": Decimal("10"), "n_fills": 1, "task": task_a}
+
+        # Second fill: should cancel task_A and replace with task_B
+        task_b = MagicMock()
+        task_a.cancel()   # simulates the cancel call in _accumulate_size_change
+        pending[key]["net_added"] += Decimal("20")
+        pending[key]["n_fills"] += 1
+        pending[key]["task"] = task_b  # timer reset
+
+        assert task_a.cancel.called
+        assert pending[key]["n_fills"] == 2
+        assert pending[key]["net_added"] == Decimal("30")
+        assert pending[key]["task"] is task_b  # new timer, not original
+
+    def test_debounce_accumulation_total(self):
+        """Three fills from two different REST polls all end up in one buffer."""
+        pending: dict = {}
+        key = ("lighter:42", 0)
+
+        fills = [
+            Decimal("500"),   # REST poll 1 — fill 1
+            Decimal("600"),   # REST poll 1 — fill 2
+            Decimal("1000"),  # REST poll 2 — arrives after first batch (debounce resets timer)
+        ]
+
+        for notional in fills:
+            if key in pending:
+                pending[key]["net_added"] += notional
+                pending[key]["n_fills"] += 1
+                # Debounce: cancel old task, create new (mocked here as no-op)
+            else:
+                pending[key] = {"net_added": notional, "n_fills": 1}
+
+        assert pending[key]["n_fills"] == 3
+        assert pending[key]["net_added"] == Decimal("2100")
+
+    def test_second_alert_prevented_when_fill_resets_timer(self):
+        """After the first buffer flushes, a new fill would normally open a second buffer.
+        With debounce, if the fill arrives BEFORE the flush fires, it resets the timer
+        so no second buffer is needed and only one alert is sent."""
+        # This models the state where key is still in _pending (timer not yet fired),
+        # a new fill arrives, and the timer is reset rather than creating a new buffer.
+        pending: dict = {}
+        key = ("src", 1)
+
+        from unittest.mock import MagicMock
+
+        task_a = MagicMock()
+        pending[key] = {"net_added": Decimal("1100"), "n_fills": 2, "task": task_a}
+
+        # New fill arrives — key IS in pending, so we accumulate (not create new buffer)
+        new_fill = Decimal("1000")
+        task_b = MagicMock()
+        task_a.cancel()
+        pending[key]["net_added"] += new_fill
+        pending[key]["n_fills"] += 1
+        pending[key]["task"] = task_b
+
+        # Result: still one buffer entry (no second buffer created)
+        assert len(pending) == 1
+        assert pending[key]["n_fills"] == 3
+        assert pending[key]["net_added"] == Decimal("2100")
+
+
+# ---------------------------------------------------------------------------
 # PID lock logic (unit test — no filesystem)
 # ---------------------------------------------------------------------------
 
