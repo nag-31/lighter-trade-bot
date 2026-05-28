@@ -717,6 +717,18 @@ async def _run() -> None:
                             "[%s] fill-based OPEN for %s suppressed — reconciler already alerted",
                             src.name, ev.trade.market_symbol,
                         )
+                    elif ev.trade.market_id not in _dash_positions.get(source_id, {}):
+                        # Position is already gone from the API snapshot — the trade
+                        # was opened AND closed within the same REST poll cycle before
+                        # the reconciler could see it open (rapid open+close < 60s).
+                        # Sending a stale OPEN alert here is misleading; skip it.
+                        # The CLOSE fill arriving in the same batch will still fire
+                        # the PnL card so no information is lost.
+                        log.info(
+                            "[%s] fill-based OPEN for %s suppressed — position already closed "
+                            "before REST fill arrived (rapid open+close)",
+                            src.name, ev.trade.market_symbol,
+                        )
                     elif cfg.alert_on_open and passes_min_notional(ev, src.min_notional):
                         await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
 
