@@ -77,22 +77,40 @@ def record_result(is_win: bool) -> tuple[int, int]:
 # PnL helpers
 # ---------------------------------------------------------------------------
 
-def calculate_pnl(event: Event) -> Optional[Decimal]:
+def calculate_pnl(
+    event: Event,
+    accumulated_pnl: Optional[Decimal] = None,
+) -> Optional[Decimal]:
     """Realized PnL for a CLOSE event.
 
-    Uses trade.realized_pnl when available (HL fills carry closedPnl).
-    For Lighter (no per-fill PnL), calculates from entry/exit prices.
+    Uses trade.realized_pnl when available (HL fills carry closedPnl) and
+    adds any accumulated_pnl from previous REDUCE fills for the same position
+    lifecycle so the card reflects the TOTAL position PnL, not just the last fill.
+
+    For Lighter (no per-fill PnL), falls back to calculating from entry/exit prices.
+    accumulated_pnl is still included in the fallback total when provided.
     """
     if event.trade.realized_pnl is not None:
-        return event.trade.realized_pnl
+        total = event.trade.realized_pnl
+        if accumulated_pnl is not None:
+            total = total + accumulated_pnl
+        return total
+
+    # Fallback for Lighter (no per-fill PnL reported by the exchange)
     pos = event.position_before
     if pos is None or pos.avg_entry_price == 0:
-        return None
+        # No position info: return whatever accumulated PnL we have, or None
+        return accumulated_pnl
     t = event.trade
+    # Use t.size (this fill's closed size) — for a CLOSE event this equals
+    # the remaining position size, but using t.size is semantically correct.
     if pos.side == "long":
-        return (t.price - pos.avg_entry_price) * pos.size
+        fill_pnl = (t.price - pos.avg_entry_price) * t.size
     else:
-        return (pos.avg_entry_price - t.price) * pos.size
+        fill_pnl = (pos.avg_entry_price - t.price) * t.size
+    if accumulated_pnl is not None:
+        return fill_pnl + accumulated_pnl
+    return fill_pnl
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +170,7 @@ def generate_pnl_card(
     source_name: str,
     wins: int,
     total: int,
+    accumulated_pnl: Optional[Decimal] = None,
 ) -> Optional[bytes]:
     """Return PNG bytes for the PnL card, or None if Pillow is unavailable."""
     if not PIL_AVAILABLE:
@@ -162,7 +181,7 @@ def generate_pnl_card(
     if pos is None:
         return None
 
-    pnl = calculate_pnl(event)
+    pnl = calculate_pnl(event, accumulated_pnl=accumulated_pnl)
     is_win = pnl is not None and pnl > 0
     accent    = _GREEN if is_win else _RED
     accent_dim = _GREEN_DIM if is_win else _RED_DIM

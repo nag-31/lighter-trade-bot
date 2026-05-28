@@ -116,7 +116,7 @@ INDEX_HTML = """<!doctype html>
   <section>
     <h2>Open positions</h2>
     <table>
-      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">Liq. Price</th></tr></thead>
+      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">SL</th><th class="num">TP</th></tr></thead>
       <tbody id="positions"></tbody>
     </table>
   </section>
@@ -159,11 +159,11 @@ function renderPositions(positions) {
       <td>${esc(p.source)}</td>
       <td>${esc(p.market_symbol)}</td>
       <td class="${p.side}">${p.side.toUpperCase()}</td>
-      <td class="num">${fmtSize(p.size)}</td>
       <td class="num">${fmtPrice(p.avg_entry_price)}</td>
       <td class="num">${fmtUsd(Number(p.size) * Number(p.avg_entry_price))}</td>
       <td class="num">${fmtPnl(p.unrealized_pnl)}</td>
-      <td class="num">${p.liquidation_px != null ? fmtPrice(p.liquidation_px) : "—"}</td>
+      <td class="num">${p.sl_price != null ? fmtPrice(p.sl_price) : "—"}</td>
+      <td class="num">${p.tp_price != null ? fmtPrice(p.tp_price) : "—"}</td>
     </tr>`).join("");
 }
 function renderEvents(events) {
@@ -297,6 +297,11 @@ async def _run() -> None:
     # REDUCE aggregate buffer — same structure, separate dict
     # (source_id, market_id) -> {net_reduced, n_fills, total_pnl, leverage, position, task}
     _pending_reduces: dict[tuple[str, int], dict] = {}
+
+    # SL/TP cache for dashboard display
+    # (source_id, market_id) -> (sl_price, tp_price)  — both Optional[Decimal]
+    # Populated by the reconciler and on OPEN events; purged on CLOSE.
+    _sl_tp_cache: dict[tuple[str, int], tuple] = {}
 
     # Dedup guard: MD5(alert text) -> monotonic timestamp of last send
     _tg_sent: dict[str, float] = {}
@@ -483,10 +488,16 @@ async def _run() -> None:
 
     queue: asyncio.Queue[tuple[str, Trade]] = asyncio.Queue()
 
-    def all_positions() -> list[Position]:
-        out: list[Position] = []
+    def all_positions() -> list[dict]:
+        """Return all open positions as dicts, augmented with cached SL/TP prices."""
+        out: list[dict] = []
         for s in sources:
-            out.extend(s.tracker.snapshot().values())
+            for market_id, pos in s.tracker.snapshot().items():
+                d = asdict(pos)
+                sl, tp = _sl_tp_cache.get((s.id, market_id), (None, None))
+                d["sl_price"] = sl
+                d["tp_price"] = tp
+                out.append(d)
         return out
 
     def snapshot_payload(type_: str, extra: dict | None = None) -> dict:
@@ -551,6 +562,16 @@ async def _run() -> None:
                 # real on-chain values (size, entry, unrealizedPnl, liquidationPx).
                 src.tracker.seed(actual)
 
+                # --- update SL/TP cache for all currently open positions ---
+                for market_id in actual:
+                    sl, tp = await _get_sl_tp(src, market_id)
+                    _sl_tp_cache[(src.id, market_id)] = (sl, tp)
+                # Purge cache entries for positions that are no longer open
+                for cache_key in list(_sl_tp_cache.keys()):
+                    c_src_id, c_market_id = cache_key
+                    if c_src_id == src.id and c_market_id not in actual:
+                        del _sl_tp_cache[cache_key]
+
                 # Broadcast fresh position snapshot to all dashboard clients
                 await hub.broadcast(snapshot_payload("snapshot"))
 
@@ -605,22 +626,33 @@ async def _run() -> None:
                 if ev.kind == EventKind.OPEN:
                     # Cancel any pending aggregate for this market (position flipped)
                     _cancel_pending(key)
+                    # Always fetch and cache SL/TP on open so the dashboard shows it
+                    # immediately without waiting for the next reconciliation cycle.
+                    sl, tp = await _get_sl_tp(src, ev.trade.market_id)
+                    _sl_tp_cache[key] = (sl, tp)
                     if cfg.alert_on_open and passes_min_notional(ev, src.min_notional):
-                        sl, tp = await _get_sl_tp(src, ev.trade.market_id)
                         await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
 
                 elif ev.kind == EventKind.CLOSE:
                     # Cancel any pending SIZE_CHANGE or REDUCE aggregate — position gone
                     _cancel_pending(key)
-                    buf = _pending_reduces.pop(key, None)
-                    if buf:
-                        buf["task"].cancel()
+                    reduce_buf = _pending_reduces.pop(key, None)
+                    # Extract PnL accumulated across prior REDUCE fills so the PnL card
+                    # shows the TOTAL position PnL (all fills combined), not just this one.
+                    accumulated_pnl = reduce_buf["total_pnl"] if reduce_buf else None
+                    if reduce_buf:
+                        reduce_buf["task"].cancel()
+                    # Position is gone — remove from SL/TP cache
+                    _sl_tp_cache.pop(key, None)
                     if cfg.alert_on_close:
                         # Generate PnL card and send as photo; fall back to text
-                        pnl = calculate_pnl(ev)
+                        pnl = calculate_pnl(ev, accumulated_pnl=accumulated_pnl)
                         is_win = pnl is not None and pnl > 0
                         wins, total = record_result(is_win)
-                        card_bytes = generate_pnl_card(ev, src.name, wins, total)
+                        card_bytes = generate_pnl_card(
+                            ev, src.name, wins, total,
+                            accumulated_pnl=accumulated_pnl,
+                        )
                         if card_bytes:
                             await tg_send_photo(card_bytes, caption=src.url)
                         else:
