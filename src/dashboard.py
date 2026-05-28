@@ -269,13 +269,25 @@ async def _run() -> None:
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
 
+    # Dashboard-level position view: API truth, updated by the reconciler.
+    # Kept separate from src.tracker (fill-based classifier) so the reconciler
+    # doesn't corrupt event classification when it seeds positions before fills arrive.
+    _dash_positions: dict[str, dict[int, Position]] = {}
+
+    # Positions for which the reconciler sent an OPEN alert before the fill arrived.
+    # The fill-based OPEN/SIZE_CHANGE handler skips alerting for these keys so the
+    # user never sees a duplicate "Opened" message.
+    _reconciler_alerted_opens: set[tuple[str, int]] = set()
+
     # Bootstrap every source: markets, seed positions, anchor last_trade_id so
     # we don't replay history.
     for s in sources:
         log.info("[%s] bootstrapping markets…", s.name)
         await s.client.bootstrap_markets()
-        s.tracker.seed(await s.client.current_positions())
-        log.info("[%s] seeded with %d positions", s.name, len(s.tracker.snapshot()))
+        init_pos = await s.client.current_positions()
+        s.tracker.seed(init_pos)
+        _dash_positions[s.id] = init_pos
+        log.info("[%s] seeded with %d positions", s.name, len(init_pos))
         latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
         if latest:
             s.last_trade_id = latest[-1].trade_id
@@ -504,10 +516,15 @@ async def _run() -> None:
     queue: asyncio.Queue[tuple[str, Trade]] = asyncio.Queue()
 
     def all_positions() -> list[dict]:
-        """Return all open positions as dicts, augmented with cached SL/TP prices."""
+        """Return all open positions as dicts, augmented with cached SL/TP prices.
+
+        Uses _dash_positions (API truth from reconciler) rather than the fill-based
+        tracker so the dashboard always reflects blockchain reality, independent of
+        whether fills have been processed yet.
+        """
         out: list[dict] = []
         for s in sources:
-            for market_id, pos in s.tracker.snapshot().items():
+            for market_id, pos in _dash_positions.get(s.id, {}).items():
                 d = asdict(pos)
                 sl, tp = _sl_tp_cache.get((s.id, market_id), (None, None))
                 d["sl_price"] = sl
@@ -527,67 +544,113 @@ async def _run() -> None:
         return payload
 
     async def position_reconciler(src: Source) -> None:
-        """Every 60s: pull ground-truth positions from the exchange API and
-        reconcile against the local tracker.
+        """Every N seconds: pull ground-truth positions from the exchange API.
 
-        Positions are ALWAYS replaced by API data — the tracker's calculated
-        state is only used for fill-by-fill event classification.  This ensures
-        the dashboard and Telegram always reflect blockchain reality.
+        Uses two separate comparisons:
+          1. _dash_positions[src.id] (previous API snapshot) vs actual (current API)
+             → detect truly new / silently-closed positions and send TG alerts.
+          2. src.tracker (fill-based classifier) is seeded with API truth so its
+             internal state doesn't drift — EXCEPT for positions that the reconciler
+             just alerted about (fill not yet arrived); those are left to the fill-
+             based path so the OPEN classification fires correctly.
 
-        If a position disappeared from the API while we weren't watching (e.g.
-        closed via many small REDUCE fills each below min_notional), we send a
-        TG alert so the user is always notified of a close.
+        This separation prevents the phantom SIZE_CHANGE bug: reconciler seeds
+        position → fill arrives → tracker classifies as SIZE_CHANGE (not OPEN)
+        → alert is cancelled on close → user never sees an open notification.
         """
         while True:
             await asyncio.sleep(cfg.reconciler_interval_seconds)
             try:
                 actual = await src.client.current_positions()
-                tracked = src.tracker.snapshot()
+                prev_dash = _dash_positions.get(src.id, {})
+                tracked    = src.tracker.snapshot()
 
-                # --- detect silently-closed positions ---
-                for market_id, pos in tracked.items():
+                # ── 1. Detect positions that appeared since last reconciler run ──────
+                for market_id, pos in actual.items():
+                    if market_id not in prev_dash:
+                        # New position: appeared in API since the last reconcile tick.
+                        if market_id not in tracked:
+                            # Fill hasn't arrived yet — the tracker doesn't know about
+                            # this position. Alert from reconciler so the user isn't
+                            # left waiting for a fill that may arrive later.
+                            log.info(
+                                "[%s] reconcile: new %s %s (notional $%.0f) — "
+                                "fill pending, alerting now",
+                                src.name, pos.side, pos.market_symbol, pos.notional_usd,
+                            )
+                            if tg_token and tg_channel and pos.notional_usd >= src.min_notional:
+                                sl, tp = await _get_sl_tp(src, market_id)
+                                _sl_tp_cache[(src.id, market_id)] = (sl, tp)
+                                lev = await src.client.fetch_leverage(market_id)
+                                direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
+                                lev_str  = f"  |  {lev:g}x" if lev is not None else ""
+                                sl_parts = []
+                                if sl is not None:
+                                    sl_parts.append(f"SL: ${sl:,.4f}")
+                                if tp is not None:
+                                    sl_parts.append(f"TP: ${tp:,.4f}")
+                                sl_tp_str = ("\n" + "  |  ".join(sl_parts)) if sl_parts else ""
+                                footer    = f"\n{src.url}" if src.url else ""
+                                msg = (
+                                    f"📍 {src.name}\n"
+                                    f"Opened {direction} {pos.market_symbol}\n"
+                                    f"Entry: ${pos.avg_entry_price:,.4f}  |  "
+                                    f"Notional: ${pos.notional_usd:,.0f}"
+                                    f"{lev_str}{sl_tp_str}{footer}"
+                                )
+                                await tg_send(msg)
+                            # Mark so the fill-based OPEN handler doesn't double-alert.
+                            _reconciler_alerted_opens.add((src.id, market_id))
+                        else:
+                            # Tracker already has this position from a fill that arrived
+                            # before the reconciler ran — fill-based path handled it.
+                            log.debug(
+                                "[%s] reconcile: new position %s already in tracker",
+                                src.name, pos.market_symbol,
+                            )
+
+                # ── 2. Detect silently-closed positions ──────────────────────────────
+                # Compare against the PREVIOUS API snapshot (prev_dash), not the
+                # fill-based tracker, so we catch closes the tracker also missed.
+                for market_id, pos in prev_dash.items():
                     if market_id not in actual:
                         log.warning(
                             "[%s] reconcile: %s %s closed while unobserved",
                             src.name, pos.side, pos.market_symbol,
                         )
+                        _reconciler_alerted_opens.discard((src.id, market_id))
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
-                            notional = pos.notional_usd
-                            footer = f"\n{src.url}" if src.url else ""
+                            footer    = f"\n{src.url}" if src.url else ""
                             msg = (
                                 f"📍 {src.name}\n"
                                 f"Closed {direction} {pos.market_symbol}\n"
                                 f"Size: {pos.size:,.4f}  |  Entry: ${pos.avg_entry_price:,.2f}\n"
-                                f"Notional: ${notional:,.0f}  (close price unavailable)"
+                                f"Notional: ${pos.notional_usd:,.0f}  (close price unavailable)"
                                 f"{footer}"
                             )
                             await tg_send(msg)
 
-                # --- detect positions the tracker missed entirely ---
-                for market_id, pos in actual.items():
-                    if market_id not in tracked:
-                        log.warning(
-                            "[%s] reconcile: %s %s found in API but missing from tracker — seeding",
-                            src.name, pos.side, pos.market_symbol,
-                        )
+                # ── 3. Sync fill-based tracker with API truth ────────────────────────
+                # Exclude positions awaiting their OPEN fill so the tracker classifies
+                # that fill as OPEN (not SIZE_CHANGE) when it eventually arrives.
+                positions_for_tracker = {
+                    mid: p for mid, p in actual.items()
+                    if (src.id, mid) not in _reconciler_alerted_opens
+                }
+                src.tracker.seed(positions_for_tracker)
 
-                # --- always sync tracker to API truth ---
-                # Replaces tracker's internally-calculated positions with the
-                # real on-chain values (size, entry, unrealizedPnl, liquidationPx).
-                src.tracker.seed(actual)
-
-                # --- update SL/TP cache for all currently open positions ---
+                # ── 4. Update SL/TP cache ────────────────────────────────────────────
                 for market_id in actual:
                     sl, tp = await _get_sl_tp(src, market_id)
                     _sl_tp_cache[(src.id, market_id)] = (sl, tp)
-                # Purge cache entries for positions that are no longer open
                 for cache_key in list(_sl_tp_cache.keys()):
                     c_src_id, c_market_id = cache_key
                     if c_src_id == src.id and c_market_id not in actual:
                         del _sl_tp_cache[cache_key]
 
-                # Broadcast fresh position snapshot to all dashboard clients
+                # ── 5. Advance dashboard snapshot ────────────────────────────────────
+                _dash_positions[src.id] = actual
                 await hub.broadcast(snapshot_payload("snapshot"))
 
             except Exception:
@@ -645,7 +708,16 @@ async def _run() -> None:
                     # immediately without waiting for the next reconciliation cycle.
                     sl, tp = await _get_sl_tp(src, ev.trade.market_id)
                     _sl_tp_cache[key] = (sl, tp)
-                    if cfg.alert_on_open and passes_min_notional(ev, src.min_notional):
+                    if key in _reconciler_alerted_opens:
+                        # Reconciler already sent the OPEN alert (fill arrived after
+                        # the reconciler seeded the position). Suppress this one to
+                        # prevent a duplicate notification.
+                        _reconciler_alerted_opens.discard(key)
+                        log.info(
+                            "[%s] fill-based OPEN for %s suppressed — reconciler already alerted",
+                            src.name, ev.trade.market_symbol,
+                        )
+                    elif cfg.alert_on_open and passes_min_notional(ev, src.min_notional):
                         await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
 
                 elif ev.kind == EventKind.CLOSE:
@@ -679,8 +751,20 @@ async def _run() -> None:
                         _accumulate_reduce(source_id, ev)
 
                 elif ev.kind == EventKind.SIZE_CHANGE:
-                    # Batch same-side adds — avoids spam for rapid scaling in.
-                    if cfg.alert_on_size_change:
+                    # If the reconciler sent an OPEN alert for this position (fill
+                    # arrived after the reconciler seeded it), this SIZE_CHANGE might
+                    # be the phantom "doubling" fill (tracker classified the opening
+                    # fill as SIZE_CHANGE because the position was already seeded).
+                    # Clear the flag on the first SIZE_CHANGE so subsequent real adds
+                    # alert normally.
+                    if key in _reconciler_alerted_opens:
+                        _reconciler_alerted_opens.discard(key)
+                        log.info(
+                            "[%s] SIZE_CHANGE for %s treated as opening fill — suppressed",
+                            src.name, ev.trade.market_symbol,
+                        )
+                    elif cfg.alert_on_size_change:
+                        # Batch same-side adds — avoids spam for rapid scaling in.
                         _accumulate_size_change(source_id, ev)
 
     # --- HTTP routes ---
