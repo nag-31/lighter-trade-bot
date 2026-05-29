@@ -9,7 +9,7 @@ settings:
   # Minimum position notional (USD) to fire a Telegram alert.
   # Per-source overrides in the sources list below take priority.
   # Set to 0 to alert on every fill regardless of size.
-  default_min_notional_usd: 1000
+  default_min_notional_usd: 900
 
   # ── Alert types ──────────────────────────────────────────────────────────
   # Toggle which events send a Telegram message.
@@ -23,14 +23,14 @@ settings:
   # SIZE_CHANGE and REDUCE fills that arrive within this window are merged into
   # a single alert showing total notional + fill count.
   # Lower = more real-time but noisier. Higher = cleaner but delayed.
-  aggregate_window_seconds: 30
+  aggregate_window_seconds: 60
 
   # ── Timing ───────────────────────────────────────────────────────────────
   # How often the REST safety-net polls for any fills the WebSocket missed.
   rest_poll_seconds: 60
 
   # How often positions are re-synced from the exchange API to catch silent closes.
-  reconciler_interval_seconds: 60
+  reconciler_interval_seconds: 30
 
   # ── Duplicate suppression ────────────────────────────────────────────────
   # Identical Telegram messages within this window are silently dropped.
@@ -71,10 +71,10 @@ sources:
   - type: hyperliquid
     name: "HL"
     # address loaded from HL_ADDRESS env var
-    min_notional_usd: 10
-    footer_url: ""   # ← your public website e.g. https://enkapital.com
+    min_notional_usd: 900
+    footer_url: "https://enkapital.xyz"   # ← your public website e.g. https://enkapital.com
 
   - type: binance
     name: "Binance"
-    min_notional_usd: 100
+    min_notional_usd: 900
     # credentials in .env: BINANCE_API_KEY + BINANCE_API_SECRET
