@@ -18,6 +18,7 @@ config.yaml shape:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -213,8 +214,12 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         # The HL explorer URL is intentionally NOT used here — it exposes the wallet address.
         footer_url = str(raw.get("footer_url", "")).strip()
         client = HyperliquidClient(address, source=name)
+        # Source id must never embed the raw wallet address — it can surface in
+        # logs (e.g. the duplicate-source warning). Use a non-reversible hash so
+        # the id is stable and unique without exposing the address anywhere.
+        addr_hash = hashlib.sha256(address.lower().encode()).hexdigest()[:12]
         return Source(
-            id=f"hyperliquid:{address.lower()}",
+            id=f"hyperliquid:{addr_hash}",
             name=name,
             client=client,
             tracker=PositionTracker(source=name),

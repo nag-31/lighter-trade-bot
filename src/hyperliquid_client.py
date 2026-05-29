@@ -82,6 +82,11 @@ class HyperliquidClient:
         source: str = "",
     ) -> None:
         self.address = address.lower()
+        # Masked form for logging — never log the full wallet address.
+        # Shows only the last 4 chars (e.g. "0x…4c74").
+        self.address_masked = (
+            f"0x…{self.address[-4:]}" if len(self.address) >= 4 else "0x…"
+        )
         self.source = source
 
         self._http_base = (http_url or _MAINNET_HTTP).rstrip("/")
@@ -111,7 +116,7 @@ class HyperliquidClient:
         # Flag to signal clean shutdown to stream_trades()
         self._closed = False
 
-        log.info("[%s] HL client initialized for %s", source, self.address)
+        log.info("[%s] HL client initialized for %s", source, self.address_masked)
 
     # ------------------------------------------------------------------ #
     # Protocol: close                                                      #
@@ -409,7 +414,7 @@ class HyperliquidClient:
 
                 log.info(
                     "[%s] HL WS subscribed to userFills + webData2 for %s",
-                    self.source, self.address,
+                    self.source, self.address_masked,
                 )
                 backoff = _BACKOFF_INITIAL  # reset on successful connect
 
