@@ -106,6 +106,11 @@ INDEX_HTML = """<!doctype html>
   .kind-REDUCE { color: #fb923c; }
   .empty { color:#4b5563; font-style: italic; padding: 8px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .alerts-section { margin-top: 24px; }
+  .alert-msg { white-space: pre-wrap; word-break: break-word; color:#cbd5e1; font-size:12px; line-height:1.5; }
+  .badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:.5px; }
+  .badge-text { background:#1e293b; color:#93c5fd; }
+  .badge-card { background:#3b2f1a; color:#fbbf24; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -128,6 +133,13 @@ INDEX_HTML = """<!doctype html>
     </table>
   </section>
 </div>
+<section class="alerts-section">
+  <h2>Telegram alerts &mdash; exactly what the bot sent</h2>
+  <table>
+    <thead><tr><th style="width:90px">Time IST</th><th style="width:70px">Type</th><th>Message</th></tr></thead>
+    <tbody id="alerts"></tbody>
+  </table>
+</section>
 <script>
 const toIST = ts => {
   const d = new Date(new Date(ts).getTime() + 5.5 * 60 * 60 * 1000);
@@ -185,6 +197,17 @@ function renderEvents(events) {
     </tr>`;
   }).join("");
 }
+function renderAlerts(alerts) {
+  const tb = document.getElementById("alerts");
+  const a = alerts || [];
+  if (!a.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">no alerts sent yet</td></tr>'; return; }
+  tb.innerHTML = a.map(x => `
+    <tr>
+      <td class="num">${toIST(x.ts)}</td>
+      <td><span class="badge badge-${x.kind === 'card' ? 'card' : 'text'}">${x.kind === 'card' ? 'CARD' : 'TEXT'}</span></td>
+      <td class="alert-msg">${esc(x.text)}</td>
+    </tr>`).join("");
+}
 function renderSources(sources) {
   const s = sources || [];
   document.getElementById("sources").textContent =
@@ -201,6 +224,7 @@ function connect() {
       renderSources(data.sources);
       renderPositions(data.positions);
       renderEvents(data.recent_events);
+      renderAlerts(data.tg_alerts);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
@@ -208,6 +232,7 @@ function connect() {
       renderSources(data.sources);
       renderPositions(data.positions);
       renderEvents(data.recent_events);
+      renderAlerts(data.tg_alerts);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
     }
   };
@@ -318,6 +343,20 @@ async def _run() -> None:
     # Dedup guard: MD5(alert text) -> monotonic timestamp of last send
     _tg_sent: dict[str, float] = {}
 
+    # Rolling log of alerts actually delivered to Telegram, surfaced on the
+    # dashboard so the bot's output can be compared against positions/events at
+    # a glance. In-memory only (resets on restart); newest first.
+    _tg_alerts: list[dict] = []
+    TG_ALERTS_MAX = 100
+
+    def _record_tg_alert(kind: str, text: str) -> None:
+        _tg_alerts.insert(0, {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,   # "text" | "card"
+            "text": text,
+        })
+        del _tg_alerts[TG_ALERTS_MAX:]
+
     async def tg_send(text: str) -> None:
         h = hashlib.md5(text.encode()).hexdigest()
         now = time.monotonic()
@@ -331,6 +370,7 @@ async def _run() -> None:
                         now - _tg_sent[h], dedup_window)
             return
         _tg_sent[h] = now
+        _record_tg_alert("text", text)
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -340,9 +380,17 @@ async def _run() -> None:
                 log.warning("tg sendMessage failed: %s", r.text[:200])
         except Exception:
             log.exception("tg_send failed")
+        # Push the new alert to dashboard clients live (alerts can fire from the
+        # aggregate flush / reconciler at times with no other broadcast).
+        await hub.broadcast(snapshot_payload("snapshot"))
 
-    async def tg_send_photo(image_bytes: bytes, caption: str = "") -> None:
-        """Send a PNG image to Telegram. Falls back to plain text on error."""
+    async def tg_send_photo(image_bytes: bytes, caption: str = "", log_text: str = "") -> None:
+        """Send a PNG image to Telegram. Falls back to plain text on error.
+
+        log_text is the human-readable line recorded in the dashboard alert log
+        (the image itself can't be shown there); falls back to the caption.
+        """
+        _record_tg_alert("card", log_text or caption or "PnL card")
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendPhoto",
@@ -357,6 +405,7 @@ async def _run() -> None:
             log.exception("tg_send_photo failed")
             if caption:
                 await tg_send(caption)
+        await hub.broadcast(snapshot_payload("snapshot"))
 
     async def _get_sl_tp(src: Source, market_id: int):
         """Fetch SL/TP from client; returns (None, None) silently on any error."""
@@ -538,6 +587,7 @@ async def _run() -> None:
             "sources": [s.name for s in sources],
             "positions": all_positions(),
             "recent_events": recent_events[:cfg.max_recent_events],
+            "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
         }
         if extra:
             payload.update(extra)
@@ -747,7 +797,18 @@ async def _run() -> None:
                             accumulated_pnl=accumulated_pnl,
                         )
                         if card_bytes:
-                            await tg_send_photo(card_bytes, caption=src.url)
+                            pos_b = ev.position_before
+                            side_txt = (pos_b.side.upper() if pos_b else ev.trade.side.upper())
+                            if pnl is not None:
+                                sign = "+" if pnl >= 0 else "−"
+                                pnl_txt = f"{sign}${abs(pnl):,.2f}"
+                            else:
+                                pnl_txt = "—"
+                            log_text = (
+                                f"🖼 PnL card · CLOSE {side_txt} "
+                                f"{ev.trade.market_symbol} · {pnl_txt}  [{src.name}]"
+                            )
+                            await tg_send_photo(card_bytes, caption=src.url, log_text=log_text)
                         else:
                             await tg_send(format_event(ev, src.url, src.name))
 

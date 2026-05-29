@@ -90,6 +90,66 @@ class TestTgDedup:
 
 
 # ---------------------------------------------------------------------------
+# TG alert log — dashboard panel mirroring what was sent to the bot
+# ---------------------------------------------------------------------------
+
+class TestTgAlertLog:
+    """Replicate dashboard._record_tg_alert: newest-first insert, capped length."""
+
+    def _make_recorder(self, cap: int = 100):
+        alerts: list[dict] = []
+
+        def record(kind: str, text: str) -> None:
+            alerts.insert(0, {"kind": kind, "text": text})
+            del alerts[cap:]
+
+        return record, alerts
+
+    def test_first_alert_recorded(self):
+        record, alerts = self._make_recorder()
+        record("text", "Opened LONG HYPE")
+        assert len(alerts) == 1
+        assert alerts[0]["text"] == "Opened LONG HYPE"
+
+    def test_newest_first_ordering(self):
+        record, alerts = self._make_recorder()
+        record("text", "first")
+        record("text", "second")
+        record("card", "third")
+        assert [a["text"] for a in alerts] == ["third", "second", "first"]
+
+    def test_kind_preserved(self):
+        record, alerts = self._make_recorder()
+        record("text", "an open alert")
+        record("card", "🖼 PnL card · CLOSE LONG HYPE · +$1,200.00  [NK]")
+        assert alerts[0]["kind"] == "card"
+        assert alerts[1]["kind"] == "text"
+
+    def test_capped_at_max(self):
+        record, alerts = self._make_recorder(cap=100)
+        for i in range(150):
+            record("text", f"alert {i}")
+        assert len(alerts) == 100
+        # Newest retained, oldest dropped
+        assert alerts[0]["text"] == "alert 149"
+        assert alerts[-1]["text"] == "alert 50"
+
+    def test_cap_boundary_exact(self):
+        record, alerts = self._make_recorder(cap=3)
+        for t in ["a", "b", "c", "d"]:
+            record("text", t)
+        assert [a["text"] for a in alerts] == ["d", "c", "b"]
+
+    def test_multiline_text_preserved(self):
+        """Full multi-line alert text is stored verbatim for dashboard pre-wrap."""
+        record, alerts = self._make_recorder()
+        msg = "📍 NK\nOpened 🟢 LONG HYPE\nEntry: $57.2000  |  Notional: $1,000  |  15x"
+        record("text", msg)
+        assert alerts[0]["text"] == msg
+        assert "\n" in alerts[0]["text"]
+
+
+# ---------------------------------------------------------------------------
 # seen_tids dedup — prevents same fill processed twice
 # ---------------------------------------------------------------------------
 
