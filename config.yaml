@@ -74,7 +74,9 @@ sources:
     min_notional_usd: 900
     footer_url: "https://enkapital.xyz"   # ← your public website e.g. https://enkapital.com
 
-  - type: binance
-    name: "Binance"
-    min_notional_usd: 900
-    # credentials in .env: BINANCE_API_KEY + BINANCE_API_SECRET
+  # Binance disabled — source is HTTP 451 geo-blocked from the current region.
+  # Re-enable (uncomment) once the Singapore VPS / SOCKS5 proxy is in place.
+  # - type: binance
+  #   name: "Binance"
+  #   min_notional_usd: 900
+  #   # credentials in .env: BINANCE_API_KEY + BINANCE_API_SECRET
