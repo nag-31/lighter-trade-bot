@@ -310,6 +310,7 @@ async def _run() -> None:
         log.info("[%s] bootstrapping markets…", s.name)
         await s.client.bootstrap_markets()
         init_pos = await s.client.current_positions()
+        init_pos = {mid: p for mid, p in init_pos.items() if not s.is_excluded(p.market_symbol)}
         s.tracker.seed(init_pos)
         _dash_positions[s.id] = init_pos
         log.info("[%s] seeded with %d positions", s.name, len(init_pos))
@@ -612,6 +613,7 @@ async def _run() -> None:
             await asyncio.sleep(cfg.reconciler_interval_seconds)
             try:
                 actual = await src.client.current_positions()
+                actual = {mid: p for mid, p in actual.items() if not src.is_excluded(p.market_symbol)}
                 prev_dash = _dash_positions.get(src.id, {})
                 tracked    = src.tracker.snapshot()
 
@@ -733,6 +735,8 @@ async def _run() -> None:
             src.last_trade_id = max(src.last_trade_id or 0, trade.trade_id)
             events = src.tracker.apply(trade)
             for ev in events:
+                if src.is_excluded(ev.trade.market_symbol):
+                    continue
                 ev.leverage = await src.client.fetch_leverage(ev.trade.market_id)
                 recent_events.insert(0, ev)
                 del recent_events[cfg.max_recent_events:]

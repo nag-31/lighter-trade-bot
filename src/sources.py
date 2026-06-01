@@ -152,6 +152,17 @@ class Source:
     # Set-based dedup: protects against WS replay and REST/WS overlap.
     # Using a set catches duplicates with any tid, not just the last one.
     seen_tids: set[int] = field(default_factory=set)
+    # Normalized ticker symbols to hide entirely: no dashboard row, no TG
+    # alert, no reconciler notification. Populated from config.yaml
+    # `exclude_symbols`. Compared via _normalize_symbol (case-insensitive,
+    # quote-suffix tolerant).
+    exclude_symbols: frozenset[str] = field(default_factory=frozenset)
+
+    def is_excluded(self, market_symbol: str) -> bool:
+        """True if this ticker should be hidden from dashboard + alerts."""
+        if not self.exclude_symbols:
+            return False
+        return _normalize_symbol(market_symbol) in self.exclude_symbols
 
 
 def _proxy_url() -> Optional[str]:
@@ -164,6 +175,17 @@ def _proxy_url() -> Optional[str]:
     """
     url = os.getenv("SOCKS_PROXY_URL", "").strip()
     return url if url else None
+
+
+def _normalize_symbol(sym: str) -> str:
+    """Canonicalize a ticker for exclusion matching: uppercase, strip a single
+    trailing quote/perp suffix. So 'fartcoinusd', 'FARTCOIN', 'FARTCOIN-PERP'
+    all collapse to 'FARTCOIN'."""
+    s = str(sym or "").upper().strip()
+    for suffix in ("USDT", "USDC", "USD", "-PERP", "PERP"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)]
+    return s
 
 
 def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[Source]:
@@ -179,6 +201,16 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         if raw.get("min_notional_usd") is not None
         else global_min
     )
+
+    # Per-source ticker exclusions (hidden from dashboard + all alerts).
+    raw_excludes = raw.get("exclude_symbols") or []
+    if not isinstance(raw_excludes, list):
+        raw_excludes = [raw_excludes]
+    exclude_symbols = frozenset(
+        _normalize_symbol(x) for x in raw_excludes if str(x).strip()
+    )
+    if exclude_symbols:
+        log.info("source '%s': excluding symbols %s", name, sorted(exclude_symbols))
 
     if stype == "lighter":
         pool_id = raw.get("pool_id")
@@ -197,6 +229,7 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             tracker=PositionTracker(source=name),
             url=f"https://app.lighter.xyz/public-pools/{pool_id}",
             min_notional=min_notional,
+            exclude_symbols=exclude_symbols,
         )
 
     if stype == "hyperliquid":
@@ -225,6 +258,7 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             tracker=PositionTracker(source=name),
             url=footer_url,   # wallet address is NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
+            exclude_symbols=exclude_symbols,
         )
 
     if stype == "binance":
@@ -248,6 +282,7 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             tracker=PositionTracker(source=name),
             url=footer_url,  # API keys/account info are NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
+            exclude_symbols=exclude_symbols,
         )
 
     log.warning("unknown source type %r for '%s' — skipping", stype, name)

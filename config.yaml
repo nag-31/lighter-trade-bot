@@ -72,6 +72,7 @@ sources:
     name: "HL"
     # address loaded from HL_ADDRESS env var
     min_notional_usd: 900
+    exclude_symbols: ["FARTCOIN"]
     footer_url: "https://enkapital.xyz"   # ← your public website e.g. https://enkapital.com
 
   # Binance disabled — source is HTTP 451 geo-blocked from the current region.
