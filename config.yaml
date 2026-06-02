@@ -40,6 +40,7 @@ settings:
   # ── Dashboard ────────────────────────────────────────────────────────────
   dashboard_port: 8080
   max_recent_events: 200       # rows visible in the browser event table
+  max_closed_trades: 200       # closed trades kept for history + analytics charts
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

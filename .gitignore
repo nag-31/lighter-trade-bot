@@ -17,6 +17,11 @@ state.json
 # runtime-generated PnL card images
 data/cards/
 
+# local-only artifacts — never commit (contains secrets / scratch work)
+lighter-bot-commands.txt
+test_card*.png
+bots/
+
 # os
 .DS_Store
 Thumbs.db

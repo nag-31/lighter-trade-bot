@@ -65,6 +65,7 @@ class BotSettings:
     # Dashboard
     dashboard_port:      int = 8080
     max_recent_events:   int = 200
+    max_closed_trades:   int = 200
 
 
 def load_settings(path: str | Path = "config.yaml") -> BotSettings:
@@ -109,6 +110,7 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         tg_dedup_window_seconds     = _int("tg_dedup_window_seconds",     90),
         dashboard_port              = _int("dashboard_port",              8080),
         max_recent_events           = _int("max_recent_events",           200),
+        max_closed_trades           = _int("max_closed_trades",           200),
     )
     log.info(
         "settings loaded — min_notional=$%s  window=%ds  poll=%ds  dedup=%ds  port=%d",

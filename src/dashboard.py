@@ -34,6 +34,8 @@ from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
+from .stats import compute_stats, format_stats_summary
+from .stats_card import render_stats_card
 from .types import Event, EventKind, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -83,6 +85,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Trade tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -145,7 +148,25 @@ INDEX_HTML = """<!doctype html>
     .grid { grid-template-columns: 1fr; }
     .col-left section, .col-right { max-height: none; overflow-y: visible; }
     .trade-tile { max-width: 100%; }
+    .charts-grid { grid-template-columns: 1fr !important; }
   }
+  /* ---- analytics section ---- */
+  .analytics-section { margin-top: 24px; }
+  .analytics-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .analytics-section-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color:#9ca3af; margin: 0; }
+  .btn-send-stats { background: #1f242c; border: 1px solid #374151; color: #d8dbe0; font-family: inherit; font-size: 11px; padding: 5px 12px; border-radius: 5px; cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+  .btn-send-stats:hover { background: #262c38; border-color: #4b5563; }
+  .btn-send-stats:disabled { opacity: 0.55; cursor: default; }
+  .kpi-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
+  .kpi-card { background: #13161b; border: 1px solid #1f242c; border-radius: 8px; padding: 12px 16px; min-width: 110px; flex: 1 1 110px; }
+  .kpi-label { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #6b7280; margin-bottom: 5px; }
+  .kpi-value { font-size: 18px; font-weight: 700; line-height: 1.15; }
+  .kpi-sub { font-size: 10px; color: #6b7280; margin-top: 3px; }
+  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .chart-card { background: #13161b; border: 1px solid #1f242c; border-radius: 8px; padding: 14px 16px; }
+  .chart-card-title { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #6b7280; margin-bottom: 10px; }
+  .chart-wrap { position: relative; height: 240px; }
+  .no-trades-msg { color: #4b5563; font-style: italic; font-size: 12px; padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -176,6 +197,34 @@ INDEX_HTML = """<!doctype html>
     </table>
   </div>
 </div>
+<section class="analytics-section">
+  <div class="analytics-section-header">
+    <h2>Trade analytics</h2>
+    <button class="btn-send-stats" id="send-stats-btn">&#128228; Send stats to Telegram</button>
+  </div>
+  <div id="analytics-no-trades" class="no-trades-msg" style="display:none">no closed trades yet</div>
+  <div id="analytics-content">
+    <div class="kpi-row" id="kpi-row"></div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-card-title">Equity curve</div>
+        <div class="chart-wrap"><canvas id="chart-equity"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-title">PnL per trade</div>
+        <div class="chart-wrap"><canvas id="chart-pnl-per-trade"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-title">PnL by symbol</div>
+        <div class="chart-wrap"><canvas id="chart-by-symbol"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-title">Win / loss</div>
+        <div class="chart-wrap"><canvas id="chart-donut"></canvas></div>
+      </div>
+    </div>
+  </div>
+</section>
 <section class="history-section">
   <h2>Closed trades / PnL history</h2>
   <div id="history-grid" class="history-grid"></div>
@@ -299,6 +348,257 @@ function renderClosedTrades(trades) {
 </div>`;
   }).join("");
 }
+const fmtSignedUsd = n => {
+  if (n == null || !isFinite(Number(n))) return "—";
+  const v = Number(n);
+  const sign = v >= 0 ? "+" : "−";
+  return sign + "$" + Math.abs(v).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
+};
+// Chart instance cache — reused/updated on each renderStats call to avoid leaks
+let _chartEquity = null;
+let _chartPnlBar = null;
+let _chartBySymbol = null;
+let _chartDonut = null;
+const CHART_DEFAULTS = {
+  color: "#9ca3af",
+  borderColor: "#1f242c",
+  font: { family: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", size: 10 },
+};
+function _chartBaseOpts(extra) {
+  return Object.assign({
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 300 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: "#1f242c",
+        titleColor: "#9ca3af",
+        bodyColor: "#d8dbe0",
+        borderColor: "#374151",
+        borderWidth: 1,
+        titleFont: CHART_DEFAULTS.font,
+        bodyFont: CHART_DEFAULTS.font,
+      },
+    },
+    scales: {
+      x: {
+        ticks: { color: "#9ca3af", font: CHART_DEFAULTS.font, maxRotation: 0 },
+        grid: { color: "#1f242c" },
+        border: { color: "#1f242c" },
+      },
+      y: {
+        ticks: { color: "#9ca3af", font: CHART_DEFAULTS.font },
+        grid: { color: "#1f242c" },
+        border: { color: "#1f242c" },
+      },
+    },
+  }, extra || {});
+}
+function renderStats(stats) {
+  if (!stats) return;
+  const noTrades = !stats.n_trades;
+  const noEl = document.getElementById("analytics-no-trades");
+  const contEl = document.getElementById("analytics-content");
+  if (noTrades) {
+    noEl.style.display = "";
+    contEl.style.display = "none";
+    return;
+  }
+  noEl.style.display = "none";
+  contEl.style.display = "";
+
+  // --- KPI cards ---
+  const GREEN = "#22c55e", RED = "#ef4444", MUTED = "#9ca3af";
+  const kpis = [
+    { label: "Net P&L",       value: fmtSignedUsd(stats.total_pnl),   color: stats.total_pnl >= 0 ? GREEN : RED },
+    { label: "Win rate",      value: (Number(stats.win_rate)||0).toFixed(1) + "%", sub: stats.wins + "/" + stats.n_trades + " trades", color: stats.win_rate >= 50 ? GREEN : RED },
+    { label: "Profit factor", value: stats.profit_factor == null ? (stats.wins > 0 ? "∞" : "—") : Number(stats.profit_factor).toFixed(2), color: stats.profit_factor == null ? (stats.wins > 0 ? GREEN : MUTED) : (stats.profit_factor >= 1 ? GREEN : RED) },
+    { label: "# Trades",      value: String(stats.n_trades), color: MUTED },
+    { label: "Avg win",       value: fmtSignedUsd(stats.avg_win),   color: GREEN },
+    { label: "Avg loss",      value: fmtSignedUsd(stats.avg_loss),  color: RED  },
+    { label: "Best",          value: fmtSignedUsd(stats.largest_win),  color: GREEN },
+    { label: "Worst",         value: fmtSignedUsd(stats.largest_loss), color: RED  },
+    { label: "Max drawdown",  value: fmtSignedUsd(stats.max_drawdown), color: RED  },
+  ];
+  const kpiRow = document.getElementById("kpi-row");
+  kpiRow.innerHTML = kpis.map(k =>
+    '<div class="kpi-card">' +
+      '<div class="kpi-label">' + esc(k.label) + '</div>' +
+      '<div class="kpi-value" style="color:' + k.color + '">' + esc(k.value) + '</div>' +
+      (k.sub ? '<div class="kpi-sub">' + esc(k.sub) + '</div>' : '') +
+    '</div>'
+  ).join("");
+
+  // --- Equity curve ---
+  const eqData = (stats.equity_curve || []);
+  const eqLabels = eqData.map((_, i) => String(i + 1));
+  const eqValues = eqData.map(p => Number(p.cum_pnl));
+  const finalPnl = eqValues.length ? eqValues[eqValues.length - 1] : 0;
+  const eqColor = finalPnl >= 0 ? GREEN : RED;
+  const eqFill = finalPnl >= 0 ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.12)";
+  if (_chartEquity) {
+    _chartEquity.data.labels = eqLabels;
+    _chartEquity.data.datasets[0].data = eqValues;
+    _chartEquity.data.datasets[0].borderColor = eqColor;
+    _chartEquity.data.datasets[0].backgroundColor = eqFill;
+    _chartEquity.update();
+  } else {
+    const ctx = document.getElementById("chart-equity").getContext("2d");
+    _chartEquity = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: eqLabels,
+        datasets: [{
+          data: eqValues,
+          borderColor: eqColor,
+          backgroundColor: eqFill,
+          borderWidth: 2,
+          pointRadius: eqValues.length > 60 ? 0 : 3,
+          pointHoverRadius: 4,
+          fill: true,
+          tension: 0.3,
+        }],
+      },
+      options: _chartBaseOpts(),
+    });
+  }
+
+  // --- PnL per trade bar chart ---
+  const pnlSeries = (stats.pnl_series || []);
+  const pnlLabels = pnlSeries.map((_, i) => String(i + 1));
+  const pnlValues = pnlSeries.map(p => Number(p.pnl));
+  const pnlColors = pnlSeries.map(p => (p.pnl >= 0 ? "rgba(34,197,94,0.75)" : "rgba(239,68,68,0.75)"));
+  if (_chartPnlBar) {
+    _chartPnlBar.data.labels = pnlLabels;
+    _chartPnlBar.data.datasets[0].data = pnlValues;
+    _chartPnlBar.data.datasets[0].backgroundColor = pnlColors;
+    _chartPnlBar.update();
+  } else {
+    const ctx2 = document.getElementById("chart-pnl-per-trade").getContext("2d");
+    _chartPnlBar = new Chart(ctx2, {
+      type: "bar",
+      data: {
+        labels: pnlLabels,
+        datasets: [{
+          data: pnlValues,
+          backgroundColor: pnlColors,
+          borderWidth: 0,
+          borderRadius: 2,
+        }],
+      },
+      options: _chartBaseOpts(),
+    });
+  }
+
+  // --- PnL by symbol horizontal bar ---
+  const bySymbol = (stats.by_symbol || []);
+  const symLabels = bySymbol.map(s => s.symbol);
+  const symValues = bySymbol.map(s => Number(s.pnl));
+  const symColors = symValues.map(v => v >= 0 ? "rgba(34,197,94,0.75)" : "rgba(239,68,68,0.75)");
+  const symOpts = _chartBaseOpts({
+    indexAxis: "y",
+    scales: {
+      x: {
+        ticks: { color: "#9ca3af", font: CHART_DEFAULTS.font },
+        grid: { color: "#1f242c" },
+        border: { color: "#1f242c" },
+      },
+      y: {
+        ticks: { color: "#9ca3af", font: CHART_DEFAULTS.font },
+        grid: { color: "#1f242c" },
+        border: { color: "#1f242c" },
+      },
+    },
+  });
+  if (_chartBySymbol) {
+    _chartBySymbol.data.labels = symLabels;
+    _chartBySymbol.data.datasets[0].data = symValues;
+    _chartBySymbol.data.datasets[0].backgroundColor = symColors;
+    _chartBySymbol.update();
+  } else {
+    const ctx3 = document.getElementById("chart-by-symbol").getContext("2d");
+    _chartBySymbol = new Chart(ctx3, {
+      type: "bar",
+      data: {
+        labels: symLabels,
+        datasets: [{
+          data: symValues,
+          backgroundColor: symColors,
+          borderWidth: 0,
+          borderRadius: 2,
+        }],
+      },
+      options: symOpts,
+    });
+  }
+
+  // --- Win/loss donut ---
+  const donutData = [stats.wins || 0, stats.losses || 0];
+  if (_chartDonut) {
+    _chartDonut.data.datasets[0].data = donutData;
+    _chartDonut.update();
+  } else {
+    const ctx4 = document.getElementById("chart-donut").getContext("2d");
+    _chartDonut = new Chart(ctx4, {
+      type: "doughnut",
+      data: {
+        labels: ["Wins", "Losses"],
+        datasets: [{
+          data: donutData,
+          backgroundColor: ["rgba(34,197,94,0.8)", "rgba(239,68,68,0.8)"],
+          borderColor: ["#22c55e", "#ef4444"],
+          borderWidth: 1,
+          hoverOffset: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 300 },
+        cutout: "60%",
+        plugins: {
+          legend: {
+            display: true,
+            position: "bottom",
+            labels: { color: "#9ca3af", font: CHART_DEFAULTS.font, padding: 12, boxWidth: 12 },
+          },
+          tooltip: {
+            backgroundColor: "#1f242c",
+            titleColor: "#9ca3af",
+            bodyColor: "#d8dbe0",
+            borderColor: "#374151",
+            borderWidth: 1,
+            titleFont: CHART_DEFAULTS.font,
+            bodyFont: CHART_DEFAULTS.font,
+          },
+        },
+      },
+    });
+  }
+}
+
+// --- Send stats to Telegram button ---
+document.getElementById("send-stats-btn").addEventListener("click", function() {
+  const btn = this;
+  btn.disabled = true;
+  btn.textContent = "Sending…";
+  fetch("/api/send_stats", { method: "POST" })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        btn.textContent = "✓ Sent";
+      } else {
+        btn.textContent = d.error || "error";
+      }
+      setTimeout(() => { btn.disabled = false; btn.textContent = "📤 Send stats to Telegram"; }, 2000);
+    })
+    .catch(err => {
+      btn.textContent = "network error";
+      setTimeout(() => { btn.disabled = false; btn.textContent = "📤 Send stats to Telegram"; }, 2000);
+    });
+});
+
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => setStatus(true, "connected");
@@ -312,6 +612,7 @@ function connect() {
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
+      if (data.stats) renderStats(data.stats);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
@@ -321,6 +622,7 @@ function connect() {
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
+      if (data.stats) renderStats(data.stats);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
     }
   };
@@ -381,8 +683,17 @@ async def _run() -> None:
     # _to_jsonable handles both transparently.
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
-    closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, 500))
+    closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, cfg.max_closed_trades))
     log.info("loaded %d closed trades from db", len(closed_trades))
+
+    # Cached trade stats — recomputed after each close, served in snapshot payload.
+    # Stored as a mutable dict so inner closures can update it in-place.
+    stats_state: dict = compute_stats(closed_trades)
+
+    def refresh_stats() -> None:
+        """Recompute trade stats from the in-memory closed_trades list."""
+        stats_state.clear()
+        stats_state.update(compute_stats(closed_trades))
 
     # Directory for PnL card PNG files — must exist before static route is added.
     cards_dir = DB_PATH.parent / "cards"
@@ -695,7 +1006,8 @@ async def _run() -> None:
             "positions": all_positions(),
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
-            "closed_trades": closed_trades[:500],
+            "closed_trades": closed_trades[:cfg.max_closed_trades],
+            "stats": stats_state,
         }
         if extra:
             payload.update(extra)
@@ -972,7 +1284,8 @@ async def _run() -> None:
                     }
                     await save_closed_trade(DB_PATH, record)
                     closed_trades.insert(0, record)
-                    del closed_trades[500:]
+                    del closed_trades[cfg.max_closed_trades:]
+                    refresh_stats()
                     await hub.broadcast(snapshot_payload("snapshot"))
 
                     if cfg.alert_on_close:
@@ -1033,10 +1346,26 @@ async def _run() -> None:
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def send_stats(_request: web.Request) -> web.Response:
+        """POST /api/send_stats — relay current trade stats to Telegram."""
+        if not (tg_token and tg_channel):
+            return web.json_response({"ok": False, "error": "telegram not configured"})
+        try:
+            text = format_stats_summary(stats_state, pool_url="")
+            await tg_send(text)
+            card = render_stats_card(stats_state)
+            if card:
+                await tg_send_photo(card, log_text="\U0001f4ca Trade stats")
+            return web.json_response({"ok": True})
+        except Exception as exc:
+            log.exception("send_stats failed")
+            return web.json_response({"ok": False, "error": str(exc)})
+
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/healthz", healthz)
+    app.router.add_post("/api/send_stats", send_stats)
     app.router.add_static("/cards/", path=str(cards_dir), show_index=False)
 
     runner = web.AppRunner(app)
