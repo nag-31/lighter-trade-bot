@@ -14,6 +14,9 @@ venv/
 state.json
 *.db
 
+# runtime-generated PnL card images
+data/cards/
+
 # os
 .DS_Store
 Thumbs.db

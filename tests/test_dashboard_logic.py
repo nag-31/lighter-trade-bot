@@ -502,3 +502,135 @@ class TestPidLock:
             acquired = True
 
         assert acquired is True
+
+
+# ---------------------------------------------------------------------------
+# _sl_tp_alerted arm / dedup logic
+# ---------------------------------------------------------------------------
+
+class TestSlTpAlertedLogic:
+    """Mirror the _sl_tp_alerted set logic from _run() to verify arm/dedup/discard behavior.
+
+    The set tracks (source_id, market_id) keys for which a SL/TP TG alert has already
+    fired this position lifecycle, preventing the reconciler from double-alerting.
+    """
+
+    # Helpers that replicate the in-_run() patterns -------------------------
+
+    def _simulate_bootstrap(self, init_pos_market_ids, source_id="src:a"):
+        """Returns an alerted set seeded as if bootstrap ran."""
+        alerted: set[tuple[str, int]] = set()
+        for mid in init_pos_market_ids:
+            alerted.add((source_id, mid))
+        return alerted
+
+    def _reconciler_sl_tp_check(self, alerted, source_id, market_id, sl, tp,
+                                 alerts_sent):
+        """Simulate the reconciler SL/TP section for one market_id.
+        Returns True if a TG alert would be sent."""
+        key = (source_id, market_id)
+        if (sl is not None or tp is not None) and key not in alerted:
+            alerts_sent.append(key)
+            alerted.add(key)
+            return True
+        return False
+
+    def _simulate_close(self, alerted, source_id, market_id):
+        alerted.discard((source_id, market_id))
+
+    def _simulate_open_with_sl_tp(self, alerted, source_id, market_id, sl, tp):
+        """Simulate fill-based OPEN handler pre-arming when SL/TP was shown."""
+        if sl is not None or tp is not None:
+            alerted.add((source_id, market_id))
+
+    # Tests ------------------------------------------------------------------
+
+    def test_bootstrap_suppresses_existing_positions(self):
+        """Positions open at startup must never trigger a SL/TP alert."""
+        alerted = self._simulate_bootstrap([10, 20, 30], source_id="src:a")
+        alerts_sent = []
+        # Reconciler runs and finds SL/TP for market 10
+        self._reconciler_sl_tp_check(alerted, "src:a", 10, sl=1.0, tp=2.0, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 0
+
+    def test_new_position_alerts_once(self):
+        """A brand-new position (not at bootstrap) should alert exactly once."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        # First reconciler tick: SL/TP becomes known for market 5
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=1.0, tp=None, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 1
+
+    def test_second_reconciler_tick_does_not_double_alert(self):
+        """After the first SL/TP alert, subsequent ticks must be silent."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=1.0, tp=2.0, alerts_sent=alerts_sent)
+        # Second reconciler tick
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=1.0, tp=2.0, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 1  # still exactly one
+
+    def test_neither_sl_nor_tp_never_alerts(self):
+        """No alert when both SL and TP are None, even for a new position."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=None, tp=None, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 0
+        # key must not be added either (so a future tick with real values can still alert)
+        assert ("src:a", 5) not in alerted
+
+    def test_discard_on_close_re_arms_for_reopen(self):
+        """After a position closes, the key is removed so a reopen can alert again."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        # Position opens, SL/TP alert fires
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=1.0, tp=2.0, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 1
+        # Position closes
+        self._simulate_close(alerted, "src:a", 5)
+        assert ("src:a", 5) not in alerted
+        # Position re-opens and SL/TP is discovered again — should alert
+        self._reconciler_sl_tp_check(alerted, "src:a", 5, sl=1.5, tp=2.5, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 2
+
+    def test_open_with_sl_tp_pre_arms_suppresses_reconciler(self):
+        """If fill-based OPEN already showed SL/TP, pre-arming prevents reconciler double-alert."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        # Fill-based OPEN fires and pre-arms because SL/TP was included
+        from decimal import Decimal
+        self._simulate_open_with_sl_tp(alerted, "src:a", 7, sl=Decimal("45000"), tp=Decimal("60000"))
+        assert ("src:a", 7) in alerted
+        # Reconciler tick discovers same SL/TP — should NOT fire
+        self._reconciler_sl_tp_check(alerted, "src:a", 7, sl=45000, tp=60000, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 0
+
+    def test_open_without_sl_tp_does_not_pre_arm(self):
+        """Fill-based OPEN with no SL/TP must not pre-arm — reconciler can alert later."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_sent = []
+        # OPEN fill has no SL/TP
+        self._simulate_open_with_sl_tp(alerted, "src:a", 8, sl=None, tp=None)
+        assert ("src:a", 8) not in alerted
+        # Reconciler later discovers SL/TP — should alert
+        self._reconciler_sl_tp_check(alerted, "src:a", 8, sl=1.0, tp=None, alerts_sent=alerts_sent)
+        assert len(alerts_sent) == 1
+
+    def test_multiple_sources_independent(self):
+        """Keys are (source_id, market_id) — same market_id on different sources are independent."""
+        alerted: set[tuple[str, int]] = set()
+        alerts_a = []
+        alerts_b = []
+        self._reconciler_sl_tp_check(alerted, "src:a", 1, sl=1.0, tp=2.0, alerts_sent=alerts_a)
+        self._reconciler_sl_tp_check(alerted, "src:b", 1, sl=1.0, tp=2.0, alerts_sent=alerts_b)
+        assert len(alerts_a) == 1
+        assert len(alerts_b) == 1
+
+    def test_purge_on_position_gone_also_discards(self):
+        """When the reconciler purges an SL/TP cache key (position gone), _sl_tp_alerted is discarded too."""
+        alerted: set[tuple[str, int]] = set()
+        alerted.add(("src:a", 3))
+        # Simulate the purge loop behaviour
+        cache_key = ("src:a", 3)
+        alerted.discard(cache_key)
+        assert ("src:a", 3) not in alerted

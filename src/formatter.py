@@ -45,6 +45,36 @@ def _fmt_sl_tp(sl: Optional[Decimal], tp: Optional[Decimal]) -> str:
     return ("\n" + "  |  ".join(parts)) if parts else ""
 
 
+def format_sl_tp_set(
+    source_name: str,
+    side: str,
+    market_symbol: str,
+    sl: Optional[Decimal],
+    tp: Optional[Decimal],
+    pool_url: str = "",
+) -> str:
+    """One-time TG alert fired by the reconciler when SL/TP first becomes known.
+
+    Layout:
+        📍 {source}
+        🛡 SL/TP set · 🟢 LONG {symbol}
+        SL: $x  |  TP: $y
+        {pool_url}
+    Either sl or tp may be None; if both are None returns empty string.
+    """
+    if sl is None and tp is None:
+        return ""
+    direction = _direction_emoji(side)
+    parts = []
+    if sl is not None:
+        parts.append(f"SL: {_fmt_price(sl)}")
+    if tp is not None:
+        parts.append(f"TP: {_fmt_price(tp)}")
+    sl_tp_line = "  |  ".join(parts)
+    body = f"🛡 SL/TP set · {direction} {market_symbol}\n{sl_tp_line}"
+    return f"{_header(source_name)}{body}{_footer(pool_url)}"
+
+
 def format_event(
     event: Event,
     pool_url: str,

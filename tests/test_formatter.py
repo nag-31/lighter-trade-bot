@@ -12,6 +12,7 @@ from src.formatter import (
     format_aggregate,
     format_event,
     format_reduce_aggregate,
+    format_sl_tp_set,
 )
 from src.types import Event, EventKind, Position
 from tests.conftest import T0, make_position, make_trade
@@ -290,6 +291,78 @@ class TestFormatAggregate:
     def test_source_name_in_header(self):
         msg = format_aggregate(self._pos(), Decimal("5000"), 13, 10.0, "", "My NK pool")
         assert "My NK pool" in msg
+
+
+# ---------------------------------------------------------------------------
+# format_sl_tp_set
+# ---------------------------------------------------------------------------
+
+class TestFormatSlTpSet:
+    def test_both_set_contains_shield_marker(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("45000"), Decimal("60000"))
+        assert "🛡" in msg
+
+    def test_both_set_contains_sl_and_tp(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("45000"), Decimal("60000"))
+        assert "SL:" in msg
+        assert "TP:" in msg
+
+    def test_both_set_direction_long(self):
+        msg = format_sl_tp_set("NK", "long", "ETH", Decimal("2000"), Decimal("3000"))
+        assert "LONG" in msg
+        assert "🟢" in msg
+
+    def test_both_set_direction_short(self):
+        msg = format_sl_tp_set("NK", "short", "ETH", Decimal("2000"), Decimal("1000"))
+        assert "SHORT" in msg
+        assert "🔴" in msg
+
+    def test_sl_only(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("45000"), None)
+        assert "SL:" in msg
+        assert "TP:" not in msg
+        assert "🛡" in msg
+
+    def test_tp_only(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", None, Decimal("60000"))
+        assert "TP:" in msg
+        assert "SL:" not in msg
+        assert "🛡" in msg
+
+    def test_both_none_returns_empty_string(self):
+        result = format_sl_tp_set("NK", "long", "BTC", None, None)
+        assert result == ""
+
+    def test_contains_market_symbol(self):
+        msg = format_sl_tp_set("NK", "long", "HYPE", Decimal("50"), Decimal("80"))
+        assert "HYPE" in msg
+
+    def test_source_name_header(self):
+        msg = format_sl_tp_set("My NK pool", "long", "BTC", Decimal("45000"), Decimal("60000"))
+        assert msg.startswith("📍 My NK pool")
+
+    def test_no_source_name_no_header_pin(self):
+        msg = format_sl_tp_set("", "long", "BTC", Decimal("45000"), Decimal("60000"))
+        assert not msg.startswith("📍")
+
+    def test_pool_url_footer(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("45000"), Decimal("60000"),
+                               pool_url="https://example.com/pool")
+        assert msg.endswith("https://example.com/pool")
+
+    def test_no_pool_url_no_trailing_newline(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("45000"), Decimal("60000"), pool_url="")
+        assert not msg.endswith("\n")
+
+    def test_price_formatting_large(self):
+        msg = format_sl_tp_set("NK", "long", "BTC", Decimal("50000"), Decimal("60000"))
+        assert "$50,000.00" in msg
+        assert "$60,000.00" in msg
+
+    def test_price_formatting_small(self):
+        msg = format_sl_tp_set("NK", "long", "SUI", Decimal("1.25"), Decimal("2.50"))
+        assert "$1.2500" in msg
+        assert "$2.5000" in msg
 
 
 # ---------------------------------------------------------------------------

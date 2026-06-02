@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import time
 from dataclasses import asdict
@@ -28,9 +29,9 @@ from dotenv import load_dotenv
 
 from pathlib import Path
 
-from .db import init_db, load_recent_events, save_event
+from .db import init_db, load_closed_trades, load_recent_events, save_closed_trade, save_event
 from .filters import passes_min_notional
-from .formatter import format_aggregate, format_event, format_reduce_aggregate
+from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
 from .types import Event, EventKind, Position, Trade
@@ -91,9 +92,13 @@ INDEX_HTML = """<!doctype html>
   .meta .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#444; margin-right:6px; vertical-align: 1px; }
   .meta .dot.on { background:#22c55e; }
   .meta .dot.off { background:#ef4444; }
-  .grid { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; align-items: start; }
+  .col-left { display: flex; flex-direction: column; gap: 24px; }
   section { background:#13161b; border:1px solid #1f242c; border-radius:8px; padding:16px; }
   section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color:#9ca3af; margin: 0 0 12px; }
+  .col-left section { max-height: 340px; overflow-y: auto; }
+  .col-right { background:#13161b; border:1px solid #1f242c; border-radius:8px; padding:16px; max-height: 720px; overflow-y: auto; }
+  .col-right h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color:#9ca3af; margin: 0 0 12px; }
   table { width:100%; border-collapse: collapse; font-size: 12px; }
   th { text-align:left; color:#6b7280; font-weight:500; padding: 6px 8px; border-bottom: 1px solid #1f242c; }
   td { padding: 8px; border-bottom: 1px solid #11141a; }
@@ -106,39 +111,74 @@ INDEX_HTML = """<!doctype html>
   .kind-REDUCE { color: #fb923c; }
   .empty { color:#4b5563; font-style: italic; padding: 8px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .alerts-section { margin-top: 24px; }
   .alert-msg { white-space: pre-wrap; word-break: break-word; color:#cbd5e1; font-size:12px; line-height:1.5; }
   .badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:.5px; }
   .badge-text { background:#1e293b; color:#93c5fd; }
   .badge-card { background:#3b2f1a; color:#fbbf24; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  /* ---- history section ---- */
+  .history-section { margin-top: 24px; }
+  .history-section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color:#9ca3af; margin: 0 0 16px; }
+  .history-grid { display: flex; flex-wrap: wrap; gap: 16px; }
+  .trade-tile {
+    background: #13161b; border: 1px solid #1f242c; border-radius: 10px;
+    padding: 14px 16px; min-width: 260px; max-width: 320px; flex: 1 1 260px;
+    transition: border-color 0.2s;
+    position: relative;
+  }
+  .trade-tile:hover { border-color: #374151; }
+  .trade-tile.win  { border-left: 3px solid #22c55e; }
+  .trade-tile.loss { border-left: 3px solid #ef4444; }
+  .tile-header { font-size: 11px; color: #6b7280; margin-bottom: 4px; }
+  .tile-direction { font-size: 11px; font-weight: 600; margin-bottom: 6px; }
+  .tile-pnl { font-size: 26px; font-weight: 700; line-height: 1.1; margin-bottom: 2px; }
+  .tile-pct { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+  .tile-details { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 11px; margin-bottom: 8px; }
+  .tile-detail-label { color: #6b7280; }
+  .tile-detail-val { color: #d8dbe0; }
+  .tile-footer { font-size: 10px; color: #4b5563; margin-top: 6px; display: flex; justify-content: space-between; align-items: center; }
+  .tile-thumb-wrap { margin-top: 10px; }
+  .card-thumb { width: 100%; border-radius: 6px; cursor: pointer; transition: opacity 0.15s; }
+  .card-thumb:hover { opacity: 0.85; }
+  .green { color: #22c55e; }
+  .red   { color: #ef4444; }
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+    .col-left section, .col-right { max-height: none; overflow-y: visible; }
+    .trade-tile { max-width: 100%; }
+  }
 </style>
 </head>
 <body>
 <h1>Trade tracker</h1>
 <div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="sources">no sources</span> &middot; <span id="last">no events yet</span></div>
 <div class="grid">
-  <section>
-    <h2>Open positions</h2>
-    <table>
-      <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">SL</th><th class="num">TP</th></tr></thead>
-      <tbody id="positions"></tbody>
-    </table>
-  </section>
-  <section>
+  <div class="col-left">
+    <section>
+      <h2>Open positions</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">SL</th><th class="num">TP</th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Telegram alerts &mdash; exactly what the bot sent</h2>
+      <table>
+        <thead><tr><th style="width:90px">Time IST</th><th style="width:70px">Type</th><th>Message</th></tr></thead>
+        <tbody id="alerts"></tbody>
+      </table>
+    </section>
+  </div>
+  <div class="col-right">
     <h2>Recent events</h2>
     <table>
       <thead><tr><th>Time IST</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
       <tbody id="events"></tbody>
     </table>
-  </section>
+  </div>
 </div>
-<section class="alerts-section">
-  <h2>Telegram alerts &mdash; exactly what the bot sent</h2>
-  <table>
-    <thead><tr><th style="width:90px">Time IST</th><th style="width:70px">Type</th><th>Message</th></tr></thead>
-    <tbody id="alerts"></tbody>
-  </table>
+<section class="history-section">
+  <h2>Closed trades / PnL history</h2>
+  <div id="history-grid" class="history-grid"></div>
 </section>
 <script>
 const toIST = ts => {
@@ -213,6 +253,52 @@ function renderSources(sources) {
   document.getElementById("sources").textContent =
     s.length ? s.length + " source" + (s.length > 1 ? "s" : "") + ": " + s.join(", ") : "no sources";
 }
+function renderClosedTrades(trades) {
+  const grid = document.getElementById("history-grid");
+  const arr = trades || [];
+  if (!arr.length) {
+    grid.innerHTML = '<span style="color:#4b5563;font-style:italic;font-size:12px">no closed trades yet</span>';
+    return;
+  }
+  grid.innerHTML = arr.map(tr => {
+    const isWin = tr.is_win === 1 || tr.is_win === true;
+    const pnlN  = tr.pnl  != null ? Number(tr.pnl)  : null;
+    const pctN  = tr.pct  != null ? Number(tr.pct)   : null;
+    const pnlColor = (pnlN == null ? '#9ca3af' : pnlN >= 0 ? '#22c55e' : '#ef4444');
+    const pnlSign  = (pnlN == null ? '' : pnlN >= 0 ? '+' : '−');
+    const pnlStr   = pnlN == null ? '—' : pnlSign + '$' + Math.abs(pnlN).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+    const pctStr   = pctN == null ? '' : (pctN >= 0 ? '+' : '') + pctN.toFixed(2) + '%';
+    const sideClass = (tr.side || '').toLowerCase() === 'long' ? 'green' : 'red';
+    const sideLabel = ((tr.side || '').toUpperCase()) + ' · CLOSED';
+    const levStr  = tr.leverage ? tr.leverage + 'x' : '—';
+    const wrStr   = (tr.wins != null && tr.total != null && tr.total > 0) ? tr.wins + '/' + tr.total : '—';
+    const timeStr = tr.ts ? toIST(tr.ts) : '';
+    const entryStr = tr.entry ? fmtPrice(tr.entry) : '—';
+    const exitStr  = tr.exit  ? fmtPrice(tr.exit)  : '—';
+    const sizeStr  = tr.size  ? fmtSize(tr.size)   : '—';
+    const notStr   = tr.notional ? fmtUsd(tr.notional) : '—';
+    let thumbHtml = '';
+    if (tr.card_path) {
+      thumbHtml = `<div class="tile-thumb-wrap"><img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="window.open('${esc(tr.card_path)}','_blank')"></div>`;
+    }
+    return `<div class="trade-tile ${isWin ? 'win' : 'loss'}">
+  <div class="tile-header">${esc(tr.source || '')} &middot; ${esc(tr.market_symbol || '')}</div>
+  <div class="tile-direction ${sideClass}">${sideLabel}</div>
+  <div class="tile-pnl" style="color:${pnlColor}">${pnlStr}</div>
+  ${pctStr ? `<div class="tile-pct" style="color:${pnlColor}">${pctStr}</div>` : ''}
+  <div class="tile-details">
+    <span class="tile-detail-label">ENTRY</span><span class="tile-detail-val">${entryStr}</span>
+    <span class="tile-detail-label">EXIT</span><span class="tile-detail-val">${exitStr}</span>
+    <span class="tile-detail-label">SIZE</span><span class="tile-detail-val">${sizeStr}</span>
+    <span class="tile-detail-label">NOTIONAL</span><span class="tile-detail-val">${notStr}</span>
+    <span class="tile-detail-label">LEVERAGE</span><span class="tile-detail-val">${levStr}</span>
+    <span class="tile-detail-label">WIN RATE</span><span class="tile-detail-val">${wrStr}</span>
+  </div>
+  ${thumbHtml}
+  <div class="tile-footer"><span>${timeStr} IST</span></div>
+</div>`;
+  }).join("");
+}
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => setStatus(true, "connected");
@@ -225,6 +311,7 @@ function connect() {
       renderPositions(data.positions);
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
+      renderClosedTrades(data.closed_trades);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
@@ -233,6 +320,7 @@ function connect() {
       renderPositions(data.positions);
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
+      renderClosedTrades(data.closed_trades);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
     }
   };
@@ -293,6 +381,12 @@ async def _run() -> None:
     # _to_jsonable handles both transparently.
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
+    closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, 500))
+    log.info("loaded %d closed trades from db", len(closed_trades))
+
+    # Directory for PnL card PNG files — must exist before static route is added.
+    cards_dir = DB_PATH.parent / "cards"
+    cards_dir.mkdir(parents=True, exist_ok=True)
 
     # Dashboard-level position view: API truth, updated by the reconciler.
     # Kept separate from src.tracker (fill-based classifier) so the reconciler
@@ -314,6 +408,10 @@ async def _run() -> None:
         s.tracker.seed(init_pos)
         _dash_positions[s.id] = init_pos
         log.info("[%s] seeded with %d positions", s.name, len(init_pos))
+        # Arm every already-open position so the reconciler never fires a SL/TP alert
+        # for positions that existed before this bot session started.
+        for mid in init_pos:
+            _sl_tp_alerted.add((s.id, mid))
         latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
         if latest:
             s.last_trade_id = latest[-1].trade_id
@@ -340,6 +438,10 @@ async def _run() -> None:
     # (source_id, market_id) -> (sl_price, tp_price)  — both Optional[Decimal]
     # Populated by the reconciler and on OPEN events; purged on CLOSE.
     _sl_tp_cache: dict[tuple[str, int], tuple] = {}
+
+    # Set of (source_id, market_id) keys for which a SL/TP TG alert has already
+    # been sent this position lifecycle. Prevents the reconciler from double-alerting.
+    _sl_tp_alerted: set[tuple[str, int]] = set()
 
     # Dedup guard: MD5(alert text) -> monotonic timestamp of last send
     _tg_sent: dict[str, float] = {}
@@ -589,6 +691,7 @@ async def _run() -> None:
             "positions": all_positions(),
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
+            "closed_trades": closed_trades[:500],
         }
         if extra:
             payload.update(extra)
@@ -651,6 +754,10 @@ async def _run() -> None:
                                     f"{lev_str}{sl_tp_str}{footer}"
                                 )
                                 await tg_send(msg)
+                                # If OPEN alert already showed SL/TP, pre-arm so the
+                                # reconciler's SL/TP section doesn't double-alert.
+                                if sl is not None or tp is not None:
+                                    _sl_tp_alerted.add((src.id, market_id))
                             # Mark so the fill-based OPEN handler doesn't double-alert.
                             _reconciler_alerted_opens.add((src.id, market_id))
                         else:
@@ -671,6 +778,7 @@ async def _run() -> None:
                             src.name, pos.side, pos.market_symbol,
                         )
                         _reconciler_alerted_opens.discard((src.id, market_id))
+                        _sl_tp_alerted.discard((src.id, market_id))
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
                             footer    = f"\n{src.url}" if src.url else ""
@@ -692,14 +800,29 @@ async def _run() -> None:
                 }
                 src.tracker.seed(positions_for_tracker)
 
-                # ── 4. Update SL/TP cache ────────────────────────────────────────────
+                # ── 4. Update SL/TP cache + fire one-time TG alert when first known ──
                 for market_id in actual:
                     sl, tp = await _get_sl_tp(src, market_id)
                     _sl_tp_cache[(src.id, market_id)] = (sl, tp)
+                    key = (src.id, market_id)
+                    if (sl is not None or tp is not None) and key not in _sl_tp_alerted:
+                        pos = actual[market_id]
+                        alert_text = format_sl_tp_set(
+                            source_name=src.name,
+                            side=pos.side,
+                            market_symbol=pos.market_symbol,
+                            sl=sl,
+                            tp=tp,
+                            pool_url=src.url,
+                        )
+                        if alert_text and tg_token and tg_channel:
+                            await tg_send(alert_text)
+                        _sl_tp_alerted.add(key)
                 for cache_key in list(_sl_tp_cache.keys()):
                     c_src_id, c_market_id = cache_key
                     if c_src_id == src.id and c_market_id not in actual:
                         del _sl_tp_cache[cache_key]
+                        _sl_tp_alerted.discard(cache_key)
 
                 # ── 5. Advance dashboard snapshot ────────────────────────────────────
                 _dash_positions[src.id] = actual
@@ -779,6 +902,10 @@ async def _run() -> None:
                         # Suppressing this alert based on a possibly-stale snapshot
                         # caused legitimate OPENs to be silently dropped.
                         await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
+                        # Pre-arm so the reconciler doesn't double-alert SL/TP when
+                        # the OPEN alert already showed them.
+                        if sl is not None or tp is not None:
+                            _sl_tp_alerted.add(key)
 
                 elif ev.kind == EventKind.CLOSE:
                     # Cancel any pending SIZE_CHANGE or REDUCE aggregate — position gone
@@ -789,19 +916,63 @@ async def _run() -> None:
                     accumulated_pnl = reduce_buf["total_pnl"] if reduce_buf else None
                     if reduce_buf:
                         reduce_buf["task"].cancel()
-                    # Position is gone — remove from SL/TP cache
+                    # Position is gone — remove from SL/TP cache and re-arm for next open
                     _sl_tp_cache.pop(key, None)
+                    _sl_tp_alerted.discard(key)
+
+                    # Always compute PnL card data (for DB persistence + optional TG send)
+                    pnl = calculate_pnl(ev, accumulated_pnl=accumulated_pnl)
+                    is_win = pnl is not None and pnl > 0
+                    wins, total = record_result(is_win)
+                    card_bytes = generate_pnl_card(
+                        ev, src.name, wins, total,
+                        accumulated_pnl=accumulated_pnl,
+                    )
+
+                    # Compute pct change (same formula as pnl_card.py)
+                    pos_b = ev.position_before
+                    pct = None
+                    if pos_b and pos_b.avg_entry_price:
+                        if pos_b.side == "long":
+                            pct = (ev.trade.price - pos_b.avg_entry_price) / pos_b.avg_entry_price * 100
+                        else:
+                            pct = (pos_b.avg_entry_price - ev.trade.price) / pos_b.avg_entry_price * 100
+
+                    # Write PNG to disk and record its web path
+                    card_path = None
+                    if card_bytes:
+                        ts_str = ev.trade.timestamp.isoformat().replace(":", "-").replace("+", "p")
+                        raw_name = f"{ts_str}_{src.name}_{ev.trade.market_symbol}"
+                        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_name) + ".png"
+                        card_file = cards_dir / safe_name
+                        await asyncio.to_thread(card_file.write_bytes, card_bytes)
+                        card_path = f"/cards/{safe_name}"
+
+                    # Persist to DB and update in-memory list regardless of alert setting
+                    record = {
+                        "ts": ev.trade.timestamp.isoformat(),
+                        "source": src.name,
+                        "market_symbol": ev.trade.market_symbol,
+                        "side": pos_b.side if pos_b else None,
+                        "entry": str(pos_b.avg_entry_price) if pos_b else None,
+                        "exit": str(ev.trade.price),
+                        "size": str(pos_b.size) if pos_b else None,
+                        "notional": str(pos_b.notional_usd) if pos_b else None,
+                        "pnl": str(pnl) if pnl is not None else None,
+                        "pct": str(pct) if pct is not None else None,
+                        "is_win": 1 if is_win else 0,
+                        "leverage": str(ev.leverage) if ev.leverage is not None else None,
+                        "wins": wins,
+                        "total": total,
+                        "card_path": card_path,
+                    }
+                    await save_closed_trade(DB_PATH, record)
+                    closed_trades.insert(0, record)
+                    del closed_trades[500:]
+                    await hub.broadcast(snapshot_payload("snapshot"))
+
                     if cfg.alert_on_close:
-                        # Generate PnL card and send as photo; fall back to text
-                        pnl = calculate_pnl(ev, accumulated_pnl=accumulated_pnl)
-                        is_win = pnl is not None and pnl > 0
-                        wins, total = record_result(is_win)
-                        card_bytes = generate_pnl_card(
-                            ev, src.name, wins, total,
-                            accumulated_pnl=accumulated_pnl,
-                        )
                         if card_bytes:
-                            pos_b = ev.position_before
                             side_txt = (pos_b.side.upper() if pos_b else ev.trade.side.upper())
                             if pnl is not None:
                                 sign = "+" if pnl >= 0 else "−"
@@ -862,6 +1033,7 @@ async def _run() -> None:
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/healthz", healthz)
+    app.router.add_static("/cards/", path=str(cards_dir), show_index=False)
 
     runner = web.AppRunner(app)
     await runner.setup()
