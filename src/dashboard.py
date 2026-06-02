@@ -398,6 +398,11 @@ async def _run() -> None:
     # user never sees a duplicate "Opened" message.
     _reconciler_alerted_opens: set[tuple[str, int]] = set()
 
+    # Positions for which a one-time "SL/TP set" TG alert has already been sent
+    # (or that existed at startup, pre-armed below). Declared before bootstrap
+    # because the bootstrap loop arms it.
+    _sl_tp_alerted: set[tuple[str, int]] = set()
+
     # Bootstrap every source: markets, seed positions, anchor last_trade_id so
     # we don't replay history.
     for s in sources:
@@ -439,9 +444,8 @@ async def _run() -> None:
     # Populated by the reconciler and on OPEN events; purged on CLOSE.
     _sl_tp_cache: dict[tuple[str, int], tuple] = {}
 
-    # Set of (source_id, market_id) keys for which a SL/TP TG alert has already
-    # been sent this position lifecycle. Prevents the reconciler from double-alerting.
-    _sl_tp_alerted: set[tuple[str, int]] = set()
+    # NOTE: _sl_tp_alerted is declared earlier (before the bootstrap loop, which
+    # arms it for pre-existing positions).
 
     # Dedup guard: MD5(alert text) -> monotonic timestamp of last send
     _tg_sent: dict[str, float] = {}
