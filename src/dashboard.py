@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 
 from pathlib import Path
 
-from .db import init_db, load_closed_trades, load_recent_events, save_closed_trade, save_event
+from .db import init_db, load_closed_trades, load_recent_events, load_tg_alerts, save_closed_trade, save_event, save_tg_alert
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
@@ -763,17 +763,22 @@ async def _run() -> None:
 
     # Rolling log of alerts actually delivered to Telegram, surfaced on the
     # dashboard so the bot's output can be compared against positions/events at
-    # a glance. In-memory only (resets on restart); newest first.
-    _tg_alerts: list[dict] = []
+    # a glance. Persisted to DB and loaded on restart; newest first.
     TG_ALERTS_MAX = 100
+    _tg_alerts: list[dict] = list(await load_tg_alerts(DB_PATH, TG_ALERTS_MAX))
 
-    def _record_tg_alert(kind: str, text: str) -> None:
-        _tg_alerts.insert(0, {
+    async def _record_tg_alert(kind: str, text: str) -> None:
+        record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "kind": kind,   # "text" | "card"
             "text": text,
-        })
+        }
+        _tg_alerts.insert(0, record)
         del _tg_alerts[TG_ALERTS_MAX:]
+        try:
+            await save_tg_alert(DB_PATH, record["ts"], record["kind"], record["text"])
+        except Exception:
+            log.exception("failed to persist tg alert")
 
     async def tg_send(text: str) -> None:
         h = hashlib.md5(text.encode()).hexdigest()
@@ -788,7 +793,7 @@ async def _run() -> None:
                         now - _tg_sent[h], dedup_window)
             return
         _tg_sent[h] = now
-        _record_tg_alert("text", text)
+        await _record_tg_alert("text", text)
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -808,7 +813,7 @@ async def _run() -> None:
         log_text is the human-readable line recorded in the dashboard alert log
         (the image itself can't be shown there); falls back to the caption.
         """
-        _record_tg_alert("card", log_text or caption or "PnL card")
+        await _record_tg_alert("card", log_text or caption or "PnL card")
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendPhoto",

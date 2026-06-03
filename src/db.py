@@ -43,6 +43,14 @@ def _init_sync(path: Path) -> None:
             card_path    TEXT
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS tg_alerts (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts   TEXT    NOT NULL,
+            kind TEXT    NOT NULL,
+            text TEXT    NOT NULL
+        )
+    """)
     con.commit()
     con.close()
 
@@ -123,3 +131,37 @@ async def save_closed_trade(path: Path, record: dict) -> None:
 async def load_closed_trades(path: Path, limit: int | None = None) -> list[dict]:
     """Return closed trades newest-first. If limit is None, return all."""
     return await asyncio.to_thread(_load_closed_trades_sync, path, limit)
+
+
+# ---------------------------------------------------------------------------
+# TG alerts table
+# ---------------------------------------------------------------------------
+
+
+def _save_tg_alert_sync(path: Path, ts: str, kind: str, text: str) -> None:
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO tg_alerts (ts, kind, text) VALUES (?, ?, ?)",
+        (ts, kind, text),
+    )
+    con.commit()
+    con.close()
+
+
+def _load_tg_alerts_sync(path: Path, limit: int) -> list[dict]:
+    con = sqlite3.connect(path)
+    rows = con.execute(
+        "SELECT ts, kind, text FROM tg_alerts ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    con.close()
+    return [{"ts": r[0], "kind": r[1], "text": r[2]} for r in rows]
+
+
+async def save_tg_alert(path: Path, ts: str, kind: str, text: str) -> None:
+    """Persist a single Telegram alert row to the tg_alerts table."""
+    await asyncio.to_thread(_save_tg_alert_sync, path, ts, kind, text)
+
+
+async def load_tg_alerts(path: Path, limit: int = 100) -> list[dict]:
+    """Return up to `limit` Telegram alert records newest-first."""
+    return await asyncio.to_thread(_load_tg_alerts_sync, path, limit)
