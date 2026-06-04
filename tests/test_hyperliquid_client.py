@@ -282,3 +282,89 @@ class TestFetchRealizingFillsLimit:
         # Returns the 3 NEWEST (tail) after oldest-first sort
         assert len(result) == 3
         assert result[-1].trade_id == 9
+
+
+# ---------------------------------------------------------------------------
+# Regression test: multi-coin cascade bug
+#
+# Before the fix, _parse_fill used _coin_to_id for the perp filter.
+# _market_id() adds synthetic entries to _coin_to_id as a side-effect, so
+# after parsing the first fill the map became non-empty; every subsequent
+# fill for a *different* coin then failed "coin.upper() not in _coin_to_id"
+# and was silently dropped — only 1 coin survived.
+#
+# The fix: _parse_fill now uses the stable _perp_universe set (populated once
+# by bootstrap_markets()) instead of the mutating _coin_to_id map.
+# ---------------------------------------------------------------------------
+
+class TestMultiCoinCascadeBug:
+    """Regression test: all perp coins kept, spot coin dropped."""
+
+    def _make_bootstrapped_client(self) -> HyperliquidClient:
+        """Client with _perp_universe pre-populated for BTC, ETH, RENDER."""
+        with patch("hyperliquid.info.Info.__init__", return_value=None):
+            c = HyperliquidClient(
+                address="0xdeadbeefdeadbeefdeadbeefdeadbeef00001234",
+                source="test",
+            )
+        c._info = MagicMock()
+        # Simulate what bootstrap_markets() does: populate all three maps.
+        c._coin_to_id = {"BTC": 0, "ETH": 1, "RENDER": 2}
+        c._id_to_coin = {0: "BTC", 1: "ETH", 2: "RENDER"}
+        c._perp_universe = {"BTC", "ETH", "RENDER"}
+        return c
+
+    def test_all_perp_coins_kept_not_just_first(self):
+        """Parsing BTC, ETH, RENDER fills all return non-None trades."""
+        c = self._make_bootstrapped_client()
+        raw_fills = [
+            _raw_fill(tid=1, coin="BTC",    closed_pnl="100", dir_="Close Long"),
+            _raw_fill(tid=2, coin="ETH",    closed_pnl="200", dir_="Close Long"),
+            _raw_fill(tid=3, coin="RENDER", closed_pnl="50",  dir_="Close Short"),
+        ]
+        with patch.object(c._info, "user_fills", return_value=raw_fills):
+            result = _run(c.fetch_realizing_fills())
+
+        symbols = {t.market_symbol for t in result}
+        assert "BTC" in symbols,    "BTC fills must not be dropped"
+        assert "ETH" in symbols,    "ETH fills must not be dropped"
+        assert "RENDER" in symbols, "RENDER fills must not be dropped"
+        assert len(result) == 3
+
+    def test_spot_fill_dropped_perps_kept(self):
+        """A spot-like coin ('xyz:GOLD') is dropped; perp coins survive."""
+        c = self._make_bootstrapped_client()
+        raw_fills = [
+            _raw_fill(tid=10, coin="BTC",      closed_pnl="100", dir_="Close Long"),
+            _raw_fill(tid=11, coin="ETH",      closed_pnl="200", dir_="Close Long"),
+            _raw_fill(tid=12, coin="xyz:GOLD", closed_pnl="5",   dir_="Close Long"),
+            _raw_fill(tid=13, coin="RENDER",   closed_pnl="30",  dir_="Close Short"),
+        ]
+        with patch.object(c._info, "user_fills", return_value=raw_fills):
+            result = _run(c.fetch_realizing_fills())
+
+        tids = {t.trade_id for t in result}
+        assert 10 in tids, "BTC fill must be kept"
+        assert 11 in tids, "ETH fill must be kept"
+        assert 12 not in tids, "spot fill 'xyz:GOLD' must be dropped by perp filter"
+        assert 13 in tids, "RENDER fill must be kept"
+        assert len(result) == 3
+
+    def test_empty_perp_universe_skips_filter_parses_all(self):
+        """When _perp_universe is empty (no bootstrap), the filter is skipped."""
+        with patch("hyperliquid.info.Info.__init__", return_value=None):
+            c = HyperliquidClient(
+                address="0xdeadbeefdeadbeefdeadbeefdeadbeef00001234",
+                source="test",
+            )
+        c._info = MagicMock()
+        # Intentionally leave _perp_universe empty (no bootstrap)
+        assert c._perp_universe == set()
+        raw_fills = [
+            _raw_fill(tid=1, coin="BTC", closed_pnl="100", dir_="Close Long"),
+            _raw_fill(tid=2, coin="SOL", closed_pnl="50",  dir_="Close Long"),
+        ]
+        with patch.object(c._info, "user_fills", return_value=raw_fills):
+            result = _run(c.fetch_realizing_fills())
+        # Without a universe, all fills pass the filter
+        assert len(result) == 2

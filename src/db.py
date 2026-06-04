@@ -185,6 +185,44 @@ async def delete_closed_trades_by_source(path: Path, source: str) -> int:
     return await asyncio.to_thread(_delete_closed_trades_by_source_sync, path, source)
 
 
+def _delete_closed_trades_by_source_since_sync(
+    path: Path, source: str, ts_iso: str
+) -> int:
+    """Delete closed_trades rows WHERE source = ? AND ts >= ?.
+
+    Used by the reconciler for a SCOPED delete-rebuild: only rows within the
+    authoritative time window are removed; rows older than the window are
+    preserved untouched.  Parametrized — safe against SQL injection.
+    Returns the number of rows deleted.
+    """
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            "DELETE FROM closed_trades WHERE source = ? AND ts >= ?",
+            (source, ts_iso),
+        )
+        deleted = cur.rowcount
+        con.commit()
+        return deleted
+    finally:
+        con.close()
+
+
+async def delete_closed_trades_by_source_since(
+    path: Path, source: str, ts_iso: str
+) -> int:
+    """Delete closed_trades rows for *source* with ts >= ts_iso (ISO-8601 string).
+
+    Scoped alternative to delete_closed_trades_by_source: only rows inside the
+    authoritative fetch window are removed; rows older than ts_iso are preserved
+    intact.  Parametrized query — safe against SQL injection.
+    Returns the number of rows deleted.
+    """
+    return await asyncio.to_thread(
+        _delete_closed_trades_by_source_since_sync, path, source, ts_iso
+    )
+
+
 def _query_closed_trades_by_source_sync(path: Path, source: str) -> list[dict]:
     """Return all closed_trades rows WHERE source = ?, newest-first."""
     con = sqlite3.connect(path)

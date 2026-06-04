@@ -97,6 +97,11 @@ class HyperliquidClient:
         # coin-index maps populated by bootstrap_markets()
         self._coin_to_id: dict[str, int] = {}
         self._id_to_coin: dict[int, str] = {}
+        # Stable frozen set of perp coin names (uppercased), populated once by
+        # bootstrap_markets().  Used as the perp-only filter in _parse_fill so
+        # that _market_id()'s side-effect of adding synthetic ids to _coin_to_id
+        # cannot corrupt the filter (the cascade bug).
+        self._perp_universe: set[str] = set()
 
         # Clearinghouse state cache
         self._ch_cache: Optional[dict] = None
@@ -144,6 +149,9 @@ class HyperliquidClient:
                 if name:
                     self._coin_to_id[name] = idx
                     self._id_to_coin[idx] = name
+            # Populate the stable perp-universe set so _parse_fill can use it
+            # as a filter without being affected by _market_id()'s side-effects.
+            self._perp_universe = set(self._coin_to_id.keys())
             log.info("[%s] loaded %d HL market symbols", self.source, len(self._id_to_coin))
         else:
             log.warning(
@@ -775,8 +783,18 @@ class HyperliquidClient:
             trade_id = int(raw["tid"])
             coin = str(raw["coin"])
 
-            # Perp-only filter — skip spot / builder fills once we have the map.
-            if self._coin_to_id and coin.upper() not in self._coin_to_id:
+            # Perp-only filter — skip spot / builder fills once we have the
+            # stable universe set.  We intentionally use _perp_universe (not
+            # _coin_to_id) here: _market_id() adds synthetic entries to
+            # _coin_to_id as a side-effect, which made _coin_to_id non-empty
+            # after the first fill was parsed, causing every subsequent
+            # different coin to fail the old "not in _coin_to_id" check and be
+            # silently dropped (the multi-coin cascade bug).
+            # _perp_universe is written exactly once by bootstrap_markets() and
+            # is never mutated afterwards, so the filter is stable.
+            # When _perp_universe is empty (bootstrap not called) the filter is
+            # skipped entirely — safe fallback, all fills are parsed.
+            if self._perp_universe and coin.upper() not in self._perp_universe:
                 log.debug(
                     "[%s] HL fill skipped (not perp): coin=%s tid=%d",
                     self.source, coin, trade_id,

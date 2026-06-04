@@ -12,7 +12,7 @@ Dry-run (default — NO writes):
 Apply (writes to DB, regenerates cards):
     python scripts/reconcile_hl_pnl.py --apply
 
-Only look back N days:
+Look back N days (default 180):
     python scripts/reconcile_hl_pnl.py --days 30 --apply
 
 Skip card regeneration:
@@ -25,8 +25,13 @@ Safety guarantees
 -----------------
 - DRY-RUN by default; nothing is written without --apply.
 - Back up the DB before any delete: data/events.db.bak-<unix_ts>
-- Only rows WHERE source = <hl.name> are deleted; Lighter rows are NEVER touched.
-- Idempotent: re-running with --apply produces the same result (delete+insert).
+- SCOPED delete: only rows WHERE source=<hl name> AND ts >= T0 are removed,
+  where T0 = min(fill.timestamp) across the fetched window.  Rows OLDER than
+  T0 are preserved untouched (no data loss outside the authoritative window).
+- Lighter rows are NEVER touched (filter strictly on source == <hl name>).
+- Idempotent: re-running with --apply produces the same result.
+- bootstrap_markets() is called before any fetch so ALL coins are parsed
+  (prevents the multi-coin cascade bug where only the first coin was kept).
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ if str(_REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from src.db import (
-    delete_closed_trades_by_source,
+    delete_closed_trades_by_source_since,
     init_db,
     query_closed_trades_by_source,
     save_closed_trade,
@@ -67,6 +72,8 @@ from scripts.hl_pnl_logic import reconstruct_all
 # DB path matches dashboard.py: repo_root/data/events.db
 DB_PATH = _REPO_ROOT / "data" / "events.db"
 CARDS_DIR = DB_PATH.parent / "cards"
+
+_DEFAULT_DAYS = 180
 
 log = logging.getLogger("reconcile_hl_pnl")
 
@@ -207,59 +214,79 @@ def _net_pnl(rows: list[dict]) -> Decimal:
     return total
 
 
+def _per_coin_table(records: list[dict]) -> list[tuple[str, int, Decimal]]:
+    """Return list of (coin, fill_count, net_pnl) sorted by net PnL descending."""
+    from collections import defaultdict
+    coin_fills: dict[str, int] = defaultdict(int)
+    coin_pnl: dict[str, Decimal] = defaultdict(Decimal)
+    for r in records:
+        sym = r.get("market_symbol") or "?"
+        coin_fills[sym] += 1
+        v = r.get("pnl")
+        if v is not None:
+            try:
+                coin_pnl[sym] += Decimal(str(v))
+            except Exception:
+                pass
+    result = [(sym, coin_fills[sym], coin_pnl[sym]) for sym in coin_fills]
+    result.sort(key=lambda x: x[2], reverse=True)
+    return result
+
+
 def _print_report(
     existing_rows: list[dict],
     rebuilt_records: list[dict],
     hl_name: str,
     dry_run: bool,
+    t0_iso: str | None,
+    now_iso: str,
+    rows_replaced: int,
+    rows_preserved: int,
 ) -> None:
-    existing_count = len(existing_rows)
-    existing_pnl = _net_pnl(existing_rows)
-    rebuilt_count = len(rebuilt_records)
+    """Print the full reconciliation report including a per-coin breakdown."""
     rebuilt_pnl = _net_pnl(rebuilt_records)
+    existing_pnl = _net_pnl(existing_rows)
     delta = rebuilt_pnl - existing_pnl
 
     mode = "DRY-RUN" if dry_run else "APPLY"
-    print(f"\n{'='*60}")
+    print(f"\n{'='*64}")
     print(f"  HL PnL Reconciliation Report  [{mode}]")
-    print(f"{'='*60}")
+    print(f"{'='*64}")
     print(f"  Source             : {hl_name}")
     print(f"  DB path            : {DB_PATH}")
-    print()
-    print(f"  Existing HL rows   : {existing_count:>6}")
-    print(f"  Existing net PnL   : ${existing_pnl:>+,.2f}")
-    print()
-    print(f"  Rebuilt rows       : {rebuilt_count:>6}")
-    print(f"  Rebuilt net PnL    : ${rebuilt_pnl:>+,.2f}")
-    print()
-    print(f"  Delta (recovered)  : ${delta:>+,.2f}  ({rebuilt_count - existing_count:+d} rows)")
+    print(f"  Time window        : [{t0_iso or 'N/A'} .. {now_iso}]")
     print()
 
-    # Show up to 5 sample rebuilt records
-    samples = rebuilt_records[:5]
-    if samples:
-        print("  Sample rebuilt trades (oldest 5):")
-        for r in samples:
-            ts_short = str(r.get("ts", ""))[:19]
-            sym = r.get("market_symbol", "?")
-            side = r.get("side", "?")
-            pnl_val = r.get("pnl", "0")
-            kind = r.get("realization_kind", "?")
-            try:
-                pnl_f = float(pnl_val)
-                pnl_str = f"${pnl_f:>+,.2f}"
-            except (ValueError, TypeError):
-                pnl_str = str(pnl_val)
-            tid = r.get("trade_id", "?")
-            print(f"    [{ts_short}] {sym:>6} {side:<5} {pnl_str:>12}  {kind:<7}  tid={tid}")
-
+    # Per-coin table
+    coin_table = _per_coin_table(rebuilt_records)
+    if coin_table:
+        print(f"  {'Coin':<10}  {'#Fills':>7}  {'Net PnL':>14}")
+        print(f"  {'-'*10}  {'-'*7}  {'-'*14}")
+        for sym, cnt, pnl in coin_table:
+            print(f"  {sym:<10}  {cnt:>7}  ${pnl:>+13,.2f}")
+        print(f"  {'-'*10}  {'-'*7}  {'-'*14}")
+        print(f"  {'TOTAL':<10}  {len(rebuilt_records):>7}  ${rebuilt_pnl:>+13,.2f}")
+    else:
+        print("  (no rebuilt records)")
     print()
+
+    print(f"  Existing HL rows (total)   : {len(existing_rows):>6}")
+    print(f"  Existing HL rows (ts>=T0)  : {rows_replaced:>6}  ← will be replaced")
+    print(f"  Existing HL rows (ts<T0)   : {rows_preserved:>6}  ← preserved untouched")
+    print()
+    print(f"  Existing net PnL           : ${existing_pnl:>+,.2f}")
+    print(f"  Rebuilt net PnL            : ${rebuilt_pnl:>+,.2f}")
+    print(f"  Delta (recovered)          : ${delta:>+,.2f}  ({len(rebuilt_records) - len(existing_rows):+d} rows)")
+    print()
+    print(f"  Resulting row count        : {rows_preserved + len(rebuilt_records):>6}")
+    print()
+
     if dry_run:
         print("  [DRY-RUN] No changes written.  Re-run with --apply to apply.")
     else:
         print("  Changes applied.  Restart the bot to reload corrected stats:")
         print("    sudo systemctl restart lighterbot")
-    print(f"{'='*60}\n")
+    print(f"{'='*64}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +295,9 @@ def _print_report(
 
 async def main(
     apply: bool,
-    days: int | None,
+    days: int,
     no_cards: bool,
+    now_ms: int,
 ) -> None:
     # 1. Load config + find HL source
     load_dotenv()
@@ -298,37 +326,70 @@ async def main(
     # 3. Initialise DB
     await init_db(DB_PATH)
 
-    # 4. Fetch realizing fills from HL
-    start_time_ms: int | None = None
-    if days is not None:
-        start_time_ms = int(time.time() * 1000) - days * 86_400_000
-        log.info("Fetching fills for the last %d days (start_ms=%d)", days, start_time_ms)
-    else:
-        log.info("Fetching last ~2000 fills (no --days specified)")
+    # 4. Bootstrap markets BEFORE fetching fills.
+    #    Without this, _coin_to_id starts empty; _market_id() adds the first
+    #    parsed coin making it non-empty, then every other coin fails the
+    #    old "not in _coin_to_id" perp filter → only 1 coin survives.
+    log.info("Bootstrapping HL markets (required for multi-coin fill parsing)…")
+    await hl_source.client.bootstrap_markets()
+
+    # 5. Compute start window and fetch fills.
+    start_time_ms = now_ms - days * 86_400_000
+    log.info(
+        "Fetching fills for the last %d days (start_ms=%d)", days, start_time_ms
+    )
 
     fills = await hl_source.client.fetch_realizing_fills(
         start_time_ms=start_time_ms,
-        limit=2000,
     )
     log.info("Fetched %d realizing fills", len(fills))
 
-    # 5. Reconstruct records (pure logic)
+    # 6. Reconstruct records (pure logic in hl_pnl_logic.py)
     rebuilt_records = reconstruct_all(fills)
     log.info("Reconstructed %d records", len(rebuilt_records))
 
-    # 6. Query existing HL rows for the report
-    existing_rows = await query_closed_trades_by_source(DB_PATH, hl_source.name)
+    # 7. Determine T0 = min timestamp across all fetched fills.
+    #    Only rows with ts >= T0 are within our authoritative window.
+    from datetime import datetime, timezone
+    now_iso = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat()
 
-    # 7. Print report
-    _print_report(existing_rows, rebuilt_records, hl_source.name, dry_run=not apply)
+    t0_iso: str | None = None
+    if rebuilt_records:
+        t0_iso = min(r["ts"] for r in rebuilt_records)
+
+    # 8. Query existing HL rows and compute scoped counts for the report.
+    existing_rows = await query_closed_trades_by_source(DB_PATH, hl_source.name)
+    if t0_iso is not None:
+        rows_replaced = sum(1 for r in existing_rows if (r.get("ts") or "") >= t0_iso)
+        rows_preserved = len(existing_rows) - rows_replaced
+    else:
+        rows_replaced = 0
+        rows_preserved = len(existing_rows)
+
+    # 9. Print per-coin report (always, dry-run and apply alike)
+    _print_report(
+        existing_rows,
+        rebuilt_records,
+        hl_source.name,
+        dry_run=not apply,
+        t0_iso=t0_iso,
+        now_iso=now_iso,
+        rows_replaced=rows_replaced,
+        rows_preserved=rows_preserved,
+    )
 
     if not apply:
+        # Close client cleanly even in dry-run
+        try:
+            await hl_source.client.close()
+        except Exception:
+            pass
         return
 
-    # 8. Apply: backup → delete → insert → (optionally) regenerate cards
+    # 10. Apply: backup → scoped-delete → insert rebuilt rows → (optionally) cards
 
-    # 8a. Backup DB
-    ts_stamp = int(time.time())
+    # 10a. Backup DB
+    ts_stamp = int(now_ms / 1000)
     backup_path = DB_PATH.with_name(f"events.db.bak-{ts_stamp}")
     try:
         shutil.copy2(DB_PATH, backup_path)
@@ -339,12 +400,31 @@ async def main(
         print(f"ERROR: Could not back up DB: {exc}\nAborting — no changes made.")
         sys.exit(1)
 
-    # 8b. Delete existing HL rows
-    deleted = await delete_closed_trades_by_source(DB_PATH, hl_source.name)
-    log.info("Deleted %d existing HL rows (source=%r)", deleted, hl_source.name)
-    print(f"  Deleted {deleted} existing HL rows.")
+    # 10b. SCOPED delete: remove only rows with ts >= T0 (authoritative window).
+    #      Rows older than T0 are outside the fetched window and are preserved.
+    #      Blanket delete is intentionally NOT used here.
+    if t0_iso is not None:
+        deleted = await delete_closed_trades_by_source_since(
+            DB_PATH, hl_source.name, t0_iso
+        )
+        log.info(
+            "Scoped-deleted %d existing HL rows (source=%r, ts>=%s)",
+            deleted, hl_source.name, t0_iso,
+        )
+        print(
+            f"  Scoped-deleted {deleted} existing HL rows "
+            f"(ts >= {t0_iso}; {rows_preserved} older rows preserved)."
+        )
+    else:
+        log.info("No rebuilt records — nothing to delete or insert.")
+        print("  No fills fetched — nothing to delete or insert.")
+        try:
+            await hl_source.client.close()
+        except Exception:
+            pass
+        return
 
-    # 8c. Insert rebuilt records (with optional card generation)
+    # 10c. Insert rebuilt records (with optional card generation)
     cards_written = 0
     cards_failed = 0
     for rec in rebuilt_records:
@@ -367,12 +447,16 @@ async def main(
     log.info("Inserted %d records", len(rebuilt_records))
     if not no_cards:
         log.info("Cards: %d written, %d failed", cards_written, cards_failed)
-        print(f"  Inserted {len(rebuilt_records)} records  "
-              f"({cards_written} cards written, {cards_failed} failed).")
+        print(
+            f"  Inserted {len(rebuilt_records)} records  "
+            f"({cards_written} cards written, {cards_failed} failed)."
+        )
     else:
-        print(f"  Inserted {len(rebuilt_records)} records (cards skipped via --no-cards).")
+        print(
+            f"  Inserted {len(rebuilt_records)} records (cards skipped via --no-cards)."
+        )
 
-    # 8d. Close HL client cleanly
+    # 10d. Close HL client cleanly
     try:
         await hl_source.client.close()
     except Exception:
@@ -389,9 +473,11 @@ async def main(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Rebuild all Hyperliquid closed-trade records from HL's authoritative fills.\n\n"
+            "Rebuild Hyperliquid closed-trade records from HL's authoritative fills.\n\n"
             "Defaults to DRY-RUN — pass --apply to write changes.\n"
-            "Always backs up the DB before any mutation."
+            "Always backs up the DB before any mutation.\n\n"
+            "SCOPED delete: only rows with ts >= T0 (earliest fetched fill timestamp)\n"
+            "are replaced; older rows are preserved untouched."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -404,11 +490,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--days",
         type=int,
-        default=None,
+        default=_DEFAULT_DAYS,
         metavar="N",
         help=(
-            "Restrict to fills from the last N days.  "
-            "Without this flag, uses the last ~2000 fills (HL default)."
+            f"Fetch fills from the last N days (default: {_DEFAULT_DAYS}). "
+            "Sets start_time_ms for complete history paging."
         ),
     )
     parser.add_argument(
@@ -427,4 +513,13 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
     args = _parse_args()
-    asyncio.run(main(apply=args.apply, days=args.days, no_cards=args.no_cards))
+    # Capture now_ms at the top of main() — never inside a pure function.
+    _now_ms = int(time.time() * 1000)
+    asyncio.run(
+        main(
+            apply=args.apply,
+            days=args.days,
+            no_cards=args.no_cards,
+            now_ms=_now_ms,
+        )
+    )

@@ -423,6 +423,112 @@ class TestReconstructAll:
 # DB helper: delete_closed_trades_by_source
 # ---------------------------------------------------------------------------
 
+class TestDeleteBySourceSince:
+    """Tests for the new scoped delete helper delete_closed_trades_by_source_since."""
+
+    def _make_rec(self, source: str, ts: str, trade_id: int) -> dict:
+        return {
+            "ts": ts,
+            "source": source,
+            "market_symbol": "BTC",
+            "side": "long",
+            "entry": "49500",
+            "exit": "50000",
+            "size": "1",
+            "notional": "49500",
+            "pnl": "500",
+            "pct": "1.01",
+            "is_win": 1,
+            "leverage": None,
+            "wins": 1,
+            "total": 1,
+            "card_path": None,
+            "trade_id": trade_id,
+            "fill_ids": f"[{trade_id}]",
+            "realization_kind": "FULL",
+        }
+
+    def test_deletes_rows_at_or_after_t0(self, tmp_path):
+        from src.db import (
+            delete_closed_trades_by_source_since,
+            init_db,
+            load_closed_trades,
+            save_closed_trade,
+        )
+        db = tmp_path / "test.db"
+        _run(init_db(db))
+        # Insert three HL rows at different timestamps
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-01-01T00:00:00+00:00", 1)))
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-03-01T00:00:00+00:00", 2)))
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-06-01T00:00:00+00:00", 3)))
+
+        # Delete rows with ts >= March 2026 (T0)
+        deleted = _run(
+            delete_closed_trades_by_source_since(db, "HL", "2026-03-01T00:00:00+00:00")
+        )
+        assert deleted == 2  # March and June rows deleted
+
+        remaining = _run(load_closed_trades(db))
+        assert len(remaining) == 1
+        assert remaining[0]["trade_id"] == 1  # January row preserved
+
+    def test_preserves_other_source(self, tmp_path):
+        from src.db import (
+            delete_closed_trades_by_source_since,
+            init_db,
+            load_closed_trades,
+            save_closed_trade,
+        )
+        db = tmp_path / "test.db"
+        _run(init_db(db))
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-03-01T00:00:00+00:00", 1)))
+        _run(save_closed_trade(db, self._make_rec("Lighter NK", "2026-03-01T00:00:00+00:00", 2)))
+
+        deleted = _run(
+            delete_closed_trades_by_source_since(db, "HL", "2026-01-01T00:00:00+00:00")
+        )
+        assert deleted == 1
+
+        remaining = _run(load_closed_trades(db))
+        assert len(remaining) == 1
+        assert remaining[0]["source"] == "Lighter NK"
+
+    def test_no_rows_in_window_returns_zero(self, tmp_path):
+        from src.db import (
+            delete_closed_trades_by_source_since,
+            init_db,
+            save_closed_trade,
+        )
+        db = tmp_path / "test.db"
+        _run(init_db(db))
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-01-01T00:00:00+00:00", 1)))
+
+        # T0 is AFTER the only row — nothing matches ts >= T0
+        deleted = _run(
+            delete_closed_trades_by_source_since(db, "HL", "2026-06-01T00:00:00+00:00")
+        )
+        assert deleted == 0
+
+    def test_idempotent(self, tmp_path):
+        from src.db import (
+            delete_closed_trades_by_source_since,
+            init_db,
+            save_closed_trade,
+        )
+        db = tmp_path / "test.db"
+        _run(init_db(db))
+        _run(save_closed_trade(db, self._make_rec("HL", "2026-03-01T00:00:00+00:00", 1)))
+
+        d1 = _run(
+            delete_closed_trades_by_source_since(db, "HL", "2026-01-01T00:00:00+00:00")
+        )
+        d2 = _run(
+            delete_closed_trades_by_source_since(db, "HL", "2026-01-01T00:00:00+00:00")
+        )
+        assert d1 == 1
+        assert d2 == 0  # row already gone
+
+
 class TestDeleteBySource:
     def test_deletes_only_target_source(self, tmp_path):
         from src.db import (
