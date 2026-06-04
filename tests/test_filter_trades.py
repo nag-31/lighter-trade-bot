@@ -76,6 +76,24 @@ def test_unparseable_ts_kept_when_no_date_bound():
     assert _syms(out)[-1] == "DOGE"
 
 
+def test_exclude_symbols_blacklist():
+    out = filter_trades(SAMPLE, exclude_symbols=["ETH"])
+    assert "ETH" not in _syms(out)
+    assert set(_syms(out)) == {"PUMP", "BTC", "ARB"}
+
+
+def test_exclude_symbols_quote_suffix_tolerant():
+    rows = SAMPLE + [_rec("2026-06-05T10:00:00Z", "FARTCOINUSDT")]
+    out = filter_trades(rows, exclude_symbols=["FARTCOIN"])
+    assert "FARTCOINUSDT" not in _syms(out)
+
+
+def test_exclude_wins_over_whitelist():
+    # A symbol in both the whitelist and blacklist is excluded.
+    out = filter_trades(SAMPLE, symbols=["ETH", "BTC"], exclude_symbols=["ETH"])
+    assert _syms(out) == ["BTC"]
+
+
 def test_combined_date_and_symbol_filter():
     out = filter_trades(
         SAMPLE, start_date="2026-05-01", end_date=None, symbols=["BTC", "PUMP"]

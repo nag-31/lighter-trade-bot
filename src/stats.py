@@ -65,6 +65,7 @@ def filter_trades(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     symbols: Optional[Iterable[str]] = None,
+    exclude_symbols: Optional[Iterable[str]] = None,
 ) -> list[dict]:
     """Return the closed-trade records to DISPLAY, filtered and date-sorted.
 
@@ -81,6 +82,9 @@ def filter_trades(
         treated as inclusive end-of-day.
     symbols:
         Whitelist of tickers (normalized). Empty/``None`` ⇒ all coins.
+    exclude_symbols:
+        Blacklist of tickers (normalized) to always drop (e.g. a source's
+        ``exclude_symbols`` like FARTCOIN) — applied even if ``symbols`` is set.
 
     A record whose ``ts`` can't be parsed is dropped when any date bound is set
     (it can't be placed in the window). Result is sorted newest-first by ``ts``.
@@ -92,11 +96,15 @@ def filter_trades(
         end = end.replace(hour=23, minute=59, second=59, microsecond=999_999)
 
     allow = {_norm_symbol(s) for s in symbols} if symbols else None
+    block = {_norm_symbol(s) for s in exclude_symbols} if exclude_symbols else None
     has_bound = start is not None or end is not None
 
     out: list[dict] = []
     for t in trades:
-        if allow is not None and _norm_symbol(t.get("market_symbol")) not in allow:
+        sym = _norm_symbol(t.get("market_symbol"))
+        if allow is not None and sym not in allow:
+            continue
+        if block is not None and sym in block:
             continue
         dt = _parse_ts(t.get("ts"))
         if has_bound:
@@ -147,10 +155,15 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
         segment: list[dict] = []
         for r in rows_sorted:
             segment.append(r)
-            if (r.get("realization_kind") or "").upper() == "FULL":
+            # A round-trip ends on any CLOSE row. Only an explicit PARTIAL
+            # (scale-out) keeps it open; FULL, legacy None, or any other kind is
+            # a complete close. (Treating None as non-terminating wrongly fused
+            # closed trades + reopens into one perpetual "in progress" blob and
+            # dropped their PnL from stats.)
+            if (r.get("realization_kind") or "").upper() != "PARTIAL":
                 aggregated.append(_collapse_segment(segment, closed=True))
                 segment = []
-        if segment:  # trailing partials with no FULL → in-progress
+        if segment:  # trailing PARTIAL(s) with no close → in-progress
             aggregated.append(_collapse_segment(segment, closed=False))
 
     # Running CLOSED-trade win/total record, assigned in chronological order.

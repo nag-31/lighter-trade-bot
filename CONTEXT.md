@@ -61,7 +61,14 @@ then `sudo systemctl restart lighterbot` (**restart requires explicit user OK ea
   (`_roundtrip_partial_pnl()` sums the round-trip's partials; restart-safe).
   Silent-close backstop marks intermediate fills PARTIAL + last FULL so it
   collapses to one trade. `display_trades(include_open)` is the single view
-  feeding both grid and stats. Dashboard index sends `Cache-Control: no-cache`
+  feeding both grid and stats.
+  - A round-trip ends on ANY non-`PARTIAL` row (FULL, legacy `None`, unknown) —
+    only an explicit `PARTIAL` keeps it open. (Bug fixed 2026-06-04: treating
+    `None`-kind legacy rows as non-terminating fused closed trades + reopens
+    into one perpetual "in progress" blob and dropped ~$1.4k from stats.)
+  - Excluded symbols (e.g. FARTCOIN via `exclude_symbols`) are dropped from the
+    grid AND stats at the display layer (`filter_trades(exclude_symbols=…)`),
+    not just at record time. Dashboard index sends `Cache-Control: no-cache`
   so browsers pick up new frontend JS after a deploy.
 - **Stats computed on CLOSED trades only** (rows with non-None pnl).
 - **Binance**: rotating `ProxyPool` (round-robin + cooldown + failover) to bypass

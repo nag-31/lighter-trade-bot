@@ -960,6 +960,13 @@ async def _run() -> None:
     # analytics and the history grid so they always agree.
     #   include_open=True  → grid (shows in-progress round-trips, flagged OPEN)
     #   include_open=False → stats (CLOSED-only, per the "closed trades only" rule)
+    # Union of every source's exclude_symbols (already normalized) — these
+    # tickers (e.g. FARTCOIN) are dropped from the grid AND stats, even if a
+    # stale row exists in the DB.
+    _excluded_symbols: frozenset[str] = frozenset().union(
+        *(s.exclude_symbols for s in sources)
+    ) if sources else frozenset()
+
     def display_trades(include_open: bool = True) -> list[dict]:
         agg = aggregate_round_trips(closed_trades)
         for row in agg:
@@ -971,6 +978,7 @@ async def _run() -> None:
             start_date=cfg.stats_start_date,
             end_date=cfg.stats_end_date,
             symbols=cfg.stats_symbols,
+            exclude_symbols=_excluded_symbols,
         )
 
     if cfg.stats_start_date or cfg.stats_end_date or cfg.stats_symbols:

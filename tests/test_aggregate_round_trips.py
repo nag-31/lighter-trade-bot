@@ -106,6 +106,33 @@ def test_unsorted_input_is_segmented_by_time():
     assert agg[0]["pnl"] == 250.0
 
 
+def test_none_kind_rows_are_closed_not_in_progress():
+    # Legacy rows with realization_kind=None must count as complete closes,
+    # not get fused into a perpetual "in progress" blob.
+    rows = [
+        _row("2026-06-01T10:00:00Z", "DOGE", 40, None),
+        _row("2026-06-02T10:00:00Z", "DOGE", 60, None),
+    ]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 2
+    assert all(a["realization_kind"] == "FULL" for a in agg)
+    s = compute_stats([a for a in agg if a["realization_kind"] == "FULL"])
+    assert s["n_trades"] == 2 and s["total_pnl"] == 100.0
+
+
+def test_close_then_reopen_separates_closed_from_in_progress():
+    # LIT closed for profit, then reopened and scaled out (still open).
+    rows = [
+        _row("2026-06-01T10:00:00Z", "LIT", 200, "FULL", card="/cards/lit_close.png"),
+        _row("2026-06-03T09:00:00Z", "LIT", 30, "PARTIAL", card="/cards/lit_reopen.png"),
+    ]
+    agg = sorted(aggregate_round_trips(rows), key=lambda a: a["ts"])
+    assert len(agg) == 2
+    assert agg[0]["realization_kind"] == "FULL" and agg[0]["pnl"] == 200.0
+    assert agg[1]["realization_kind"] == "OPEN" and agg[1]["pnl"] == 30.0
+    # The previous close is NOT marked in-progress; only the reopen is.
+
+
 def test_running_win_total_counts_closed_only():
     rows = [
         _row("2026-06-01T10:00:00Z", "BTC", 100, "FULL"),   # win  -> 1/1
