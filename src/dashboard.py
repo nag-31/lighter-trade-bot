@@ -1742,12 +1742,56 @@ async def _run() -> None:
                         )
                         _reconciler_alerted_opens.discard((src.id, market_id))
                         _sl_tp_alerted.discard((src.id, market_id))
+
+                        # ── Read anchor BEFORE clearing it (needed for both TG msg
+                        #    and record_realization below).
+                        ae = _anchor(src, market_id, pos.avg_entry_price)
+
+                        # ── HL-only: fetch realizing fills and record PnL ──────────
+                        if src.is_hyperliquid:
+                            try:
+                                # Use last-2000 user_fills (start_time_ms=None) and
+                                # filter to this market_id — simple and avoids
+                                # needing a reliable last-known timestamp.
+                                _sc_fills = await src.client.fetch_realizing_fills(
+                                    market_id=market_id,
+                                    start_time_ms=None,
+                                )
+                                for _sc_fill in _sc_fills:
+                                    if _sc_fill.trade_id in _recorded_realizations:
+                                        continue
+                                    _sc_pnl = (
+                                        _sc_fill.realized_pnl
+                                        if _sc_fill.realized_pnl is not None
+                                        else _lighter_realized(
+                                            pos.side,
+                                            pos.avg_entry_price,
+                                            _sc_fill.price,
+                                            _sc_fill.size,
+                                        )
+                                    )
+                                    await record_realization(
+                                        src=src,
+                                        kind="FULL",
+                                        trade=_sc_fill,
+                                        position_before=pos,
+                                        realized_pnl=_sc_pnl,
+                                        reduced_size=_sc_fill.size,
+                                        fill_price=_sc_fill.price,
+                                        avg_entry=pos.avg_entry_price,
+                                        leverage=None,
+                                        fill_ids=[_sc_fill.trade_id],
+                                        anchor_entry=ae,
+                                    )
+                            except Exception:
+                                log.exception(
+                                    "[%s] reconcile silent-close backstop failed for %s",
+                                    src.name, pos.market_symbol,
+                                )
+
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
                             footer    = f"\n{src.url}" if src.url else ""
-
-                            # Read anchor before clearing it
-                            ae = _anchor(src, market_id, pos.avg_entry_price)
 
                             # Transform displayed values for HL (close price unavailable)
                             disp_entry_val = pos.avg_entry_price

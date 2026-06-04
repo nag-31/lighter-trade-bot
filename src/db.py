@@ -160,6 +160,50 @@ async def load_closed_trades(path: Path, limit: int | None = None) -> list[dict]
     return await asyncio.to_thread(_load_closed_trades_sync, path, limit)
 
 
+def _delete_closed_trades_by_source_sync(path: Path, source: str) -> int:
+    """Delete all closed_trades rows WHERE source = ?  Returns row count deleted."""
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            "DELETE FROM closed_trades WHERE source = ?", (source,)
+        )
+        deleted = cur.rowcount
+        con.commit()
+        return deleted
+    finally:
+        con.close()
+
+
+async def delete_closed_trades_by_source(path: Path, source: str) -> int:
+    """Delete all closed_trades rows for the given source name.
+
+    Parametrized query — safe against SQL injection.
+    Returns the number of rows deleted.
+    Only touches rows matching the exact source string; all other rows
+    (e.g. Lighter trades) are left completely untouched.
+    """
+    return await asyncio.to_thread(_delete_closed_trades_by_source_sync, path, source)
+
+
+def _query_closed_trades_by_source_sync(path: Path, source: str) -> list[dict]:
+    """Return all closed_trades rows WHERE source = ?, newest-first."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM closed_trades WHERE source = ? ORDER BY id DESC",
+            (source,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+async def query_closed_trades_by_source(path: Path, source: str) -> list[dict]:
+    """Return all closed_trades rows for the given source name, newest-first."""
+    return await asyncio.to_thread(_query_closed_trades_by_source_sync, path, source)
+
+
 def _load_recorded_fill_ids_sync(path: Path) -> set[int]:
     """Return the union of all trade_id values and all ids inside fill_ids JSON lists.
 

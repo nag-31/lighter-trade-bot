@@ -441,6 +441,133 @@ class HyperliquidClient:
         return trades[-limit:] if limit else trades
 
     # ------------------------------------------------------------------ #
+    # Realizing fills (closes / scale-outs)                               #
+    # ------------------------------------------------------------------ #
+
+    async def fetch_realizing_fills(
+        self,
+        *,
+        market_id: Optional[int] = None,
+        start_time_ms: Optional[int] = None,
+        limit: int = 2000,
+    ) -> list[Trade]:
+        """Return REALIZING fills (closes / scale-outs) from HL, each carrying the
+        exact closedPnl in Trade.realized_pnl. Used by the silent-close backstop and
+        the one-time reconciliation sweep.
+
+        When start_time_ms is given, pages via Info.user_fills_by_time(address, start, end)
+        back-to-front to cover history; otherwise uses Info.user_fills(address) (last ~2000).
+        market_id (optional) filters to one coin.
+
+        A fill is 'realizing' when:
+          - its parsed realized_pnl is not None and != 0, OR
+          - its dir starts with 'Close'
+
+        Returns fills in oldest-first order (convenient for sequential recording).
+        Returns [] and logs on any SDK error — never raises into the caller.
+        """
+        _MAX_PAGES = 20
+
+        try:
+            if start_time_ms is not None:
+                # Page user_fills_by_time from start_time_ms to now.
+                raw_fills: list[dict] = []
+                seen_tids_page: set[int] = set()
+                page_start = start_time_ms
+                now_ms = int(time.time() * 1000)
+
+                for _page in range(_MAX_PAGES):
+                    batch = await asyncio.to_thread(
+                        self._info.user_fills_by_time,
+                        self.address,
+                        page_start,
+                        now_ms,
+                    )
+                    if not isinstance(batch, list) or not batch:
+                        break
+                    added = 0
+                    last_time = page_start
+                    for fill in batch:
+                        if not isinstance(fill, dict):
+                            continue
+                        tid = fill.get("tid")
+                        if tid is not None and int(tid) in seen_tids_page:
+                            continue
+                        if tid is not None:
+                            seen_tids_page.add(int(tid))
+                        raw_fills.append(fill)
+                        added += 1
+                        fill_time = int(fill.get("time", page_start))
+                        if fill_time > last_time:
+                            last_time = fill_time
+
+                    # Advance window; stop if the batch didn't push us forward
+                    if last_time <= page_start or len(batch) < 2000:
+                        break
+                    # +1 ms to avoid re-fetching the boundary fill
+                    page_start = last_time + 1
+                    if page_start >= now_ms:
+                        break
+            else:
+                raw_fills_any = await asyncio.to_thread(
+                    self._info.user_fills, self.address
+                )
+                if not isinstance(raw_fills_any, list):
+                    log.warning(
+                        "[%s] fetch_realizing_fills: user_fills returned non-list: %r",
+                        self.source, type(raw_fills_any),
+                    )
+                    return []
+                raw_fills = raw_fills_any
+
+        except Exception:
+            log.exception("[%s] fetch_realizing_fills: SDK call failed", self.source)
+            return []
+
+        # Parse and filter
+        trades: list[Trade] = []
+        seen_ids: set[int] = set()
+        for raw in raw_fills:
+            try:
+                t = self._parse_fill(raw)
+            except Exception:
+                log.debug("[%s] fetch_realizing_fills: parse error on %r", self.source, raw)
+                continue
+            if t is None:
+                continue
+            # De-dupe by trade_id
+            if t.trade_id in seen_ids:
+                continue
+            seen_ids.add(t.trade_id)
+
+            # Market-id filter
+            if market_id is not None and t.market_id != market_id:
+                continue
+
+            # Realizing check: non-zero closedPnl OR dir starts with "Close"
+            is_realizing = (
+                (t.realized_pnl is not None and t.realized_pnl != 0)
+                or (t.dir is not None and str(t.dir).startswith("Close"))
+            )
+            if not is_realizing:
+                continue
+
+            trades.append(t)
+
+        # Oldest-first (convenient for sequential recording)
+        trades.sort(key=lambda x: x.trade_id)
+
+        # Cap to limit
+        if limit:
+            trades = trades[-limit:]
+
+        log.debug(
+            "[%s] fetch_realizing_fills: %d realizing fills (market_id=%s, start_ms=%s)",
+            self.source, len(trades), market_id, start_time_ms,
+        )
+        return trades
+
+    # ------------------------------------------------------------------ #
     # Protocol: stream_trades (WS primary stream)                         #
     # ------------------------------------------------------------------ #
 
