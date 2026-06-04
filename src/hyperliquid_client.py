@@ -33,7 +33,7 @@ from typing import AsyncIterator, Optional
 from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
-from .types import Position, Trade
+from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
 
@@ -310,6 +310,89 @@ class HyperliquidClient:
                 tp = trigger_px
 
         return sl, tp
+
+    # ------------------------------------------------------------------ #
+    # Protocol: fetch_open_orders                                         #
+    # ------------------------------------------------------------------ #
+
+    async def fetch_open_orders(self) -> list[OpenOrder]:
+        """Return all resting/pending orders for this wallet.
+
+        Prefers the SDK's frontend_open_orders() (superset with orderType,
+        isPositionTpsl, reduceOnly, triggerCondition, triggerPx) when available;
+        falls back to open_orders().  Returns [] on any error.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            # Try the richer endpoint first; it may not exist in older SDK versions.
+            if hasattr(self._info, "frontend_open_orders"):
+                orders = await loop.run_in_executor(
+                    None, self._info.frontend_open_orders, self.address
+                )
+            else:
+                orders = await loop.run_in_executor(
+                    None, self._info.open_orders, self.address
+                )
+        except Exception:
+            log.debug("[%s] HL fetch_open_orders failed", self.source)
+            return []
+
+        if not isinstance(orders, list):
+            return []
+
+        out: list[OpenOrder] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            try:
+                coin = str(order.get("coin", "")).upper()
+                if not coin:
+                    continue
+
+                market_id = self._market_id(coin)
+                side_raw = str(order.get("side", "")).upper()
+                side: str = "long" if side_raw == "B" else "short"
+
+                limit_px    = _to_decimal(order.get("limitPx") or order.get("px"))
+                trigger_px  = _to_decimal(order.get("triggerPx"))
+                size        = _to_decimal(order.get("sz") or order.get("size"))
+                reduce_only = bool(order.get("reduceOnly", False))
+                oid_raw     = order.get("oid") or order.get("orderId")
+                order_id    = int(oid_raw) if oid_raw is not None else None
+
+                # Classify order kind
+                cond  = str(order.get("triggerCondition", "")).lower()
+                otype = str(order.get("orderType", "")).lower()
+
+                if trigger_px and trigger_px != 0:
+                    # Has a trigger — classify as SL or TP
+                    if cond == "tp" or "take profit" in otype or "take_profit" in otype:
+                        kind = "take_profit"
+                    elif cond == "sl" or "stop" in otype:
+                        kind = "stop_loss"
+                    else:
+                        # Best-effort: reduce-only sell protects a long → SL
+                        kind = "stop_loss"
+                else:
+                    kind = "limit"
+
+                out.append(OpenOrder(
+                    source=self.source,
+                    market_id=market_id,
+                    market_symbol=coin,
+                    side=side,
+                    order_kind=kind,
+                    price=limit_px,
+                    trigger_px=trigger_px,
+                    size=size,
+                    reduce_only=reduce_only,
+                    order_id=order_id,
+                ))
+            except Exception:
+                log.debug("[%s] HL could not parse open order %r", self.source, order)
+
+        log.debug("[%s] %d HL open orders loaded", self.source, len(out))
+        return out
 
     # ------------------------------------------------------------------ #
     # Protocol: fetch_trades_since (REST gap-fill)                        #

@@ -32,7 +32,7 @@ from .binance_client import BinanceClient
 from .hyperliquid_client import HyperliquidClient
 from .lighter_client import LighterClient
 from .position_tracker import PositionTracker
-from .types import Position, Trade
+from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
 
@@ -191,6 +191,7 @@ class ExchangeClient(Protocol):
     def stream_trades(self) -> AsyncIterator[Trade]: ...
     async def fetch_leverage(self, market_id: int) -> Optional[float]: ...
     async def fetch_sl_tp(self, market_id: int) -> tuple[Optional[Decimal], Optional[Decimal]]: ...
+    async def fetch_open_orders(self) -> list[OpenOrder]: ...
     async def close(self) -> None: ...
 
 

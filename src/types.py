@@ -7,6 +7,22 @@ from typing import Literal, Optional
 Side = Literal["long", "short"]
 
 
+@dataclass
+class OpenOrder:
+    """A single resting/pending order on any exchange source."""
+
+    source: str
+    market_id: int
+    market_symbol: str
+    side: Side
+    order_kind: str                  # "limit" | "stop_loss" | "take_profit"
+    price: Optional[Decimal]         # limit price (None for pure market triggers)
+    trigger_px: Optional[Decimal]    # trigger price for stop/tp
+    size: Optional[Decimal]
+    reduce_only: bool = False
+    order_id: Optional[int] = None   # exchange order id — dedup + flash key
+
+
 @dataclass(frozen=True)
 class Trade:
     """A single normalised fill from any exchange source.

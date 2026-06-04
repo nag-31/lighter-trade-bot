@@ -46,7 +46,7 @@ from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
 from .stats import compute_stats, format_stats_summary
 from .stats_card import render_stats_card
-from .types import Event, EventKind, Position, Trade
+from .types import Event, EventKind, OpenOrder, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
@@ -177,6 +177,20 @@ INDEX_HTML = """<!doctype html>
   .chart-card-title { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #6b7280; margin-bottom: 10px; }
   .chart-wrap { position: relative; height: 240px; }
   .no-trades-msg { color: #4b5563; font-style: italic; font-size: 12px; padding: 8px 0; }
+  /* ---- open orders panel ---- */
+  .oo-header { display: flex; align-items: center; justify-content: space-between; margin: 0 0 12px; }
+  .oo-header h2 { margin: 0; }
+  .oo-toggle-wrap { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #6b7280; }
+  .oo-toggle { position: relative; display: inline-block; width: 32px; height: 17px; }
+  .oo-toggle input { opacity: 0; width: 0; height: 0; }
+  .oo-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #374151; border-radius: 17px; transition: background 0.2s; }
+  .oo-slider:before { position: absolute; content: ""; height: 11px; width: 11px; left: 3px; bottom: 3px; background: #9ca3af; border-radius: 50%; transition: transform 0.2s, background 0.2s; }
+  .oo-toggle input:checked + .oo-slider { background: #166534; }
+  .oo-toggle input:checked + .oo-slider:before { transform: translateX(15px); background: #22c55e; }
+  @keyframes ooFlash { 0%,100% { background: transparent; } 30% { background: rgba(34,197,94,0.25); } }
+  .oo-flash { animation: ooFlash 1.2s ease-out; }
+  @keyframes ooPulse { 0%,100% { box-shadow: none; } 40% { box-shadow: 0 0 0 3px rgba(34,197,94,0.35); } }
+  .oo-pulse { animation: ooPulse 0.6s ease-out; }
 </style>
 </head>
 <body>
@@ -190,6 +204,25 @@ INDEX_HTML = """<!doctype html>
         <thead><tr><th>Source</th><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Notional</th><th class="num">Unreal. P&amp;L</th><th class="num">SL</th><th class="num">TP</th></tr></thead>
         <tbody id="positions"></tbody>
       </table>
+    </section>
+    <section id="open-orders-section">
+      <div class="oo-header">
+        <h2>Open orders</h2>
+        <div class="oo-toggle-wrap">
+          <span>Show</span>
+          <label class="oo-toggle">
+            <input type="checkbox" id="oo-enabled" checked>
+            <span class="oo-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div id="oo-body">
+        <table>
+          <thead><tr><th>Source</th><th>Market</th><th>Side</th><th>Type</th><th class="num">Price</th><th class="num">Trigger</th><th class="num">Size</th></tr></thead>
+          <tbody id="open-orders"></tbody>
+        </table>
+        <div id="oo-footnote" style="font-size:10px;color:#6b7280;margin-top:6px"></div>
+      </div>
     </section>
     <section>
       <h2>Telegram alerts &mdash; exactly what the bot sent</h2>
@@ -600,6 +633,64 @@ function renderStats(stats) {
   }
 }
 
+// --- Open orders panel ---
+const _ooSeenIds = new Set();
+let _ooEnabled = localStorage.getItem("ooEnabled") !== "false";
+const _ooToggle = document.getElementById("oo-enabled");
+const _ooBody   = document.getElementById("oo-body");
+const _ooSection = document.getElementById("open-orders-section");
+
+// Apply initial toggle state from localStorage
+_ooToggle.checked = _ooEnabled;
+_ooBody.style.display = _ooEnabled ? "" : "none";
+
+_ooToggle.addEventListener("change", function() {
+  _ooEnabled = this.checked;
+  localStorage.setItem("ooEnabled", _ooEnabled ? "true" : "false");
+  if (_ooEnabled) {
+    _ooBody.style.display = "";
+    _ooSection.classList.remove("oo-pulse");
+    // Force reflow to re-trigger animation
+    void _ooSection.offsetWidth;
+    _ooSection.classList.add("oo-pulse");
+    _ooSection.addEventListener("animationend", () => _ooSection.classList.remove("oo-pulse"), { once: true });
+  } else {
+    _ooBody.style.display = "none";
+  }
+});
+
+function renderOpenOrders(orders) {
+  const tb = document.getElementById("open-orders");
+  const fnEl = document.getElementById("oo-footnote");
+  const arr = orders || [];
+  if (!arr.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="empty">no resting orders</td></tr>';
+    fnEl.textContent = "";
+    return;
+  }
+  let footnoteTxt = "";
+  tb.innerHTML = arr.map(o => {
+    const isNew = o.order_id != null && !_ooSeenIds.has(String(o.order_id));
+    if (o.order_id != null) _ooSeenIds.add(String(o.order_id));
+    const flashClass = isNew ? " oo-flash" : "";
+    const sideClass  = o.side === "long" ? "long" : "short";
+    const price   = o.price      != null ? fmtPrice(o.price)      : "—";
+    const trigger = o.trigger_px != null ? fmtPrice(o.trigger_px) : "—";
+    const size    = o.size       != null ? fmtSize(o.size)        : "—";
+    if (o.footnote) footnoteTxt = o.footnote;
+    return `<tr class="${flashClass}">
+      <td>${esc(o.source)}</td>
+      <td>${esc(o.market_symbol)}</td>
+      <td class="${sideClass}">${o.side.toUpperCase()}</td>
+      <td>${esc(o.order_kind)}</td>
+      <td class="num">${price}</td>
+      <td class="num">${trigger}</td>
+      <td class="num">${size}</td>
+    </tr>`;
+  }).join("");
+  fnEl.textContent = footnoteTxt;
+}
+
 // --- Send stats to Telegram button ---
 document.getElementById("send-stats-btn").addEventListener("click", function() {
   const btn = this;
@@ -631,6 +722,7 @@ function connect() {
     if (data.type === "snapshot") {
       renderSources(data.sources);
       renderPositions(data.positions);
+      renderOpenOrders(data.open_orders || []);
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
@@ -641,6 +733,7 @@ function connect() {
     } else if (data.type === "event") {
       renderSources(data.sources);
       renderPositions(data.positions);
+      renderOpenOrders(data.open_orders || []);
       renderEvents(data.recent_events);
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
@@ -870,6 +963,10 @@ async def _run() -> None:
     # (source_id, market_id) -> (sl_price, tp_price)  — both Optional[Decimal]
     # Populated by the reconciler and on OPEN events; purged on CLOSE.
     _sl_tp_cache: dict[tuple[str, int], tuple] = {}
+
+    # Open orders cache: source_id -> list of jsonable order dicts
+    # Populated by the reconciler when cfg.open_orders_enabled is True.
+    _open_orders: dict[str, list[dict]] = {}
 
     # NOTE: _sl_tp_alerted is declared earlier (before the bootstrap loop, which
     # arms it for pre-existing positions).
@@ -1153,11 +1250,56 @@ async def _run() -> None:
                 out.append(d)
         return out
 
+    def _transform_open_order_row(s: "Source", o: dict) -> dict:
+        """Apply the same privacy factor to an open order row's price/trigger_px
+        when the owning source is HL.  Lighter rows pass through unchanged."""
+        if not s.is_hyperliquid:
+            o["is_hl"] = False
+            return o
+        o["is_hl"] = True
+        try:
+            symbol = o.get("market_symbol", "")
+            side   = o.get("side", "long")
+            mid    = o.get("market_id", 0)
+            # Prefer the position anchor; fall back to the order's own price.
+            price_raw  = o.get("price")
+            trig_raw   = o.get("trigger_px")
+            anchor_raw = price_raw or trig_raw
+            if anchor_raw is None:
+                o["footnote"] = footnote(privacy, True)
+                return o
+            anchor = Decimal(str(anchor_raw))
+            ae = _anchor(s, mid, anchor)
+            f = price_factor(privacy, s.id, symbol, side, ae)
+            if price_raw is not None:
+                o["price"] = str(disp_price(privacy, True, f, Decimal(str(price_raw))))
+            if trig_raw is not None:
+                o["trigger_px"] = str(disp_price(privacy, True, f, Decimal(str(trig_raw))))
+        except Exception:
+            # Fail CLOSED: never leave a real HL price in the payload if the
+            # transform errored (the dashboard port is internet-reachable).
+            log.debug("[%s] failed to transform open order for privacy", s.name)
+            if privacy.enabled:
+                o["price"] = None
+                o["trigger_px"] = None
+        o["footnote"] = footnote(privacy, True)
+        return o
+
+    def all_open_orders() -> list[dict]:
+        """Return all cached open orders, with HL price transforms applied."""
+        out: list[dict] = []
+        for s in sources:
+            for o in _open_orders.get(s.id, []):
+                row = dict(o)  # shallow copy so we don't mutate the cache
+                out.append(_transform_open_order_row(s, row))
+        return out
+
     def snapshot_payload(type_: str, extra: dict | None = None) -> dict:
         payload = {
             "type": type_,
             "sources": [s.name for s in sources],
             "positions": all_positions(),
+            "open_orders": all_open_orders(),
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
             # UI payload is always capped; the full list is kept in-memory for stats.
@@ -1355,7 +1497,22 @@ async def _run() -> None:
                         del _sl_tp_cache[cache_key]
                         _sl_tp_alerted.discard(cache_key)
 
-                # ── 5. Advance dashboard snapshot ────────────────────────────────────
+                # ── 5. Fetch resting/pending open orders (if enabled) ────────────────
+                if cfg.open_orders_enabled:
+                    try:
+                        raw_orders = await src.client.fetch_open_orders()
+                        # Filter excluded symbols
+                        raw_orders = [
+                            o for o in raw_orders
+                            if not src.is_excluded(o.market_symbol)
+                        ]
+                        _open_orders[src.id] = [
+                            _to_jsonable(asdict(o)) for o in raw_orders
+                        ]
+                    except Exception:
+                        log.debug("[%s] fetch_open_orders failed — keeping stale cache", src.name)
+
+                # ── 6. Advance dashboard snapshot ────────────────────────────────────
                 _dash_positions[src.id] = actual
                 await hub.broadcast(snapshot_payload("snapshot"))
 

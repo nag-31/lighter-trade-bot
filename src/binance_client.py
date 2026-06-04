@@ -39,7 +39,7 @@ from typing import AsyncIterator, Optional
 import httpx
 import websockets
 
-from .types import Position, Trade
+from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
 
@@ -407,6 +407,18 @@ class BinanceClient:
                 tp = stop_px
 
         return sl, tp
+
+    # ------------------------------------------------------------------ #
+    # Protocol: fetch_open_orders (no-op stub)                           #
+    # ------------------------------------------------------------------ #
+
+    async def fetch_open_orders(self) -> list[OpenOrder]:
+        """No-op stub — satisfies ExchangeClient Protocol.
+
+        Binance open-orders are not yet tracked in this bot.  Returns []
+        so the dashboard simply shows no resting orders for Binance sources.
+        """
+        return []
 
     # ------------------------------------------------------------------ #
     # Protocol: fetch_trades_since (REST safety net)                      #
