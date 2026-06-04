@@ -171,8 +171,17 @@ def generate_pnl_card(
     wins: int,
     total: int,
     accumulated_pnl: Optional[Decimal] = None,
+    privacy=None,
+    is_hl: bool = False,
+    anchor_entry: Optional[Decimal] = None,
+    source_id: str = "",
 ) -> Optional[bytes]:
-    """Return PNG bytes for the PnL card, or None if Pillow is unavailable."""
+    """Return PNG bytes for the PnL card, or None if Pillow is unavailable.
+
+    When privacy params are supplied for an HL source, the entry/exit/size/notional
+    pills are shown with transformed values; the big PnL number and % remain EXACT
+    (derived from real prices as normal).
+    """
     if not PIL_AVAILABLE:
         return None
 
@@ -181,10 +190,35 @@ def generate_pnl_card(
     if pos is None:
         return None
 
+    # PnL and % are ALWAYS computed from real (un-transformed) values.
     pnl = calculate_pnl(event, accumulated_pnl=accumulated_pnl)
     is_win = pnl is not None and pnl > 0
     accent    = _GREEN if is_win else _RED
     accent_dim = _GREEN_DIM if is_win else _RED_DIM
+
+    # ---- Build display values for the detail pills ----
+    # Price / size / notional may be privacy-transformed for HL; PnL stays real.
+    disp_entry   = pos.avg_entry_price
+    disp_exit    = t.price
+    disp_size    = pos.size
+    disp_notional = pos.notional_usd
+    privacy_fn   = ""
+
+    if privacy is not None and is_hl:
+        ae = anchor_entry if anchor_entry is not None else pos.avg_entry_price
+        from .display_transform import (
+            disp_notional as _dn,
+            disp_price,
+            disp_size as _ds,
+            footnote,
+            price_factor,
+        )
+        f = price_factor(privacy, source_id, pos.market_symbol, pos.side, ae)
+        disp_entry    = disp_price(privacy, is_hl, f, pos.avg_entry_price)
+        disp_exit     = disp_price(privacy, is_hl, f, t.price)
+        disp_size     = _ds(privacy, is_hl, pos.size)
+        disp_notional = _dn(privacy, is_hl, pos.notional_usd)
+        privacy_fn    = footnote(privacy, is_hl)
 
     # ---- canvas ----
     img  = Image.new("RGB", (W, H), _BG)
@@ -212,7 +246,7 @@ def generate_pnl_card(
     direction_txt = ("LONG  ·  CLOSED" if pos.side == "long" else "SHORT  ·  CLOSED")
     draw.text((42, 64), direction_txt, font=f_norm, fill=accent)
 
-    # ---- big P&L ----
+    # ---- big P&L (EXACT — real values) ----
     if pnl is not None:
         sign     = "+" if pnl >= 0 else "−"
         pnl_str  = f"{sign}${abs(pnl):,.2f}"
@@ -221,7 +255,7 @@ def generate_pnl_card(
         x_pnl    = (W - tw) // 2
         draw.text((x_pnl, 96), pnl_str, font=f_huge, fill=accent)
 
-        # % change
+        # % change — EXACT, derived from real entry/exit
         if pos.avg_entry_price and pos.avg_entry_price != 0:
             if pos.side == "long":
                 pct = float((t.price - pos.avg_entry_price) / pos.avg_entry_price * 100)
@@ -236,15 +270,15 @@ def generate_pnl_card(
     # ---- divider ----
     draw.line([(42, 248), (W - 42, 248)], fill=_DIVIDER, width=2)
 
-    # ---- trade detail pills ----
+    # ---- trade detail pills (privacy-transformed for HL) ----
     def _fmt_px(p: Decimal) -> str:
         return f"${p:,.2f}" if p >= 1000 else f"${p:,.4f}"
 
     details = [
-        ("ENTRY",    _fmt_px(pos.avg_entry_price)),
-        ("EXIT",     _fmt_px(t.price)),
-        ("SIZE",     f"{pos.size:,.4f}"),
-        ("NOTIONAL", f"${pos.notional_usd:,.0f}"),
+        ("ENTRY",    _fmt_px(disp_entry)),
+        ("EXIT",     _fmt_px(disp_exit)),
+        ("SIZE",     f"{disp_size:,.4f}"),
+        ("NOTIONAL", f"${disp_notional:,.0f}"),
     ]
     col_w = (W - 84) // len(details)
     for i, (label, value) in enumerate(details):
@@ -304,6 +338,10 @@ def generate_pnl_card(
             )
         pct_lbl = f"{pct_w * 100:.0f}%"
         draw.text((bar_end + 8, y_bar), pct_lbl, font=f_small, fill=accent)
+
+    # ---- privacy footnote (HL only when disclose_footnote is set) ----
+    if privacy_fn:
+        draw.text((42, H - 16), privacy_fn, font=f_tiny, fill=_TEXT_SEC)
 
     # ---- watermark ----
     wm = "NK Capital"

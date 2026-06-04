@@ -29,7 +29,17 @@ from dotenv import load_dotenv
 
 from pathlib import Path
 
-from .db import init_db, load_closed_trades, load_recent_events, load_tg_alerts, save_closed_trade, save_event, save_tg_alert
+from .db import (
+    backfill_closed_trades_from_events,
+    init_db,
+    load_closed_trades,
+    load_recent_events,
+    load_tg_alerts,
+    save_closed_trade,
+    save_event,
+    save_tg_alert,
+)
+from .display_transform import PrivacyParams, disp_notional, disp_price, disp_size, disp_time, disp_view, footnote, price_factor
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
@@ -255,33 +265,42 @@ const fmtPnl = v => {
 function renderPositions(positions) {
   const tb = document.getElementById("positions");
   if (!positions.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">no open positions</td></tr>'; return; }
-  tb.innerHTML = positions.map(p => `
-    <tr>
+  tb.innerHTML = positions.map(p => {
+    const entry = p.avg_entry_price;
+    const size  = p.size;
+    const fn    = p.footnote ? `<br><span style="font-size:10px;color:#6b7280">${esc(p.footnote)}</span>` : "";
+    return `<tr>
       <td>${esc(p.source)}</td>
       <td>${esc(p.market_symbol)}</td>
       <td class="${p.side}">${p.side.toUpperCase()}</td>
-      <td class="num">${fmtPrice(p.avg_entry_price)}</td>
-      <td class="num">${fmtUsd(Number(p.size) * Number(p.avg_entry_price))}</td>
+      <td class="num">${fmtPrice(entry)}${fn}</td>
+      <td class="num">${fmtUsd(Number(size) * Number(entry))}</td>
       <td class="num">${fmtPnl(p.unrealized_pnl)}</td>
       <td class="num">${p.sl_price != null ? fmtPrice(p.sl_price) : "—"}</td>
       <td class="num">${p.tp_price != null ? fmtPrice(p.tp_price) : "—"}</td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
 }
 function renderEvents(events) {
   const tb = document.getElementById("events");
   if (!events.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">waiting for trades…</td></tr>'; return; }
   tb.innerHTML = events.map(e => {
     const t = e.trade;
-    const time = toIST(t.timestamp);
-    const notional = Number(t.size) * Number(t.price);
+    // Prefer display fields (present for HL events); fall back to real fields.
+    const disp = e._disp || {};
+    const time = disp.ts ?? toIST(t.timestamp);
+    const price = disp.price ?? t.price;
+    const size  = disp.size  ?? t.size;
+    const notional = disp.notional ?? (Number(size) * Number(price));
+    const fn = disp.footnote ? ` <span style="font-size:10px;color:#6b7280">${esc(disp.footnote)}</span>` : "";
     return `<tr>
       <td>${time}</td>
       <td>${esc(t.source)}</td>
       <td class="kind-${e.kind}">${e.kind}</td>
       <td>${esc(t.market_symbol)}</td>
       <td class="${t.side}">${t.side.toUpperCase()}</td>
-      <td class="num">${fmtSize(t.size)}</td>
-      <td class="num">${fmtPrice(t.price)}</td>
+      <td class="num">${fmtSize(size)}</td>
+      <td class="num">${fmtPrice(price)}${fn}</td>
       <td class="num">${fmtUsd(notional)}</td>
     </tr>`;
   }).join("");
@@ -321,11 +340,13 @@ function renderClosedTrades(trades) {
     const sideLabel = ((tr.side || '').toUpperCase()) + ' · CLOSED';
     const levStr  = tr.leverage ? tr.leverage + 'x' : '—';
     const wrStr   = (tr.wins != null && tr.total != null && tr.total > 0) ? tr.wins + '/' + tr.total : '—';
-    const timeStr = tr.ts ? toIST(tr.ts) : '';
-    const entryStr = tr.entry ? fmtPrice(tr.entry) : '—';
-    const exitStr  = tr.exit  ? fmtPrice(tr.exit)  : '—';
-    const sizeStr  = tr.size  ? fmtSize(tr.size)   : '—';
-    const notStr   = tr.notional ? fmtUsd(tr.notional) : '—';
+    // Prefer privacy-transformed display fields when present (HL trades).
+    const timeStr = tr.ts_disp   ?? (tr.ts ? toIST(tr.ts) : '');
+    const entryStr = (tr.entry_disp ?? tr.entry) ? fmtPrice(tr.entry_disp ?? tr.entry) : '—';
+    const exitStr  = (tr.exit_disp  ?? tr.exit)  ? fmtPrice(tr.exit_disp  ?? tr.exit)  : '—';
+    const sizeStr  = (tr.size_disp  ?? tr.size)  ? fmtSize(tr.size_disp   ?? tr.size)  : '—';
+    const notStr   = (tr.notional_disp ?? tr.notional) ? fmtUsd(tr.notional_disp ?? tr.notional) : '—';
+    const tileFootnote = tr.footnote ? `<div style="font-size:10px;color:#6b7280;margin-top:4px">${esc(tr.footnote)}</div>` : '';
     let thumbHtml = '';
     if (tr.card_path) {
       thumbHtml = `<div class="tile-thumb-wrap"><img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="window.open('${esc(tr.card_path)}','_blank')"></div>`;
@@ -344,6 +365,7 @@ function renderClosedTrades(trades) {
     <span class="tile-detail-label">WIN RATE</span><span class="tile-detail-val">${wrStr}</span>
   </div>
   ${thumbHtml}
+  ${tileFootnote}
   <div class="tile-footer"><span>${timeStr} IST</span></div>
 </div>`;
   }).join("");
@@ -677,14 +699,88 @@ async def _run() -> None:
     sources: list[Source] = load_sources(settings=cfg)
     by_id: dict[str, Source] = {s.id: s for s in sources}
 
+    # ── Privacy transform params (built once; ValueError on bad mag fails loudly) ──
+    privacy = PrivacyParams(
+        enabled=cfg.privacy_enabled,
+        secret=cfg.privacy_secret_key,
+        mag=cfg.privacy_mag,
+        entry_quantum_pct=cfg.privacy_entry_quantum_pct,
+        size_sigfigs=cfg.privacy_size_sigfigs,
+        notional_sigfigs=cfg.privacy_notional_sigfigs,
+        time_bucket=cfg.privacy_time_bucket,
+        disclose_footnote=cfg.privacy_disclose_footnote,
+    )
+
     log.info("initialising database…")
     await init_db(DB_PATH)
+
+    # Backfill closed_trades from events (idempotent — no-op if already populated)
+    backfill_count = await backfill_closed_trades_from_events(DB_PATH)
+    if backfill_count:
+        log.info("backfilled %d closed trades from events table", backfill_count)
+
     # recent_events holds Event objects (new this session) and dicts (loaded from DB).
     # _to_jsonable handles both transparently.
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
-    closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, cfg.max_closed_trades))
-    log.info("loaded %d closed trades from db", len(closed_trades))
+
+    # Load full history for stats when cfg.stats_full_history; cap the UI payload slice.
+    if cfg.stats_full_history:
+        _all_closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, None))
+        closed_trades: list[dict] = _all_closed_trades  # keep full list; sliced in payload
+        log.info("loaded %d closed trades (full history) from db", len(closed_trades))
+    else:
+        closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, cfg.max_closed_trades))
+        log.info("loaded %d closed trades from db", len(closed_trades))
+
+    # ── Re-derive privacy display fields for DB-loaded closed trades ──────────
+    # Display fields (entry_disp, …) are in-memory only; after a restart the
+    # history grid loads real DB rows and the JS "?? tr.entry" fallback would
+    # leak REAL Hyperliquid prices on an internet-reachable port. Re-derive them
+    # here so the public grid never shows real HL values across restarts.
+    # DB rows store the source NAME; the privacy factor is seeded by source ID
+    # (stable across restarts), so map name → id. Lighter/unknown rows are never
+    # touched (no disp keys → JS keeps real values, which are intentionally
+    # public for Lighter).
+    _hl_name_to_id = {s.name: s.id for s in sources if s.is_hyperliquid}
+    for row in closed_trades:
+        try:
+            # Newly-closed in-memory rows already carry frozen-anchor disp fields.
+            if row.get("entry_disp"):
+                continue
+            sid = _hl_name_to_id.get(row.get("source"))
+            if sid is None:
+                continue  # Lighter/unknown — leave real values untouched.
+            if not (privacy.enabled and row.get("entry")):
+                continue
+            real_entry = Decimal(str(row["entry"]))
+            dv = disp_view(
+                privacy,
+                True,
+                sid,
+                row.get("market_symbol", ""),
+                row.get("side") or "",
+                real_entry,
+                entry=real_entry,
+                exit=Decimal(str(row["exit"])) if row.get("exit") else None,
+                size=Decimal(str(row["size"])) if row.get("size") else None,
+                notional=Decimal(str(row["notional"])) if row.get("notional") else None,
+                ts=row.get("ts"),
+                now=datetime.now(timezone.utc),
+            )
+            if "entry" in dv:
+                row["entry_disp"] = str(dv["entry"])
+            if "exit" in dv:
+                row["exit_disp"] = str(dv["exit"])
+            if "size" in dv:
+                row["size_disp"] = str(dv["size"])
+            if "notional" in dv:
+                row["notional_disp"] = str(dv["notional"])
+            row["ts_disp"] = dv.get("ts")
+            row["is_hl"] = True
+            row["footnote"] = dv.get("footnote", "")
+        except Exception:
+            log.exception("failed to derive privacy disp fields for closed trade row")
 
     # Cached trade stats — recomputed after each close, served in snapshot payload.
     # Stored as a mutable dict so inner closures can update it in-place.
@@ -694,6 +790,11 @@ async def _run() -> None:
         """Recompute trade stats from the in-memory closed_trades list."""
         stats_state.clear()
         stats_state.update(compute_stats(closed_trades))
+
+    # ── Privacy anchor store: [source_id][market_id] → frozen Decimal entry price ──
+    # Seeded at OPEN; cleared (after reading) at CLOSE.
+    # Ensures the jitter factor stays constant across scale-ins and the close card.
+    _privacy_anchor: dict[str, dict[int, Decimal]] = {}
 
     # Directory for PnL card PNG files — must exist before static route is added.
     cards_dir = DB_PATH.parent / "cards"
@@ -728,6 +829,12 @@ async def _run() -> None:
         # for positions that existed before this bot session started.
         for mid in init_pos:
             _sl_tp_alerted.add((s.id, mid))
+        # Seed privacy anchors for pre-existing HL positions using current avg_entry_price
+        if s.is_hyperliquid and init_pos:
+            _privacy_anchor.setdefault(s.id, {})
+            for mid, pos in init_pos.items():
+                if mid not in _privacy_anchor[s.id]:
+                    _privacy_anchor[s.id][mid] = pos.avg_entry_price
         latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
         if latest:
             s.last_trade_id = latest[-1].trade_id
@@ -735,6 +842,15 @@ async def _run() -> None:
         # Tell HL client the anchor so WS snapshot is filtered correctly
         if hasattr(s.client, "set_anchor"):
             s.client.set_anchor(s.last_trade_id)
+
+    def _anchor(src: "Source", market_id: int, fallback_entry: Decimal) -> Decimal:
+        """Return the frozen open-time anchor entry for (src, market_id).
+
+        Falls back to fallback_entry (the live avg_entry_price) when the anchor
+        has not been set yet — this is safe because it only happens on the very
+        first OPEN message before the anchor is written.
+        """
+        return _privacy_anchor.get(src.id, {}).get(market_id) or fallback_entry
 
     # --- Telegram ---
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -858,6 +974,7 @@ async def _run() -> None:
                      src.name, pos.market_symbol, pos.notional_usd)
             return
         sl, tp = await _get_sl_tp(src, market_id)
+        ae = _anchor(src, market_id, pos.avg_entry_price)
         text = format_aggregate(
             position=pos,
             net_added_usd=buf["net_added"],
@@ -867,6 +984,10 @@ async def _run() -> None:
             source_name=src.name,
             sl=sl,
             tp=tp,
+            privacy=privacy,
+            is_hl=src.is_hyperliquid,
+            anchor_entry=ae,
+            source_id=src.id,
         )
         log.info("[%s] aggregate alert: %s +$%.0f across %d fills → $%.0f",
                  src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
@@ -887,6 +1008,7 @@ async def _run() -> None:
                      src.name, market_id)
             return
         sl, tp = await _get_sl_tp(src, market_id)
+        ae = _anchor(src, market_id, pos.avg_entry_price)
         text = format_reduce_aggregate(
             position=pos,
             net_reduced_usd=buf["net_reduced"],
@@ -897,6 +1019,10 @@ async def _run() -> None:
             source_name=src.name,
             sl=sl,
             tp=tp,
+            privacy=privacy,
+            is_hl=src.is_hyperliquid,
+            anchor_entry=ae,
+            source_id=src.id,
         )
         log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
                  src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
@@ -993,6 +1119,9 @@ async def _run() -> None:
         Uses _dash_positions (API truth from reconciler) rather than the fill-based
         tracker so the dashboard always reflects blockchain reality, independent of
         whether fills have been processed yet.
+
+        For HL sources, display fields (avg_entry_price, size, notional, sl, tp) are
+        overwritten with privacy-transformed values; uPnL stays EXACT.
         """
         out: list[dict] = []
         for s in sources:
@@ -1001,6 +1130,26 @@ async def _run() -> None:
                 sl, tp = _sl_tp_cache.get((s.id, market_id), (None, None))
                 d["sl_price"] = sl
                 d["tp_price"] = tp
+                d["is_hl"] = s.is_hyperliquid
+                if s.is_hyperliquid:
+                    ae = _anchor(s, market_id, pos.avg_entry_price)
+                    dv = disp_view(
+                        privacy, True,
+                        s.id, pos.market_symbol, pos.side, ae,
+                        entry=pos.avg_entry_price,
+                        size=pos.size,
+                        notional=pos.notional_usd,
+                        sl=sl,
+                        tp=tp,
+                    )
+                    d["avg_entry_price"] = dv.get("entry", pos.avg_entry_price)
+                    d["size"]            = dv.get("size",  pos.size)
+                    d["notional_usd"]    = dv.get("notional", pos.notional_usd)
+                    if sl is not None:
+                        d["sl_price"] = dv.get("sl", sl)
+                    if tp is not None:
+                        d["tp_price"] = dv.get("tp", tp)
+                    d["footnote"] = dv.get("footnote", "")
                 out.append(d)
         return out
 
@@ -1011,6 +1160,7 @@ async def _run() -> None:
             "positions": all_positions(),
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
+            # UI payload is always capped; the full list is kept in-memory for stats.
             "closed_trades": closed_trades[:cfg.max_closed_trades],
             "stats": stats_state,
         }
@@ -1060,19 +1210,49 @@ async def _run() -> None:
                                 lev = await src.client.fetch_leverage(market_id)
                                 direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
                                 lev_str  = f"  |  {lev:g}x" if lev is not None else ""
+
+                                # Seed privacy anchor for this newly-observed position
+                                if src.is_hyperliquid:
+                                    _privacy_anchor.setdefault(src.id, {})
+                                    if market_id not in _privacy_anchor[src.id]:
+                                        _privacy_anchor[src.id][market_id] = pos.avg_entry_price
+
+                                # Transform displayed values for HL
+                                disp_entry_val = pos.avg_entry_price
+                                disp_not_val   = pos.notional_usd
+                                disp_sl        = sl
+                                disp_tp        = tp
+                                fn_text        = ""
+                                if src.is_hyperliquid:
+                                    ae = _anchor(src, market_id, pos.avg_entry_price)
+                                    dv = disp_view(
+                                        privacy, True,
+                                        src.id, pos.market_symbol, pos.side, ae,
+                                        entry=pos.avg_entry_price,
+                                        notional=pos.notional_usd,
+                                        sl=sl,
+                                        tp=tp,
+                                    )
+                                    disp_entry_val = dv.get("entry", pos.avg_entry_price)
+                                    disp_not_val   = dv.get("notional", pos.notional_usd)
+                                    disp_sl        = dv.get("sl", sl)
+                                    disp_tp        = dv.get("tp", tp)
+                                    fn_text        = dv.get("footnote", "")
+
                                 sl_parts = []
-                                if sl is not None:
-                                    sl_parts.append(f"SL: ${sl:,.4f}")
-                                if tp is not None:
-                                    sl_parts.append(f"TP: ${tp:,.4f}")
+                                if disp_sl is not None:
+                                    sl_parts.append(f"SL: ${disp_sl:,.4f}")
+                                if disp_tp is not None:
+                                    sl_parts.append(f"TP: ${disp_tp:,.4f}")
                                 sl_tp_str = ("\n" + "  |  ".join(sl_parts)) if sl_parts else ""
                                 footer    = f"\n{src.url}" if src.url else ""
+                                fn_line   = f"\n{fn_text}" if fn_text else ""
                                 msg = (
                                     f"📍 {src.name}\n"
                                     f"Opened {direction} {pos.market_symbol}\n"
-                                    f"Entry: ${pos.avg_entry_price:,.4f}  |  "
-                                    f"Notional: ${pos.notional_usd:,.0f}"
-                                    f"{lev_str}{sl_tp_str}{footer}"
+                                    f"Entry: ${disp_entry_val:,.4f}  |  "
+                                    f"Notional: ${disp_not_val:,.0f}"
+                                    f"{lev_str}{sl_tp_str}{fn_line}{footer}"
                                 )
                                 await tg_send(msg)
                                 # If OPEN alert already showed SL/TP, pre-arm so the
@@ -1103,12 +1283,37 @@ async def _run() -> None:
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
                             footer    = f"\n{src.url}" if src.url else ""
+
+                            # Read anchor before clearing it
+                            ae = _anchor(src, market_id, pos.avg_entry_price)
+
+                            # Transform displayed values for HL (close price unavailable)
+                            disp_sz_val    = pos.size
+                            disp_entry_val = pos.avg_entry_price
+                            disp_not_val   = pos.notional_usd
+                            fn_text        = ""
+                            if src.is_hyperliquid:
+                                dv = disp_view(
+                                    privacy, True,
+                                    src.id, pos.market_symbol, pos.side, ae,
+                                    entry=pos.avg_entry_price,
+                                    size=pos.size,
+                                    notional=pos.notional_usd,
+                                )
+                                disp_sz_val    = dv.get("size",     pos.size)
+                                disp_entry_val = dv.get("entry",    pos.avg_entry_price)
+                                disp_not_val   = dv.get("notional", pos.notional_usd)
+                                fn_text        = dv.get("footnote", "")
+                                # Clear anchor now that position is gone
+                                _privacy_anchor.get(src.id, {}).pop(market_id, None)
+
+                            fn_line = f"\n{fn_text}" if fn_text else ""
                             msg = (
                                 f"📍 {src.name}\n"
                                 f"Closed {direction} {pos.market_symbol}\n"
-                                f"Size: {pos.size:,.4f}  |  Entry: ${pos.avg_entry_price:,.2f}\n"
-                                f"Notional: ${pos.notional_usd:,.0f}  (close price unavailable)"
-                                f"{footer}"
+                                f"Size: {disp_sz_val:,.4f}  |  Entry: ${disp_entry_val:,.2f}\n"
+                                f"Notional: ${disp_not_val:,.0f}  (close price unavailable)"
+                                f"{fn_line}{footer}"
                             )
                             await tg_send(msg)
 
@@ -1128,6 +1333,7 @@ async def _run() -> None:
                     key = (src.id, market_id)
                     if (sl is not None or tp is not None) and key not in _sl_tp_alerted:
                         pos = actual[market_id]
+                        ae = _anchor(src, market_id, pos.avg_entry_price)
                         alert_text = format_sl_tp_set(
                             source_name=src.name,
                             side=pos.side,
@@ -1135,6 +1341,10 @@ async def _run() -> None:
                             sl=sl,
                             tp=tp,
                             pool_url=src.url,
+                            privacy=privacy,
+                            is_hl=src.is_hyperliquid,
+                            anchor_entry=ae,
+                            source_id=src.id,
                         )
                         if alert_text and tg_token and tg_channel:
                             await tg_send(alert_text)
@@ -1184,7 +1394,32 @@ async def _run() -> None:
                 ev.leverage = await src.client.fetch_leverage(ev.trade.market_id)
                 recent_events.insert(0, ev)
                 del recent_events[cfg.max_recent_events:]
-                await hub.broadcast(snapshot_payload("event", {"event": ev}))
+                # Build a display block for HL events so the JS renderer uses
+                # privacy-fuzzed values without doing any math itself.
+                _ev_extra: dict = {"event": ev}
+                if src.is_hyperliquid:
+                    _ev_ae = _anchor(src, ev.trade.market_id, ev.trade.price)
+                    _ev_dv = disp_view(
+                        privacy, True,
+                        src.id, ev.trade.market_symbol, ev.trade.side, _ev_ae,
+                        entry=ev.trade.price,
+                        size=ev.trade.size,
+                        notional=ev.trade.size * ev.trade.price,
+                        ts=ev.trade.timestamp.isoformat(),
+                        now=datetime.now(timezone.utc),
+                    )
+                    # Attach as _disp on the event object in recent_events so
+                    # snapshot broadcasts also carry it for newly-added events.
+                    # Since Event is a frozen dataclass we attach to the broadcast
+                    # dict directly rather than mutating the object.
+                    _ev_extra["_disp"] = {
+                        "price": str(_ev_dv.get("entry", ev.trade.price)),
+                        "size":  str(_ev_dv.get("size",  ev.trade.size)),
+                        "notional": str(_ev_dv.get("notional", ev.trade.size * ev.trade.price)),
+                        "ts": _ev_dv.get("ts", ev.trade.timestamp.isoformat()),
+                        "footnote": _ev_dv.get("footnote", ""),
+                    }
+                await hub.broadcast(snapshot_payload("event", _ev_extra))
                 await save_event(
                     DB_PATH,
                     ev.trade.timestamp.isoformat(),
@@ -1206,6 +1441,11 @@ async def _run() -> None:
                     # immediately without waiting for the next reconciliation cycle.
                     sl, tp = await _get_sl_tp(src, ev.trade.market_id)
                     _sl_tp_cache[key] = (sl, tp)
+                    # Freeze the privacy anchor at open time (only if not already set)
+                    if src.is_hyperliquid:
+                        _privacy_anchor.setdefault(src.id, {})
+                        if ev.trade.market_id not in _privacy_anchor[src.id]:
+                            _privacy_anchor[src.id][ev.trade.market_id] = ev.trade.price
                     if key in _reconciler_alerted_opens:
                         # Reconciler already sent the OPEN alert (fill arrived after
                         # the reconciler seeded the position). Suppress this one to
@@ -1222,7 +1462,12 @@ async def _run() -> None:
                         # fill is the most reliable signal that a position opened.
                         # Suppressing this alert based on a possibly-stale snapshot
                         # caused legitimate OPENs to be silently dropped.
-                        await tg_send(format_event(ev, src.url, src.name, sl=sl, tp=tp))
+                        ae = _anchor(src, ev.trade.market_id, ev.trade.price)
+                        await tg_send(format_event(
+                            ev, src.url, src.name, sl=sl, tp=tp,
+                            privacy=privacy, is_hl=src.is_hyperliquid, anchor_entry=ae,
+                            source_id=src.id,
+                        ))
                         # Pre-arm so the reconciler doesn't double-alert SL/TP when
                         # the OPEN alert already showed them.
                         if sl is not None or tp is not None:
@@ -1241,6 +1486,16 @@ async def _run() -> None:
                     _sl_tp_cache.pop(key, None)
                     _sl_tp_alerted.discard(key)
 
+                    # Read the frozen anchor BEFORE clearing it — needed for the card
+                    # and the close record's display fields.
+                    pos_b = ev.position_before
+                    _close_anchor = _anchor(
+                        src, ev.trade.market_id,
+                        pos_b.avg_entry_price if pos_b else ev.trade.price,
+                    )
+                    # Now clear the anchor (position is gone)
+                    _privacy_anchor.get(src.id, {}).pop(ev.trade.market_id, None)
+
                     # Always compute PnL card data (for DB persistence + optional TG send)
                     pnl = calculate_pnl(ev, accumulated_pnl=accumulated_pnl)
                     is_win = pnl is not None and pnl > 0
@@ -1248,10 +1503,13 @@ async def _run() -> None:
                     card_bytes = generate_pnl_card(
                         ev, src.name, wins, total,
                         accumulated_pnl=accumulated_pnl,
+                        privacy=privacy,
+                        is_hl=src.is_hyperliquid,
+                        anchor_entry=_close_anchor,
+                        source_id=src.id,
                     )
 
-                    # Compute pct change (same formula as pnl_card.py)
-                    pos_b = ev.position_before
+                    # Compute pct change (same formula as pnl_card.py) — EXACT
                     pct = None
                     if pos_b and pos_b.avg_entry_price:
                         if pos_b.side == "long":
@@ -1269,12 +1527,36 @@ async def _run() -> None:
                         await asyncio.to_thread(card_file.write_bytes, card_bytes)
                         card_path = f"/cards/{safe_name}"
 
-                    # Persist to DB and update in-memory list regardless of alert setting
+                    # Compute display fields for the closed-trade record (HL only).
+                    # DB columns hold REAL values; _disp fields carry transformed values
+                    # for the JS history grid so it never needs to re-derive them.
+                    entry_disp = exit_disp = size_disp = notional_disp = ts_disp = None
+                    close_footnote = ""
+                    if src.is_hyperliquid and pos_b is not None:
+                        dv = disp_view(
+                            privacy, True,
+                            src.id, pos_b.market_symbol, pos_b.side, _close_anchor,
+                            entry=pos_b.avg_entry_price,
+                            exit=ev.trade.price,
+                            size=pos_b.size,
+                            notional=pos_b.notional_usd,
+                            ts=ev.trade.timestamp.isoformat(),
+                            now=datetime.now(timezone.utc),
+                        )
+                        entry_disp    = str(dv.get("entry",    pos_b.avg_entry_price))
+                        exit_disp     = str(dv.get("exit",     ev.trade.price))
+                        size_disp     = str(dv.get("size",     pos_b.size))
+                        notional_disp = str(dv.get("notional", pos_b.notional_usd))
+                        ts_disp       = dv.get("ts", ev.trade.timestamp.isoformat())
+                        close_footnote = dv.get("footnote", "")
+
+                    # Persist to DB (REAL values only) and update in-memory list.
                     record = {
                         "ts": ev.trade.timestamp.isoformat(),
                         "source": src.name,
                         "market_symbol": ev.trade.market_symbol,
                         "side": pos_b.side if pos_b else None,
+                        # DB columns: real prices
                         "entry": str(pos_b.avg_entry_price) if pos_b else None,
                         "exit": str(ev.trade.price),
                         "size": str(pos_b.size) if pos_b else None,
@@ -1288,8 +1570,21 @@ async def _run() -> None:
                         "card_path": card_path,
                     }
                     await save_closed_trade(DB_PATH, record)
+
+                    # Add display fields to the in-memory record (not persisted to DB,
+                    # but used by the JS history grid to show fuzzed values for HL).
+                    if src.is_hyperliquid:
+                        record["entry_disp"]    = entry_disp
+                        record["exit_disp"]     = exit_disp
+                        record["size_disp"]     = size_disp
+                        record["notional_disp"] = notional_disp
+                        record["ts_disp"]       = ts_disp
+                        record["is_hl"]         = True
+                        record["footnote"]      = close_footnote
+
                     closed_trades.insert(0, record)
-                    del closed_trades[cfg.max_closed_trades:]
+                    # Do NOT truncate closed_trades here — keep full list for stats;
+                    # snapshot_payload slices to max_closed_trades for the UI.
                     refresh_stats()
                     await hub.broadcast(snapshot_payload("snapshot"))
 
@@ -1307,7 +1602,12 @@ async def _run() -> None:
                             )
                             await tg_send_photo(card_bytes, caption=src.url, log_text=log_text)
                         else:
-                            await tg_send(format_event(ev, src.url, src.name))
+                            ae = _close_anchor
+                            await tg_send(format_event(
+                                ev, src.url, src.name,
+                                privacy=privacy, is_hl=src.is_hyperliquid, anchor_entry=ae,
+                                source_id=src.id,
+                            ))
 
                 elif ev.kind == EventKind.REDUCE:
                     # Batch partial-close fills — avoids spam on incremental closes.

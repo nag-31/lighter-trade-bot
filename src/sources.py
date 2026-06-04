@@ -67,6 +67,27 @@ class BotSettings:
     max_recent_events:   int = 200
     max_closed_trades:   int = 200
 
+    # ── Privacy (HL display obfuscation) ─────────────────────────────────────
+    # Master switch: when False, every alert/card/dashboard cell shows REAL
+    # values (full rollback). Posture = "exact results, fuzzy fingerprint":
+    # PnL $/%/win-rate stay EXACT; only price/size/notional/timestamps are fuzzed.
+    # HL-only — Lighter is never transformed. The secret salt loads from the
+    # PRIVACY_SECRET_KEY env var, NEVER from config.yaml.
+    privacy_enabled:           bool  = True
+    privacy_mag:               float = 0.003       # price jitter ±0.3% (0 < mag < 0.05)
+    privacy_entry_quantum_pct: float = 0.005       # coarse seed bucket = 0.5% of price
+    privacy_size_sigfigs:      int   = 2           # round displayed size to N sig figs
+    privacy_notional_sigfigs:  int   = 2           # round displayed notional to N sig figs
+    privacy_time_bucket:       str   = "relative"  # exact | hour | relative
+    privacy_disclose_footnote: bool  = True
+    privacy_secret_key:        str   = ""          # loaded from env, never config.yaml
+
+    # Open orders dashboard panel
+    open_orders_enabled: bool = True
+
+    # Stats: compute over ALL closed trades, not just the last max_closed_trades
+    stats_full_history: bool = True
+
 
 def load_settings(path: str | Path = "config.yaml") -> BotSettings:
     """Read the optional 'settings:' block from config.yaml.
@@ -98,6 +119,29 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
             log.warning("settings.%s must be a number — using default %s", key, default)
             return default
 
+    def _float(key: str, default: float) -> float:
+        try:
+            return float(raw.get(key, default))
+        except (TypeError, ValueError):
+            log.warning("settings.%s must be a number — using default %s", key, default)
+            return default
+
+    def _str(key: str, default: str) -> str:
+        v = raw.get(key, default)
+        return str(v) if v is not None else default
+
+    # Privacy salt is a SECRET — it loads from the PRIVACY_SECRET_KEY env var,
+    # never from config.yaml. Falling back to a fixed dev salt keeps the bot
+    # running, but production MUST set the env var (a known salt is recoverable).
+    privacy_enabled = _bool("privacy_enabled", True)
+    privacy_secret = os.getenv("PRIVACY_SECRET_KEY", "").strip()
+    if privacy_enabled and not privacy_secret:
+        log.warning(
+            "PRIVACY_SECRET_KEY env var is unset — using an insecure default salt. "
+            "Set PRIVACY_SECRET_KEY in .env for real privacy."
+        )
+        privacy_secret = "lighterbot-dev-privacy-salt-CHANGE-ME"
+
     settings = BotSettings(
         default_min_notional_usd    = _decimal("default_min_notional_usd", DEFAULT_MIN_NOTIONAL),
         alert_on_open               = _bool("alert_on_open",        True),
@@ -111,6 +155,16 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         dashboard_port              = _int("dashboard_port",              8080),
         max_recent_events           = _int("max_recent_events",           200),
         max_closed_trades           = _int("max_closed_trades",           200),
+        privacy_enabled             = privacy_enabled,
+        privacy_mag                 = _float("privacy_mag",               0.003),
+        privacy_entry_quantum_pct   = _float("privacy_entry_quantum_pct", 0.005),
+        privacy_size_sigfigs        = _int("privacy_size_sigfigs",        2),
+        privacy_notional_sigfigs    = _int("privacy_notional_sigfigs",    2),
+        privacy_time_bucket         = _str("privacy_time_bucket",         "relative"),
+        privacy_disclose_footnote   = _bool("privacy_disclose_footnote",  True),
+        privacy_secret_key          = privacy_secret,
+        open_orders_enabled         = _bool("open_orders_enabled",        True),
+        stats_full_history          = _bool("stats_full_history",         True),
     )
     log.info(
         "settings loaded — min_notional=$%s  window=%ds  poll=%ds  dedup=%ds  port=%d",
@@ -165,6 +219,15 @@ class Source:
         if not self.exclude_symbols:
             return False
         return _normalize_symbol(market_symbol) in self.exclude_symbols
+
+    @property
+    def is_hyperliquid(self) -> bool:
+        """Canonical HL predicate — the privacy transform is gated on this.
+
+        The exchange type lives only in Source.id (built with a 'hyperliquid:'
+        prefix); Trade.source / Position.source carry only the human name.
+        """
+        return self.id.startswith("hyperliquid:")
 
 
 def _proxy_url() -> Optional[str]:

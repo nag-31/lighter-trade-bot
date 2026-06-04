@@ -40,7 +40,25 @@ settings:
   # ── Dashboard ────────────────────────────────────────────────────────────
   dashboard_port: 8080
   max_recent_events: 200       # rows visible in the browser event table
-  max_closed_trades: 200       # closed trades kept for history + analytics charts
+  max_closed_trades: 200       # closed trades shown in the UI history grid
+  stats_full_history: true     # analytics computed over ALL closed trades, not just last-N
+  open_orders_enabled: true    # show the resting/open-orders dashboard panel
+
+  # ── Privacy (Hyperliquid display obfuscation) ────────────────────────────
+  # Stops followers from fingerprinting your public on-chain wallet via the
+  # alerts. Posture: "exact results, fuzzy fingerprint" — PnL $, %, win-rate
+  # and win/loss stay EXACT and honest; only price/size/notional/timestamps
+  # are fuzzed. HL-only — Lighter is never touched.
+  # Flip privacy_enabled to false to instantly show 100% real values again.
+  # NOTE: the secret salt is NOT here — set PRIVACY_SECRET_KEY in .env.
+  privacy_enabled: true
+  privacy_mag: 0.003               # price jitter ±0.3% (must be 0 < mag < 0.05)
+  privacy_entry_quantum_pct: 0.005 # coarse seed bucket (0.5% of price) — keeps a
+                                   # scaled-into position looking identical open→close
+  privacy_size_sigfigs: 2          # round displayed size to N significant figures
+  privacy_notional_sigfigs: 2      # round displayed notional to N significant figures
+  privacy_time_bucket: relative    # exact | hour | relative  (timing is the #1 on-chain join key)
+  privacy_disclose_footnote: true  # append "prices approx · PnL exact" to HL alerts/cards
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

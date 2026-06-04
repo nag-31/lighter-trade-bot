@@ -134,6 +134,193 @@ async def load_closed_trades(path: Path, limit: int | None = None) -> list[dict]
 
 
 # ---------------------------------------------------------------------------
+# Backfill helper — reconstruct closed_trades from the events table
+# ---------------------------------------------------------------------------
+
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+
+def _backfill_closed_trades_sync(path: Path) -> int:
+    """Worker for backfill_closed_trades_from_events.
+
+    Reads ALL rows from the ``events`` table, identifies CLOSE events, and
+    inserts synthesised ``closed_trades`` rows for each one found.
+
+    Returns the number of rows inserted.
+
+    Caveat: recovery is only as complete and accurate as the ``events`` table
+    preserved.  Events that were never written to the DB (e.g. from runs before
+    DB persistence existed) are unrecoverable, and ``wins``/``total`` counters
+    are re-derived from the back-filled set only — they will not match the
+    original runtime values.
+    """
+    con = sqlite3.connect(path)
+    try:
+        # ── Idempotency guard ─────────────────────────────────────────────────
+        (existing,) = con.execute("SELECT COUNT(*) FROM closed_trades").fetchone()
+        if existing >= 1:
+            return 0
+
+        # ── Load ALL events in chronological order (oldest first) ─────────────
+        rows = con.execute(
+            "SELECT id, ts, payload FROM events ORDER BY id ASC"
+        ).fetchall()
+
+        good_records: list[dict] = []
+
+        for row_id, row_ts, raw_payload in rows:
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                continue  # unparseable JSON — skip
+
+            # Accept both "CLOSE" string (EventKind.value) and wrapped shapes
+            kind = payload.get("kind") or payload.get("type") or ""
+            if str(kind).upper() != "CLOSE":
+                continue
+
+            try:
+                trade = payload.get("trade") or {}
+                pos_b = payload.get("position_before") or {}
+
+                # Require at minimum a non-empty trade dict with a symbol or
+                # price — a bare {"kind":"CLOSE"} with no trade data is not
+                # a parseable trade record and should be skipped.
+                if not trade or not (trade.get("market_symbol") or trade.get("price")):
+                    continue
+
+                # ── Timestamps ────────────────────────────────────────────────
+                ts = (
+                    trade.get("timestamp")
+                    or payload.get("ts")
+                    or row_ts
+                )
+
+                # ── Core trade fields ─────────────────────────────────────────
+                market_symbol = (
+                    trade.get("market_symbol")
+                    or pos_b.get("market_symbol")
+                    or payload.get("market_symbol")
+                )
+                exit_price_raw = trade.get("price") or payload.get("exit")
+                source = (
+                    trade.get("source")
+                    or payload.get("source")
+                    or pos_b.get("source")
+                )
+
+                # ── Position-before fields ────────────────────────────────────
+                side = pos_b.get("side") or trade.get("side") or payload.get("side")
+                entry_raw = pos_b.get("avg_entry_price") or payload.get("entry")
+                size_raw = pos_b.get("size") or trade.get("size") or payload.get("size")
+                notional_raw = pos_b.get("notional_usd") or payload.get("notional")
+
+                leverage_raw = payload.get("leverage")
+
+                # ── Recompute pnl/pct when we have the needed fields ───────────
+                pnl_str: str | None = None
+                pct_str: str | None = None
+                is_win = 0
+
+                if entry_raw is not None and exit_price_raw is not None and side:
+                    try:
+                        entry_f = float(entry_raw)
+                        exit_f = float(exit_price_raw)
+                        size_f = float(size_raw) if size_raw is not None else None
+
+                        if size_f is not None:
+                            if side == "long":
+                                pnl = (exit_f - entry_f) * size_f
+                            else:
+                                pnl = (entry_f - exit_f) * size_f
+                            pnl_str = str(pnl)
+                            is_win = 1 if pnl > 0 else 0
+
+                        if entry_f:
+                            if side == "long":
+                                pct = (exit_f - entry_f) / entry_f * 100
+                            else:
+                                pct = (entry_f - exit_f) / entry_f * 100
+                            pct_str = str(pct)
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        # Fall back to whatever the payload already contains
+                        pnl_str = str(payload["pnl"]) if payload.get("pnl") is not None else None
+                        pct_str = str(payload["pct"]) if payload.get("pct") is not None else None
+                        is_win = int(bool(payload.get("is_win", 0)))
+                else:
+                    # No entry/exit available — use pre-computed values if present
+                    pnl_str = str(payload["pnl"]) if payload.get("pnl") is not None else None
+                    pct_str = str(payload["pct"]) if payload.get("pct") is not None else None
+                    is_win = int(bool(payload.get("is_win", 0)))
+
+                record: dict = {
+                    "ts": ts,
+                    "source": str(source) if source is not None else None,
+                    "market_symbol": str(market_symbol) if market_symbol is not None else None,
+                    "side": side,
+                    "entry": str(entry_raw) if entry_raw is not None else None,
+                    "exit": str(exit_price_raw) if exit_price_raw is not None else None,
+                    "size": str(size_raw) if size_raw is not None else None,
+                    "notional": str(notional_raw) if notional_raw is not None else None,
+                    "pnl": pnl_str,
+                    "pct": pct_str,
+                    "is_win": is_win,
+                    "leverage": str(leverage_raw) if leverage_raw is not None else None,
+                    # wins/total are re-derived below after collecting all rows
+                    "wins": None,
+                    "total": None,
+                    "card_path": None,
+                }
+                good_records.append(record)
+            except Exception as exc:
+                _log.warning("backfill: skipping row id=%s: %s", row_id, exc)
+                continue
+
+        if not good_records:
+            return 0
+
+        # ── Derive cumulative wins/total counters (chronological order) ───────
+        wins_so_far = 0
+        for i, rec in enumerate(good_records, start=1):
+            if rec["is_win"]:
+                wins_so_far += 1
+            rec["wins"] = wins_so_far
+            rec["total"] = i
+
+        # ── Bulk-insert ───────────────────────────────────────────────────────
+        placeholders = ", ".join("?" for _ in _CLOSED_TRADE_COLUMNS)
+        cols = ", ".join(_CLOSED_TRADE_COLUMNS)
+        for rec in good_records:
+            values = tuple(rec.get(c) for c in _CLOSED_TRADE_COLUMNS)
+            con.execute(
+                f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
+                values,
+            )
+        con.commit()
+        return len(good_records)
+    finally:
+        con.close()
+
+
+async def backfill_closed_trades_from_events(path: Path) -> int:
+    """One-time, idempotent helper: populate ``closed_trades`` from ``events``.
+
+    If ``closed_trades`` already contains at least one row this function returns
+    0 immediately and performs no writes — it is safe to call on every startup.
+
+    Recovery is only as complete and accurate as the ``events`` table preserved.
+    Events not in the DB are unrecoverable; ``wins``/``total`` counters reflect
+    only the back-filled set and will not match original runtime values.
+
+    Returns the number of rows inserted (0 if already populated or no CLOSE
+    events found).
+    """
+    return await asyncio.to_thread(_backfill_closed_trades_sync, path)
+
+
+# ---------------------------------------------------------------------------
 # TG alerts table
 # ---------------------------------------------------------------------------
 
