@@ -341,6 +341,7 @@ async def main(
 
     fills = await hl_source.client.fetch_realizing_fills(
         start_time_ms=start_time_ms,
+        limit=10_000_000,   # effectively uncapped — reconcile the FULL window
     )
     log.info("Fetched %d realizing fills", len(fills))
 

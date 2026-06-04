@@ -474,7 +474,7 @@ class HyperliquidClient:
         Returns fills in oldest-first order (convenient for sequential recording).
         Returns [] and logs on any SDK error — never raises into the caller.
         """
-        _MAX_PAGES = 20
+        _MAX_PAGES = 60   # 60 x 2000 = up to 120k raw fills — covers heavy histories
 
         try:
             if start_time_ms is not None:
