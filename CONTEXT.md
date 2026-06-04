@@ -49,6 +49,20 @@ then `sudo systemctl restart lighterbot` (**restart requires explicit user OK ea
   `closedPnl` or `_lighter_realized()`. Fill-level dedup via
   `closed_trades.trade_id` + `fill_ids` (JSON) + `_recorded_realizations` set
   loaded at boot.
+- **One card per fully-closed trade (display-layer aggregation)**: the recorder
+  still writes per-fill rows (above), but the dashboard collapses each
+  *round-trip* — a coin's PARTIAL rows + its final FULL — into ONE grid tile +
+  chart bar + stats entry via `stats.aggregate_round_trips()`. A completed trade
+  shows the TOTAL of every scale-out + the close; a still-open scaled-out
+  position shows as an `OPEN` (· IN PROGRESS) tile with realized-so-far and is
+  EXCLUDED from closed-only stats. No schema change, no double counting (each
+  source row keeps its own-fill pnl; aggregation sums once). The FULL close card
+  IMAGE shows the round-trip total via `record_realization(card_pnl_override=…)`
+  (`_roundtrip_partial_pnl()` sums the round-trip's partials; restart-safe).
+  Silent-close backstop marks intermediate fills PARTIAL + last FULL so it
+  collapses to one trade. `display_trades(include_open)` is the single view
+  feeding both grid and stats. Dashboard index sends `Cache-Control: no-cache`
+  so browsers pick up new frontend JS after a deploy.
 - **Stats computed on CLOSED trades only** (rows with non-None pnl).
 - **Binance**: rotating `ProxyPool` (round-robin + cooldown + failover) to bypass
   the Azure-region geo-block; fail-safe so HL/Lighter keep running if Binance is

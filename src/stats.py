@@ -112,6 +112,100 @@ def filter_trades(
     return out
 
 
+def aggregate_round_trips(trades: list[dict]) -> list[dict]:
+    """Collapse per-fill realization rows into one record per round-trip.
+
+    The recorder writes one row per realization (each scale-out + the final
+    close). For display we want ONE entry per completed trade. A *round-trip*
+    is the run of realizations for a given ``(source, market_symbol)`` that ends
+    with a ``FULL`` close. Trailing ``PARTIAL`` rows with no ``FULL`` yet form an
+    in-progress (still-open) round-trip.
+
+    Returns aggregated records (REAL values only — no privacy ``*_disp`` fields;
+    the caller re-derives those for HL), newest-first by ``ts``. Each record:
+
+    - ``pnl``      = sum of the group's realized pnl (so a closed trade's total
+      already equals every scale-out + the final close — no double counting,
+      because each source row keeps its own-fill pnl and we sum once here)
+    - ``size`` / ``notional`` = sums
+    - ``entry``    = size-weighted cost-basis average of the rows' entries
+    - ``exit``     = the final fill price in the group
+    - ``pct``      = pnl / cost_basis * 100
+    - ``ts``       = the final row's ts ; ``card_path`` = the final row's card
+    - ``realization_kind`` = ``"FULL"`` (closed) | ``"OPEN"`` (in progress)
+    - ``wins`` / ``total`` = running CLOSED-trade record through this trade
+    """
+    # Group by (source, market_symbol), preserving deterministic ordering.
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for t in trades:
+        key = (t.get("source") or "", t.get("market_symbol") or "")
+        groups.setdefault(key, []).append(t)
+
+    aggregated: list[dict] = []
+    for (source, symbol), rows in groups.items():
+        rows_sorted = sorted(rows, key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT)
+        segment: list[dict] = []
+        for r in rows_sorted:
+            segment.append(r)
+            if (r.get("realization_kind") or "").upper() == "FULL":
+                aggregated.append(_collapse_segment(segment, closed=True))
+                segment = []
+        if segment:  # trailing partials with no FULL → in-progress
+            aggregated.append(_collapse_segment(segment, closed=False))
+
+    # Running CLOSED-trade win/total record, assigned in chronological order.
+    aggregated.sort(key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT)
+    wins = total = 0
+    for rec in aggregated:
+        if (rec.get("realization_kind") or "").upper() == "FULL":
+            total += 1
+            if rec.get("is_win"):
+                wins += 1
+        rec["wins"] = wins
+        rec["total"] = total
+
+    aggregated.sort(key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT, reverse=True)
+    return aggregated
+
+
+def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
+    """Build one aggregated record from a round-trip's realization rows."""
+    last = rows[-1]
+    total_pnl = sum((_f(r.get("pnl")) or 0.0) for r in rows)
+    total_size = sum((_f(r.get("size")) or 0.0) for r in rows)
+    total_notional = sum((_f(r.get("notional")) or 0.0) for r in rows)
+
+    cost_basis = 0.0
+    for r in rows:
+        e, s = _f(r.get("entry")), _f(r.get("size"))
+        if e is not None and s is not None:
+            cost_basis += e * s
+    entry = (cost_basis / total_size) if total_size else _f(last.get("entry"))
+    exit_ = _f(last.get("exit"))
+    pct = (total_pnl / cost_basis * 100.0) if cost_basis else None
+
+    # Carry only safe identity fields from the representative (final) row; the
+    # caller re-derives HL *_disp fields from these REAL values.
+    return {
+        "ts": last.get("ts"),
+        "source": last.get("source"),
+        "market_symbol": last.get("market_symbol"),
+        "side": last.get("side"),
+        "entry": entry,
+        "exit": exit_,
+        "size": total_size,
+        "notional": total_notional,
+        "pnl": total_pnl,
+        "pct": pct,
+        "is_win": 1 if total_pnl > 0 else 0,
+        "leverage": last.get("leverage"),
+        "card_path": last.get("card_path"),
+        "trade_id": last.get("trade_id"),
+        "realization_kind": "FULL" if closed else "OPEN",
+        "n_fills": len(rows),
+    }
+
+
 def compute_stats(trades: list[dict]) -> dict:
     """Compute full trade analytics from a list of closed-trade records.
 

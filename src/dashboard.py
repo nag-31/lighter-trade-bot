@@ -46,7 +46,7 @@ from .formatter import format_aggregate, format_event, format_reduce_aggregate, 
 from .health import HealthRegistry
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
-from .stats import compute_stats, filter_trades, format_stats_summary
+from .stats import aggregate_round_trips, compute_stats, filter_trades, format_stats_summary
 from .stats_card import render_stats_card
 from .types import Event, EventKind, OpenOrder, Position, Trade
 
@@ -388,7 +388,9 @@ function renderClosedTrades(trades) {
     const pnlStr   = pnlN == null ? '—' : pnlSign + '$' + Math.abs(pnlN).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
     const pctStr   = pctN == null ? '' : (pctN >= 0 ? '+' : '') + pctN.toFixed(2) + '%';
     const sideClass = (tr.side || '').toLowerCase() === 'long' ? 'green' : 'red';
-    const sideLabel = ((tr.side || '').toUpperCase()) + (tr.realization_kind === 'PARTIAL' ? ' · PARTIAL CLOSE' : ' · CLOSED');
+    const _rk = (tr.realization_kind || '').toUpperCase();
+    const _rkLabel = _rk === 'OPEN' ? ' · IN PROGRESS' : (_rk === 'PARTIAL' ? ' · PARTIAL CLOSE' : ' · CLOSED');
+    const sideLabel = ((tr.side || '').toUpperCase()) + _rkLabel;
     const levStr  = tr.leverage ? tr.leverage + 'x' : '—';
     const wrStr   = (tr.wins != null && tr.total != null && tr.total > 0) ? tr.wins + '/' + tr.total : '—';
     // Prefer privacy-transformed display fields when present (HL trades).
@@ -897,16 +899,24 @@ async def _run() -> None:
     # touched (no disp keys → JS keeps real values, which are intentionally
     # public for Lighter).
     _hl_name_to_id = {s.name: s.id for s in sources if s.is_hyperliquid}
-    for row in closed_trades:
+
+    def _derive_hl_disp_fields(row: dict) -> None:
+        """Populate HL privacy ``*_disp`` fields on a closed-trade row in place.
+
+        The public grid uses ``tr.<field>_disp ?? tr.<field>`` — without the
+        disp fields an internet-reachable port would leak REAL Hyperliquid
+        prices. We seed the jitter from the row's own (real) entry so the
+        displayed values are internally consistent across restarts. Lighter /
+        unknown rows are left untouched (their real values are intentionally
+        public). Re-derives even if disp fields exist, since aggregated rows
+        carry stale per-fill disp that must be recomputed from the aggregate.
+        """
         try:
-            # Newly-closed in-memory rows already carry frozen-anchor disp fields.
-            if row.get("entry_disp"):
-                continue
             sid = _hl_name_to_id.get(row.get("source"))
             if sid is None:
-                continue  # Lighter/unknown — leave real values untouched.
+                return  # Lighter/unknown — leave real values untouched.
             if not (privacy.enabled and row.get("entry")):
-                continue
+                return
             real_entry = Decimal(str(row["entry"]))
             dv = disp_view(
                 privacy,
@@ -936,14 +946,28 @@ async def _run() -> None:
         except Exception:
             log.exception("failed to derive privacy disp fields for closed trade row")
 
-    # ── Stats display window ─────────────────────────────────────────────────
-    # Filter + date-sort the in-memory closed_trades into the view we actually
-    # show: trades within [stats_start_date, stats_end_date] (end None ⇒ now)
-    # whose ticker is in stats_symbols (empty ⇒ all coins currently in the DB).
-    # This backs BOTH the analytics and the history grid, so they always agree.
-    def display_trades() -> list[dict]:
+    for row in closed_trades:
+        # Newly-closed in-memory rows already carry frozen-anchor disp fields.
+        if not row.get("entry_disp"):
+            _derive_hl_disp_fields(row)
+
+    # ── Stats display window + round-trip aggregation ────────────────────────
+    # The recorder writes one row per realization (each scale-out + the final
+    # close). For display we collapse each round-trip into ONE entry via
+    # aggregate_round_trips (closed trade = total of all its scale-outs; an
+    # in-progress position = its realized-so-far), then re-derive HL disp on the
+    # aggregates, then apply the [start,end]+symbols window. Used by BOTH the
+    # analytics and the history grid so they always agree.
+    #   include_open=True  → grid (shows in-progress round-trips, flagged OPEN)
+    #   include_open=False → stats (CLOSED-only, per the "closed trades only" rule)
+    def display_trades(include_open: bool = True) -> list[dict]:
+        agg = aggregate_round_trips(closed_trades)
+        for row in agg:
+            _derive_hl_disp_fields(row)
+        if not include_open:
+            agg = [r for r in agg if (r.get("realization_kind") or "").upper() == "FULL"]
         return filter_trades(
-            closed_trades,
+            agg,
             start_date=cfg.stats_start_date,
             end_date=cfg.stats_end_date,
             symbols=cfg.stats_symbols,
@@ -959,12 +983,12 @@ async def _run() -> None:
 
     # Cached trade stats — recomputed after each close, served in snapshot payload.
     # Stored as a mutable dict so inner closures can update it in-place.
-    stats_state: dict = compute_stats(display_trades())
+    stats_state: dict = compute_stats(display_trades(include_open=False))
 
     def refresh_stats() -> None:
-        """Recompute trade stats from the filtered/date-sorted display view."""
+        """Recompute trade stats from the CLOSED-only round-trip view."""
         stats_state.clear()
-        stats_state.update(compute_stats(display_trades()))
+        stats_state.update(compute_stats(display_trades(include_open=False)))
 
     # ── Privacy anchor store: [source_id][market_id] → frozen Decimal entry price ──
     # Seeded at OPEN; cleared (after reading) at CLOSE.
@@ -1202,6 +1226,29 @@ async def _run() -> None:
             return (fill_price - avg_entry) * reduced_size
         return (avg_entry - fill_price) * reduced_size
 
+    def _roundtrip_partial_pnl(source_name: str, market_symbol: str) -> Decimal:
+        """Sum the realized PnL of the CURRENT (not-yet-closed) round-trip's
+        PARTIAL rows for this (source, coin).
+
+        closed_trades is newest-first; walk from the front collecting PARTIAL
+        rows until the previous FULL (a round-trip boundary). Used to make the
+        FULL close card show the whole trade's total. Restart-safe: the partials
+        were persisted, so they're back in closed_trades after a reboot.
+        """
+        total = Decimal(0)
+        for row in closed_trades:
+            if row.get("source") != source_name or row.get("market_symbol") != market_symbol:
+                continue
+            if (row.get("realization_kind") or "").upper() == "FULL":
+                break  # boundary of the previous round-trip
+            p = row.get("pnl")
+            if p is not None:
+                try:
+                    total += Decimal(str(p))
+                except Exception:
+                    pass
+        return total
+
     # ── Shared realization recorder ───────────────────────────────────────────
     async def record_realization(
         *,
@@ -1216,12 +1263,20 @@ async def _run() -> None:
         leverage: "float | None",
         fill_ids: "list[int]",
         anchor_entry: Decimal,
+        card_pnl_override: "Decimal | None" = None,
     ) -> None:
         """Record a single realization event (partial close or full close).
 
         Writes a closed_trades DB row, a PnL card PNG, and broadcasts a snapshot.
         Deduplicated by fill_ids — if every id in fill_ids is already in
         _recorded_realizations, the call is a no-op.
+
+        ``card_pnl_override`` (FULL close only) sets the $ figure shown ON THE
+        CARD IMAGE to the whole round-trip's total (every scale-out + this
+        close), while the stored row keeps this fill's own realized_pnl. The
+        display layer (aggregate_round_trips) sums the per-fill rows to the same
+        total, so card, grid tile, chart bar and stats all agree — with no
+        double counting.
         """
         # ── Dedup guard ────────────────────────────────────────────────────────
         if fill_ids:
@@ -1280,7 +1335,7 @@ async def _run() -> None:
             src.name,
             wins,
             total,
-            pnl_override=realized_pnl,
+            pnl_override=(card_pnl_override if card_pnl_override is not None else realized_pnl),
             is_partial=(kind == "PARTIAL"),
             privacy=privacy,
             is_hl=src.is_hyperliquid,
@@ -1672,9 +1727,10 @@ async def _run() -> None:
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
             # UI payload is always capped; the full list is kept in-memory for stats.
-            # Filtered + date-sorted to the configured display window so the grid
-            # matches the analytics (only existing coins, within the date range).
-            "closed_trades": display_trades()[:cfg.max_closed_trades],
+            # Aggregated into one entry per round-trip (in-progress positions
+            # included, flagged OPEN) + filtered to the display window, so the grid
+            # matches the analytics (one card per trade, only existing coins/dates).
+            "closed_trades": display_trades(include_open=True)[:cfg.max_closed_trades],
             "stats": stats_state,
             "health": health.snapshot(),
         }
@@ -1809,9 +1865,21 @@ async def _run() -> None:
                                     market_id=market_id,
                                     start_time_ms=None,
                                 )
-                                for _sc_fill in _sc_fills:
-                                    if _sc_fill.trade_id in _recorded_realizations:
-                                        continue
+                                # Only the fills we haven't booked yet (oldest-first).
+                                _sc_new = [
+                                    f for f in _sc_fills
+                                    if f.trade_id not in _recorded_realizations
+                                ]
+                                # Partials already booked for this round-trip BEFORE
+                                # this loop inserts any rows (capture once to avoid
+                                # double-counting the rows we add below).
+                                _sc_prior = _roundtrip_partial_pnl(src.name, pos.market_symbol)
+                                # This unobserved close may span several fills. Mark
+                                # all but the last as PARTIAL and the last as FULL so
+                                # round-trip aggregation collapses them into ONE trade
+                                # (instead of N). The FULL card shows the total.
+                                _sc_total = Decimal(0)
+                                for _i, _sc_fill in enumerate(_sc_new):
                                     _sc_pnl = (
                                         _sc_fill.realized_pnl
                                         if _sc_fill.realized_pnl is not None
@@ -1822,9 +1890,17 @@ async def _run() -> None:
                                             _sc_fill.size,
                                         )
                                     )
+                                    if _sc_pnl is not None:
+                                        _sc_total += _sc_pnl
+                                    _is_last = _i == len(_sc_new) - 1
+                                    # FULL card total = pre-existing partials + every
+                                    # fill in this backstop batch.
+                                    _card_total = None
+                                    if _is_last and (_sc_prior != 0 or len(_sc_new) > 1):
+                                        _card_total = _sc_prior + _sc_total
                                     await record_realization(
                                         src=src,
-                                        kind="FULL",
+                                        kind="FULL" if _is_last else "PARTIAL",
                                         trade=_sc_fill,
                                         position_before=pos,
                                         realized_pnl=_sc_pnl,
@@ -1834,6 +1910,7 @@ async def _run() -> None:
                                         leverage=None,
                                         fill_ids=[_sc_fill.trade_id],
                                         anchor_entry=ae,
+                                        card_pnl_override=_card_total,
                                     )
                             except Exception:
                                 log.exception(
@@ -2087,6 +2164,17 @@ async def _run() -> None:
                         )
                     )
 
+                    # Round-trip total for the card image = realized PnL already
+                    # booked on this trade's scale-outs + this close fill. The
+                    # pending reduce batch was flushed just above, so those PARTIAL
+                    # rows are already in closed_trades.
+                    _rt_partials = _roundtrip_partial_pnl(src.name, ev.trade.market_symbol)
+                    _card_total = (
+                        (_rt_partials + realized)
+                        if (realized is not None and _rt_partials != 0)
+                        else None  # no scale-outs → card shows this fill's pnl as usual
+                    )
+
                     # Record the FULL close realization (card + DB + broadcast)
                     await record_realization(
                         src=src,
@@ -2100,6 +2188,7 @@ async def _run() -> None:
                         leverage=ev.leverage,
                         fill_ids=[ev.trade.trade_id] if ev.trade.trade_id is not None else [],
                         anchor_entry=_close_anchor,
+                        card_pnl_override=_card_total,
                     )
 
                     if cfg.alert_on_close:
@@ -2163,7 +2252,13 @@ async def _run() -> None:
 
     # --- HTTP routes ---
     async def index(_request: web.Request) -> web.Response:
-        return web.Response(text=INDEX_HTML, content_type="text/html")
+        # no-cache so a browser always revalidates and picks up new frontend JS
+        # after a deploy (the HTML is tiny; revalidation is cheap).
+        return web.Response(
+            text=INDEX_HTML,
+            content_type="text/html",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=30)
