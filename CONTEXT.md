@@ -74,6 +74,17 @@ then `sudo systemctl restart lighterbot` (**restart requires explicit user OK ea
 - **Binance**: rotating `ProxyPool` (round-robin + cooldown + failover) to bypass
   the Azure-region geo-block; fail-safe so HL/Lighter keep running if Binance is
   down, with a `/health` page. Currently the Binance source is commented out.
+- **Lighter WS geo-block**: Lighter's `/stream` WS endpoint is geo-blocked from
+  the Azure region (HTTP 400, code 20558 "restricted jurisdiction") while REST
+  stays open — so the 60s REST poll covers all pool trades (no data lost), just
+  not real-time. `stream_trades` detects the block, warns ONCE, and backs off
+  `_WS_GEO_BACKOFF=300s` instead of spamming. Set `LIGHTER_WS_PROXY` in `.env`
+  (a SOCKS5/HTTP proxy in an allowed region) to route ONLY the WS through it and
+  restore real-time — REST stays direct.
+- **Dashboard domain**: served at `https://dashboard.enkapital.xyz` via Caddy
+  (auto Let's Encrypt TLS) reverse-proxying localhost:8080 on the VM. GoDaddy A
+  record `dashboard → 20.29.250.158`; Azure NSG `lighter-bot-linux-nsg` opens
+  80/443/8080/22. Raw `:8080` still public (can be locked down later).
 
 ---
 

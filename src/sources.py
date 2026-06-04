@@ -340,9 +340,14 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             log.warning("lighter source '%s' missing 'pool_id' — skipping", name)
             return None
         pool_id = int(pool_id)
+        # WS-only proxy: Lighter geo-blocks the /stream endpoint from some
+        # regions while REST stays open. Set LIGHTER_WS_PROXY in .env (e.g.
+        # socks5h://host:1080) to route ONLY the real-time WS through an
+        # allowed region — REST stays direct.
+        ws_proxy = os.getenv("LIGHTER_WS_PROXY", "").strip() or None
         client = LighterClient(
             pool_id, LIGHTER_REST_BASE, LIGHTER_WS_URL,
-            source=name, proxy_url=_proxy_url(),
+            source=name, proxy_url=_proxy_url(), ws_proxy_url=ws_proxy,
         )
         return Source(
             id=f"lighter:{pool_id}",

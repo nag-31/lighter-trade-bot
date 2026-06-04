@@ -70,7 +70,7 @@ settings:
   privacy_size_sigfigs: 2          # round displayed size to N significant figures
   privacy_notional_sigfigs: 2      # round displayed notional to N significant figures
   privacy_time_bucket: relative    # exact | hour | relative
-  privacy_disclose_footnote: true  # append "prices approx * PnL exact" to HL alerts/cards
+  privacy_disclose_footnote: false # append "prices approx * PnL exact" to HL alerts/cards (off = hidden)
 
   # -- Binance proxy pool ---------------------------------------------------
   # Rotating proxy list used to bypass Binance HTTP 451 geo-blocks from this

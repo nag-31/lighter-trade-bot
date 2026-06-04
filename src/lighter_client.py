@@ -30,6 +30,10 @@ from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
 
+# When Lighter's WS handshake is geo-blocked (HTTP 400 restricted jurisdiction),
+# retry this slowly instead of hammering — the REST poll covers trades meanwhile.
+_WS_GEO_BACKOFF = 300.0  # seconds
+
 
 class LighterClient:
     def __init__(
@@ -39,12 +43,23 @@ class LighterClient:
         ws_url: str,
         source: str = "",
         proxy_url: Optional[str] = None,
+        ws_proxy_url: Optional[str] = None,
     ):
         self.pool_id = pool_id
         self.source = source
         self._rest_base = rest_base.rstrip("/")
         self._ws_url = ws_url
         self._proxy_url = proxy_url  # e.g. "socks5h://host:1080" or None
+        # WS-only proxy: Lighter geo-blocks the /stream endpoint from some
+        # regions (HTTP 400 "restricted jurisdiction") while REST stays open.
+        # Routing ONLY the WS through a proxy in an allowed region restores
+        # real-time without disturbing the working direct REST path. Falls back
+        # to the general proxy_url, else None (direct).
+        self._ws_proxy_url = ws_proxy_url or proxy_url
+        # One-shot flag so a persistent geo-block logs once, not every retry.
+        self._ws_geo_warned = False
+        if ws_proxy_url:
+            log.info("[%s] Lighter WS will route via proxy %s", source, ws_proxy_url)
 
         # httpx AsyncClient — routes through proxy if configured
         self._http = httpx.AsyncClient(
@@ -412,8 +427,8 @@ class LighterClient:
                     "ping_timeout": 20,
                     "additional_headers": {"Origin": "https://app.lighter.xyz"},
                 }
-                if self._proxy_url:
-                    connect_kwargs["proxy"] = self._proxy_url
+                if self._ws_proxy_url:
+                    connect_kwargs["proxy"] = self._ws_proxy_url
                 async with websockets.connect(self._ws_url, **connect_kwargs) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
@@ -421,6 +436,7 @@ class LighterClient:
                     }))
                     log.info("WS subscribed to account_all_trades/%s", self.pool_id)
                     backoff = 1.0
+                    self._ws_geo_warned = False  # connected — re-arm the warning
 
                     keepalive_task = asyncio.create_task(self._keepalive(ws))
                     try:
@@ -436,6 +452,30 @@ class LighterClient:
                     finally:
                         keepalive_task.cancel()
             except Exception as e:
+                # Detect Lighter's restricted-jurisdiction geo-block on /stream
+                # (handshake rejected with HTTP 400). REST keeps covering trades,
+                # so don't spam: log once, then retry slowly + quietly. A
+                # successful connect (or restart with LIGHTER_WS_PROXY set)
+                # re-arms the warning.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                geo_blocked = (
+                    status == 400
+                    or "HTTP 400" in str(e)
+                    or "restricted jurisdiction" in str(e).lower()
+                )
+                if geo_blocked:
+                    if not self._ws_geo_warned:
+                        log.warning(
+                            "[%s] Lighter WS rejected (HTTP 400 — restricted-jurisdiction "
+                            "geo-block on /stream from this region). Real-time stream is "
+                            "unavailable; the REST poll covers all trades (no data lost). "
+                            "Set LIGHTER_WS_PROXY to a SOCKS5/HTTP proxy in an allowed "
+                            "region to enable real-time. Retrying quietly every %ds.",
+                            self.source, int(_WS_GEO_BACKOFF),
+                        )
+                        self._ws_geo_warned = True
+                    await asyncio.sleep(_WS_GEO_BACKOFF)
+                    continue
                 log.warning("WS disconnected (%s) — reconnecting in %.1fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
