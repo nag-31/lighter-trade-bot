@@ -218,7 +218,7 @@ INDEX_HTML = """<!doctype html>
       </div>
       <div id="oo-body">
         <table>
-          <thead><tr><th>Source</th><th>Market</th><th>Side</th><th>Type</th><th class="num">Price</th><th class="num">Trigger</th><th class="num">Size</th></tr></thead>
+          <thead><tr><th>Source</th><th>Market</th><th>Side</th><th>Type</th><th class="num">Price</th><th class="num">Trigger</th><th class="num">Notional</th></tr></thead>
           <tbody id="open-orders"></tbody>
         </table>
         <div id="oo-footnote" style="font-size:10px;color:#6b7280;margin-top:6px"></div>
@@ -235,7 +235,7 @@ INDEX_HTML = """<!doctype html>
   <div class="col-right">
     <h2>Recent events</h2>
     <table>
-      <thead><tr><th>Time IST</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Size</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
+      <thead><tr><th>Time IST</th><th>Source</th><th>Kind</th><th>Market</th><th>Side</th><th class="num">Price</th><th class="num">Notional</th></tr></thead>
       <tbody id="events"></tbody>
     </table>
   </div>
@@ -316,7 +316,7 @@ function renderPositions(positions) {
 }
 function renderEvents(events) {
   const tb = document.getElementById("events");
-  if (!events.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">waiting for trades…</td></tr>'; return; }
+  if (!events.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">waiting for trades…</td></tr>'; return; }
   tb.innerHTML = events.map(e => {
     const t = e.trade;
     // Prefer display fields (present for HL events); fall back to real fields.
@@ -324,6 +324,7 @@ function renderEvents(events) {
     const time = disp.ts ?? toIST(t.timestamp);
     const price = disp.price ?? t.price;
     const size  = disp.size  ?? t.size;
+    // For HL events prefer the pre-computed privacy notional; for Lighter compute from real fields.
     const notional = disp.notional ?? (Number(size) * Number(price));
     const fn = disp.footnote ? ` <span style="font-size:10px;color:#6b7280">${esc(disp.footnote)}</span>` : "";
     return `<tr>
@@ -332,7 +333,6 @@ function renderEvents(events) {
       <td class="kind-${e.kind}">${e.kind}</td>
       <td>${esc(t.market_symbol)}</td>
       <td class="${t.side}">${t.side.toUpperCase()}</td>
-      <td class="num">${fmtSize(size)}</td>
       <td class="num">${fmtPrice(price)}${fn}</td>
       <td class="num">${fmtUsd(notional)}</td>
     </tr>`;
@@ -377,7 +377,6 @@ function renderClosedTrades(trades) {
     const timeStr = tr.ts_disp   ?? (tr.ts ? toIST(tr.ts) : '');
     const entryStr = (tr.entry_disp ?? tr.entry) ? fmtPrice(tr.entry_disp ?? tr.entry) : '—';
     const exitStr  = (tr.exit_disp  ?? tr.exit)  ? fmtPrice(tr.exit_disp  ?? tr.exit)  : '—';
-    const sizeStr  = (tr.size_disp  ?? tr.size)  ? fmtSize(tr.size_disp   ?? tr.size)  : '—';
     const notStr   = (tr.notional_disp ?? tr.notional) ? fmtUsd(tr.notional_disp ?? tr.notional) : '—';
     const tileFootnote = tr.footnote ? `<div style="font-size:10px;color:#6b7280;margin-top:4px">${esc(tr.footnote)}</div>` : '';
     let thumbHtml = '';
@@ -392,7 +391,6 @@ function renderClosedTrades(trades) {
   <div class="tile-details">
     <span class="tile-detail-label">ENTRY</span><span class="tile-detail-val">${entryStr}</span>
     <span class="tile-detail-label">EXIT</span><span class="tile-detail-val">${exitStr}</span>
-    <span class="tile-detail-label">SIZE</span><span class="tile-detail-val">${sizeStr}</span>
     <span class="tile-detail-label">NOTIONAL</span><span class="tile-detail-val">${notStr}</span>
     <span class="tile-detail-label">LEVERAGE</span><span class="tile-detail-val">${levStr}</span>
     <span class="tile-detail-label">WIN RATE</span><span class="tile-detail-val">${wrStr}</span>
@@ -674,9 +672,9 @@ function renderOpenOrders(orders) {
     if (o.order_id != null) _ooSeenIds.add(String(o.order_id));
     const flashClass = isNew ? " oo-flash" : "";
     const sideClass  = o.side === "long" ? "long" : "short";
-    const price   = o.price      != null ? fmtPrice(o.price)      : "—";
-    const trigger = o.trigger_px != null ? fmtPrice(o.trigger_px) : "—";
-    const size    = o.size       != null ? fmtSize(o.size)        : "—";
+    const price    = o.price      != null ? fmtPrice(o.price)      : "—";
+    const trigger  = o.trigger_px != null ? fmtPrice(o.trigger_px) : "—";
+    const notional = o.notional   != null ? fmtUsd(o.notional)     : "—";
     if (o.footnote) footnoteTxt = o.footnote;
     return `<tr class="${flashClass}">
       <td>${esc(o.source)}</td>
@@ -685,7 +683,7 @@ function renderOpenOrders(orders) {
       <td>${esc(o.order_kind)}</td>
       <td class="num">${price}</td>
       <td class="num">${trigger}</td>
-      <td class="num">${size}</td>
+      <td class="num">${notional}</td>
     </tr>`;
   }).join("");
   fnEl.textContent = footnoteTxt;
@@ -1252,7 +1250,23 @@ async def _run() -> None:
 
     def _transform_open_order_row(s: "Source", o: dict) -> dict:
         """Apply the same privacy factor to an open order row's price/trigger_px
-        when the owning source is HL.  Lighter rows pass through unchanged."""
+        when the owning source is HL.  Lighter rows pass through unchanged.
+
+        Always computes `notional` (USD value) from the RAW price and size BEFORE
+        price is overwritten, so the column shows the correct order notional.
+        """
+        # --- Compute notional from raw values before any transform ---
+        try:
+            raw_price_for_notional = o.get("price") or o.get("trigger_px")
+            raw_size = o.get("size")
+            if raw_price_for_notional is not None and raw_size is not None:
+                real_notional = Decimal(str(raw_price_for_notional)) * Decimal(str(raw_size))
+                o["notional"] = str(disp_notional(privacy, s.is_hyperliquid, real_notional))
+            else:
+                o["notional"] = None
+        except Exception:
+            o["notional"] = None
+
         if not s.is_hyperliquid:
             o["is_hl"] = False
             return o
@@ -1430,7 +1444,6 @@ async def _run() -> None:
                             ae = _anchor(src, market_id, pos.avg_entry_price)
 
                             # Transform displayed values for HL (close price unavailable)
-                            disp_sz_val    = pos.size
                             disp_entry_val = pos.avg_entry_price
                             disp_not_val   = pos.notional_usd
                             fn_text        = ""
@@ -1439,10 +1452,8 @@ async def _run() -> None:
                                     privacy, True,
                                     src.id, pos.market_symbol, pos.side, ae,
                                     entry=pos.avg_entry_price,
-                                    size=pos.size,
                                     notional=pos.notional_usd,
                                 )
-                                disp_sz_val    = dv.get("size",     pos.size)
                                 disp_entry_val = dv.get("entry",    pos.avg_entry_price)
                                 disp_not_val   = dv.get("notional", pos.notional_usd)
                                 fn_text        = dv.get("footnote", "")
@@ -1453,8 +1464,7 @@ async def _run() -> None:
                             msg = (
                                 f"📍 {src.name}\n"
                                 f"Closed {direction} {pos.market_symbol}\n"
-                                f"Size: {disp_sz_val:,.4f}  |  Entry: ${disp_entry_val:,.2f}\n"
-                                f"Notional: ${disp_not_val:,.0f}  (close price unavailable)"
+                                f"Entry: ${disp_entry_val:,.2f}  |  Notional: ${disp_not_val:,.0f}  (close price unavailable)"
                                 f"{fn_line}{footer}"
                             )
                             await tg_send(msg)

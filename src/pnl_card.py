@@ -197,10 +197,9 @@ def generate_pnl_card(
     accent_dim = _GREEN_DIM if is_win else _RED_DIM
 
     # ---- Build display values for the detail pills ----
-    # Price / size / notional may be privacy-transformed for HL; PnL stays real.
+    # Price / notional may be privacy-transformed for HL; PnL stays real.
     disp_entry   = pos.avg_entry_price
     disp_exit    = t.price
-    disp_size    = pos.size
     disp_notional = pos.notional_usd
     privacy_fn   = ""
 
@@ -216,7 +215,6 @@ def generate_pnl_card(
         f = price_factor(privacy, source_id, pos.market_symbol, pos.side, ae)
         disp_entry    = disp_price(privacy, is_hl, f, pos.avg_entry_price)
         disp_exit     = disp_price(privacy, is_hl, f, t.price)
-        disp_size     = _ds(privacy, is_hl, pos.size)
         disp_notional = _dn(privacy, is_hl, pos.notional_usd)
         privacy_fn    = footnote(privacy, is_hl)
 
@@ -274,11 +272,12 @@ def generate_pnl_card(
     def _fmt_px(p: Decimal) -> str:
         return f"${p:,.2f}" if p >= 1000 else f"${p:,.4f}"
 
+    lev_str = f"{event.leverage:g}x" if event.leverage is not None else "—"
     details = [
         ("ENTRY",    _fmt_px(disp_entry)),
         ("EXIT",     _fmt_px(disp_exit)),
-        ("SIZE",     f"{disp_size:,.4f}"),
         ("NOTIONAL", f"${disp_notional:,.0f}"),
+        ("LEVERAGE", lev_str),
     ]
     col_w = (W - 84) // len(details)
     for i, (label, value) in enumerate(details):

@@ -512,10 +512,11 @@ class TestTgDedupEdgeCases:
     def test_reconciler_and_fill_alerts_different_text_both_send(self):
         """Reconciler-format and fill-based-format alerts have different text,
         so if both somehow fired they'd both get through dedup.
-        (In practice, one is suppressed by _reconciler_alerted_opens.)"""
+        (In practice, one is suppressed by _reconciler_alerted_opens.)
+        Reconciler uses 'Entry:' label; fill-based formatter uses 'Price:'."""
         send = self._make_send()
         reconciler_msg = "📍 NK\nOpened 🟢 LONG HYPE\nEntry: $57.2000  |  Notional: $1,000  |  15x"
-        fill_msg       = "📍 NK\nOpened 🟢 LONG HYPE\nEntry: $57.2000  |  Size: 17.5  |  Notional: $1,000  |  15x"
+        fill_msg       = "📍 NK\nOpened 🟢 LONG HYPE\nPrice: $57.2000  |  Notional: $1,000  |  15x"
         assert send(reconciler_msg) is True
         assert send(fill_msg) is True   # different format → both pass dedup
 

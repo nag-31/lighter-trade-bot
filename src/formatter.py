@@ -159,12 +159,10 @@ def format_event(
     if event.kind == EventKind.CLOSE and event.position_before is not None:
         pos = event.position_before
         disp_exit = _dp(t.price)
-        disp_sz   = _ds(pos.size)
         disp_not  = _dn(pos.notional_usd)
         body = (
             f"Closed {_direction_emoji(pos.side)} {pos.market_symbol}\n"
-            f"Exit: {_fmt_price(disp_exit)}  |  Size: {_fmt_size(disp_sz)}\n"
-            f"Notional: ${disp_not:,.0f}"
+            f"Exit: {_fmt_price(disp_exit)}  |  Notional: ${disp_not:,.0f}"
         )
         if event.leverage is not None:
             body += f"  |  {event.leverage:g}x"
@@ -176,12 +174,12 @@ def format_event(
         pos_b = event.position_before
         pos_a = event.position_after
         disp_trade_price  = _dp(t.price)
-        disp_trade_sz     = _ds(t.size)
         disp_not_a        = _dn(pos_a.notional_usd)
         disp_not_b        = _dn(pos_b.notional_usd)
+        fill_notional     = _dn(t.size * t.price)
         body = (
             f"Reduced {_direction_emoji(pos_b.side)} {pos_b.market_symbol}\n"
-            f"−{_fmt_size(disp_trade_sz)} @ {_fmt_price(disp_trade_price)}\n"
+            f"−${fill_notional:,.0f} @ {_fmt_price(disp_trade_price)}\n"
             f"Remaining: ${disp_not_a:,.0f}  (was ${disp_not_b:,.0f})"
         )
         if event.leverage is not None:
@@ -193,13 +191,11 @@ def format_event(
     else:
         notional = t.size * t.price
         disp_trade_price = _dp(t.price)
-        disp_trade_sz    = _ds(t.size)
         disp_not         = _dn(notional)
         verb = {EventKind.OPEN: "Opened", EventKind.SIZE_CHANGE: "Added to"}.get(event.kind, "Updated")
         body = (
             f"{verb} {direction} {t.market_symbol}\n"
-            f"Price: {_fmt_price(disp_trade_price)}  |  Size: {_fmt_size(disp_trade_sz)}\n"
-            f"Notional: ${disp_not:,.0f}"
+            f"Price: {_fmt_price(disp_trade_price)}  |  Notional: ${disp_not:,.0f}"
         )
         if event.leverage is not None:
             body += f"  |  {event.leverage:g}x"
