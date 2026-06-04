@@ -13,6 +13,28 @@ from pathlib import Path
 from typing import Any
 
 
+def _migrate_closed_trades(con: sqlite3.Connection) -> None:
+    """Idempotent migration: add the 3 realization columns to existing DBs.
+
+    SQLite has no ADD COLUMN IF NOT EXISTS, so we inspect PRAGMA table_info
+    and only issue ALTER TABLE for columns that are actually missing.
+    Existing rows will have NULL for the new columns — callers should treat
+    NULL realization_kind as "FULL".
+    """
+    existing = {row[1] for row in con.execute("PRAGMA table_info(closed_trades)")}
+    new_cols = [
+        ("trade_id",         "INTEGER"),
+        ("fill_ids",         "TEXT"),
+        ("realization_kind", "TEXT"),
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            con.execute(
+                f"ALTER TABLE closed_trades ADD COLUMN {col_name} {col_type}"
+            )
+    con.commit()
+
+
 def _init_sync(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
@@ -25,24 +47,28 @@ def _init_sync(path: Path) -> None:
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS closed_trades (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts           TEXT    NOT NULL,
-            source       TEXT,
-            market_symbol TEXT,
-            side         TEXT,
-            entry        TEXT,
-            exit         TEXT,
-            size         TEXT,
-            notional     TEXT,
-            pnl          TEXT,
-            pct          TEXT,
-            is_win       INTEGER,
-            leverage     TEXT,
-            wins         INTEGER,
-            total        INTEGER,
-            card_path    TEXT
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                TEXT    NOT NULL,
+            source            TEXT,
+            market_symbol     TEXT,
+            side              TEXT,
+            entry             TEXT,
+            exit              TEXT,
+            size              TEXT,
+            notional          TEXT,
+            pnl               TEXT,
+            pct               TEXT,
+            is_win            INTEGER,
+            leverage          TEXT,
+            wins              INTEGER,
+            total             INTEGER,
+            card_path         TEXT,
+            trade_id          INTEGER,
+            fill_ids          TEXT,
+            realization_kind  TEXT
         )
     """)
+    _migrate_closed_trades(con)
     con.execute("""
         CREATE TABLE IF NOT EXISTS tg_alerts (
             id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,6 +118,7 @@ _CLOSED_TRADE_COLUMNS = (
     "ts", "source", "market_symbol", "side", "entry", "exit",
     "size", "notional", "pnl", "pct", "is_win", "leverage",
     "wins", "total", "card_path",
+    "trade_id", "fill_ids", "realization_kind",
 )
 
 
@@ -131,6 +158,49 @@ async def save_closed_trade(path: Path, record: dict) -> None:
 async def load_closed_trades(path: Path, limit: int | None = None) -> list[dict]:
     """Return closed trades newest-first. If limit is None, return all."""
     return await asyncio.to_thread(_load_closed_trades_sync, path, limit)
+
+
+def _load_recorded_fill_ids_sync(path: Path) -> set[int]:
+    """Return the union of all trade_id values and all ids inside fill_ids JSON lists.
+
+    Used at boot time to build the dedup set so a fill is never recorded twice.
+    Malformed / unparseable fill_ids rows are silently skipped.
+    """
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT trade_id, fill_ids FROM closed_trades"
+        ).fetchall()
+    finally:
+        con.close()
+
+    result: set[int] = set()
+    for trade_id, fill_ids_raw in rows:
+        if trade_id is not None:
+            try:
+                result.add(int(trade_id))
+            except (ValueError, TypeError):
+                pass
+        if fill_ids_raw is not None:
+            try:
+                ids = json.loads(fill_ids_raw)
+                if isinstance(ids, list):
+                    for fid in ids:
+                        try:
+                            result.add(int(fid))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass  # unparseable JSON — skip defensively
+    return result
+
+
+async def load_recorded_fill_ids(path: Path) -> set[int]:
+    """Return the union of all fill ids (trade_id + fill_ids JSON) recorded in closed_trades.
+
+    Defensive: unparseable rows / values are silently skipped.
+    """
+    return await asyncio.to_thread(_load_recorded_fill_ids_sync, path)
 
 
 # ---------------------------------------------------------------------------

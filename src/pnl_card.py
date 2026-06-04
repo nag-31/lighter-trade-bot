@@ -80,16 +80,24 @@ def record_result(is_win: bool) -> tuple[int, int]:
 def calculate_pnl(
     event: Event,
     accumulated_pnl: Optional[Decimal] = None,
+    pnl_override: Optional[Decimal] = None,
 ) -> Optional[Decimal]:
-    """Realized PnL for a CLOSE event.
+    """Realized PnL for a CLOSE/REDUCE event.
 
-    Uses trade.realized_pnl when available (HL fills carry closedPnl) and
-    adds any accumulated_pnl from previous REDUCE fills for the same position
-    lifecycle so the card reflects the TOTAL position PnL, not just the last fill.
+    Precedence:
+    1. ``pnl_override`` — when provided, returned verbatim (dashboard passes
+       the exact realized PnL from HL closedPnl batch or a Lighter computation).
+    2. ``trade.realized_pnl`` — HL per-fill closedPnl; ``accumulated_pnl`` is
+       added for multi-fill position totals.
+    3. Fallback calculation from entry/exit prices (Lighter — no per-fill PnL).
+       ``accumulated_pnl`` is included in the total when provided.
 
-    For Lighter (no per-fill PnL), falls back to calculating from entry/exit prices.
-    accumulated_pnl is still included in the fallback total when provided.
+    ``accumulated_pnl`` remains accepted for back-compat but is not the primary
+    path when ``pnl_override`` is supplied.
     """
+    if pnl_override is not None:
+        return pnl_override
+
     if event.trade.realized_pnl is not None:
         total = event.trade.realized_pnl
         if accumulated_pnl is not None:
@@ -175,12 +183,19 @@ def generate_pnl_card(
     is_hl: bool = False,
     anchor_entry: Optional[Decimal] = None,
     source_id: str = "",
+    pnl_override: Optional[Decimal] = None,
+    is_partial: bool = False,
 ) -> Optional[bytes]:
     """Return PNG bytes for the PnL card, or None if Pillow is unavailable.
 
     When privacy params are supplied for an HL source, the entry/exit/size/notional
     pills are shown with transformed values; the big PnL number and % remain EXACT
     (derived from real prices as normal).
+
+    ``pnl_override`` — when provided, the big PnL shown on the card is this exact
+    value (sourced from HL ``closedPnl`` batch total or a Lighter computation).
+    ``is_partial`` — when True, the header direction label reads "PARTIAL CLOSE"
+    instead of "CLOSED", making scale-outs visually distinct from full closes.
     """
     if not PIL_AVAILABLE:
         return None
@@ -191,7 +206,7 @@ def generate_pnl_card(
         return None
 
     # PnL and % are ALWAYS computed from real (un-transformed) values.
-    pnl = calculate_pnl(event, accumulated_pnl=accumulated_pnl)
+    pnl = calculate_pnl(event, accumulated_pnl=accumulated_pnl, pnl_override=pnl_override)
     is_win = pnl is not None and pnl > 0
     accent    = _GREEN if is_win else _RED
     accent_dim = _GREEN_DIM if is_win else _RED_DIM
@@ -241,7 +256,10 @@ def generate_pnl_card(
     header_txt = f"{source_name}  ·  {pos.market_symbol}"
     draw.text((42, 32), header_txt, font=f_med, fill=_TEXT_SEC)
 
-    direction_txt = ("LONG  ·  CLOSED" if pos.side == "long" else "SHORT  ·  CLOSED")
+    close_label = "PARTIAL CLOSE" if is_partial else "CLOSED"
+    direction_txt = (
+        f"LONG  ·  {close_label}" if pos.side == "long" else f"SHORT  ·  {close_label}"
+    )
     draw.text((42, 64), direction_txt, font=f_norm, fill=accent)
 
     # ---- big P&L (EXACT — real values) ----

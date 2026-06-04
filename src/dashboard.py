@@ -34,6 +34,7 @@ from .db import (
     init_db,
     load_closed_trades,
     load_recent_events,
+    load_recorded_fill_ids,
     load_tg_alerts,
     save_closed_trade,
     save_event,
@@ -370,7 +371,7 @@ function renderClosedTrades(trades) {
     const pnlStr   = pnlN == null ? '—' : pnlSign + '$' + Math.abs(pnlN).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
     const pctStr   = pctN == null ? '' : (pctN >= 0 ? '+' : '') + pctN.toFixed(2) + '%';
     const sideClass = (tr.side || '').toLowerCase() === 'long' ? 'green' : 'red';
-    const sideLabel = ((tr.side || '').toUpperCase()) + ' · CLOSED';
+    const sideLabel = ((tr.side || '').toUpperCase()) + (tr.realization_kind === 'PARTIAL' ? ' · PARTIAL CLOSE' : ' · CLOSED');
     const levStr  = tr.leverage ? tr.leverage + 'x' : '—';
     const wrStr   = (tr.wins != null && tr.total != null && tr.total > 0) ? tr.wins + '/' + tr.total : '—';
     // Prefer privacy-transformed display fields when present (HL trades).
@@ -824,6 +825,10 @@ async def _run() -> None:
         closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, cfg.max_closed_trades))
         log.info("loaded %d closed trades from db", len(closed_trades))
 
+    # Boot dedup set: union of all fill ids ever recorded — prevents re-recording
+    # the same fill after a restart (e.g. reduce batch flushed before crash).
+    _recorded_realizations: set[int] = set(await load_recorded_fill_ids(DB_PATH))
+
     # ── Re-derive privacy display fields for DB-loaded closed trades ──────────
     # Display fields (entry_disp, …) are in-memory only; after a restart the
     # history grid loads real DB rows and the JS "?? tr.entry" fallback would
@@ -1048,6 +1053,173 @@ async def _run() -> None:
         except Exception:
             return None, None
 
+    # ── Lighter realized-PnL helper ──────────────────────────────────────────
+    def _lighter_realized(side: str, avg_entry: Decimal, fill_price: Decimal, reduced_size: Decimal) -> Decimal:
+        """Compute realized PnL for a Lighter fill (no per-fill closedPnl from exchange)."""
+        if side == "long":
+            return (fill_price - avg_entry) * reduced_size
+        return (avg_entry - fill_price) * reduced_size
+
+    # ── Shared realization recorder ───────────────────────────────────────────
+    async def record_realization(
+        *,
+        src: "Source",
+        kind: str,  # "PARTIAL" | "FULL"
+        trade: "Trade",
+        position_before: "Position",
+        realized_pnl: "Decimal | None",
+        reduced_size: Decimal,
+        fill_price: Decimal,
+        avg_entry: Decimal,
+        leverage: "float | None",
+        fill_ids: "list[int]",
+        anchor_entry: Decimal,
+    ) -> None:
+        """Record a single realization event (partial close or full close).
+
+        Writes a closed_trades DB row, a PnL card PNG, and broadcasts a snapshot.
+        Deduplicated by fill_ids — if every id in fill_ids is already in
+        _recorded_realizations, the call is a no-op.
+        """
+        # ── Dedup guard ────────────────────────────────────────────────────────
+        if fill_ids:
+            if all(fid in _recorded_realizations for fid in fill_ids):
+                log.info(
+                    "[%s] record_realization: all fill_ids already recorded, skipping %s %s",
+                    src.name, kind, trade.market_symbol,
+                )
+                return
+            # Register all ids (and the trade's own id) so future calls are no-ops
+            for fid in fill_ids:
+                _recorded_realizations.add(fid)
+        if trade.trade_id is not None:
+            _recorded_realizations.add(trade.trade_id)
+
+        # ── Build a synthetic Event-like for generate_pnl_card ────────────────
+        # We need an Event whose position_before is the pre-reduce/pre-close
+        # position and whose trade carries the fill price and size.
+        from .types import Event as _Event, EventKind as _EventKind
+        from dataclasses import replace as _replace
+        # Use a minimal Trade-like object so the card can read price / size / side.
+        # We reuse the real trade object; position_before is what we pass in.
+        synth_trade = _replace(
+            trade,
+            price=fill_price,
+            size=reduced_size,
+        )
+        synth_ev = _Event(
+            kind=_EventKind.CLOSE,
+            trade=synth_trade,
+            position_before=position_before,
+            position_after=None,
+        )
+        synth_ev_with_leverage = synth_ev
+        # Event is a frozen dataclass so we can't set leverage directly;
+        # generate_pnl_card reads event.leverage for the pill.
+        # We work around by passing a modified object attribute via object.__setattr__.
+        import copy as _copy
+        synth_ev_with_leverage = _copy.copy(synth_ev)
+        object.__setattr__(synth_ev_with_leverage, "leverage", leverage)
+
+        # ── PnL / pct ─────────────────────────────────────────────────────────
+        is_win = realized_pnl is not None and realized_pnl > 0
+        wins, total = record_result(is_win)
+
+        pct: "Decimal | None" = None
+        if avg_entry and avg_entry != 0:
+            if position_before.side == "long":
+                pct = (fill_price - avg_entry) / avg_entry * 100
+            else:
+                pct = (avg_entry - fill_price) / avg_entry * 100
+
+        # ── PnL card ──────────────────────────────────────────────────────────
+        card_bytes = generate_pnl_card(
+            synth_ev_with_leverage,
+            src.name,
+            wins,
+            total,
+            pnl_override=realized_pnl,
+            is_partial=(kind == "PARTIAL"),
+            privacy=privacy,
+            is_hl=src.is_hyperliquid,
+            anchor_entry=anchor_entry,
+            source_id=src.id,
+        )
+
+        # Write PNG to disk
+        card_path = None
+        if card_bytes:
+            ts_str = trade.timestamp.isoformat().replace(":", "-").replace("+", "p")
+            kind_suffix = "_partial" if kind == "PARTIAL" else ""
+            raw_name = f"{ts_str}_{src.name}_{trade.market_symbol}{kind_suffix}"
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_name) + ".png"
+            card_file = cards_dir / safe_name
+            await asyncio.to_thread(card_file.write_bytes, card_bytes)
+            card_path = f"/cards/{safe_name}"
+
+        # ── Compute HL display fields (in-memory only, not persisted) ─────────
+        entry_disp = exit_disp = size_disp = notional_disp = ts_disp = None
+        close_footnote = ""
+        if src.is_hyperliquid and position_before is not None:
+            dv = disp_view(
+                privacy, True,
+                src.id, position_before.market_symbol, position_before.side, anchor_entry,
+                entry=avg_entry,
+                exit=fill_price,
+                size=reduced_size,
+                notional=reduced_size * fill_price,
+                ts=trade.timestamp.isoformat(),
+                now=datetime.now(timezone.utc),
+            )
+            entry_disp    = str(dv.get("entry",    avg_entry))
+            exit_disp     = str(dv.get("exit",     fill_price))
+            size_disp     = str(dv.get("size",     reduced_size))
+            notional_disp = str(dv.get("notional", reduced_size * fill_price))
+            ts_disp       = dv.get("ts", trade.timestamp.isoformat())
+            close_footnote = dv.get("footnote", "")
+
+        # ── Build DB record (REAL values only) ────────────────────────────────
+        record: dict = {
+            "ts": trade.timestamp.isoformat(),
+            "source": src.name,
+            "market_symbol": trade.market_symbol,
+            "side": position_before.side if position_before else None,
+            "entry": str(avg_entry),
+            "exit": str(fill_price),
+            "size": str(reduced_size),
+            "notional": str(reduced_size * fill_price),
+            "pnl": str(realized_pnl) if realized_pnl is not None else None,
+            "pct": str(pct) if pct is not None else None,
+            "is_win": 1 if is_win else 0,
+            "leverage": str(leverage) if leverage is not None else None,
+            "wins": wins,
+            "total": total,
+            "card_path": card_path,
+            # Realization metadata
+            "trade_id": trade.trade_id,
+            "fill_ids": json.dumps(fill_ids),
+            "realization_kind": kind,
+        }
+        await save_closed_trade(DB_PATH, record)
+
+        # ── Add in-memory display fields (HL only, never persisted) ───────────
+        if src.is_hyperliquid:
+            record["entry_disp"]    = entry_disp
+            record["exit_disp"]     = exit_disp
+            record["size_disp"]     = size_disp
+            record["notional_disp"] = notional_disp
+            record["ts_disp"]       = ts_disp
+            record["is_hl"]         = True
+            record["footnote"]      = close_footnote
+        record["realization_kind"] = kind  # always present in-memory for JS tile label
+
+        # Newest-first; only trim when NOT keeping full history for stats
+        closed_trades.insert(0, record)
+        if not cfg.stats_full_history:
+            del closed_trades[cfg.max_closed_trades:]
+        refresh_stats()
+        await hub.broadcast(snapshot_payload("snapshot"))
+
     async def flush_aggregate(key: tuple[str, int]) -> None:
         buf = _pending.pop(key, None)
         if buf is None:
@@ -1124,14 +1296,45 @@ async def _run() -> None:
                  pos.notional_usd)
         await tg_send(text)
 
+        # ── Record this partial close as its own realization row ───────────────
+        last_trade = buf.get("last_trade")
+        pos_before = buf.get("position_before") or pos  # best-effort pre-reduce snapshot
+        if last_trade is not None and pos_before is not None:
+            reduced_size = buf.get("reduced_size", buf["net_reduced"] / last_trade.price if last_trade.price else Decimal(0))
+            await record_realization(
+                src=src,
+                kind="PARTIAL",
+                trade=last_trade,
+                position_before=pos_before,
+                realized_pnl=buf["total_pnl"],
+                reduced_size=reduced_size,
+                fill_price=last_trade.price,
+                avg_entry=pos_before.avg_entry_price,
+                leverage=buf["leverage"],
+                fill_ids=buf.get("fill_ids", []),
+                anchor_entry=ae,
+            )
+
     def _accumulate_reduce(source_id: str, ev: Event) -> None:
         key = (source_id, ev.trade.market_id)
         fill_notional = ev.trade.size * ev.trade.price
         pnl = ev.trade.realized_pnl
+        # For Lighter (no per-fill closedPnl), compute PnL from prices.
+        # Use ev.position_before which holds the pre-fill position state.
+        pos_for_pnl = ev.position_before
+        if pnl is None and pos_for_pnl is not None:
+            pnl = _lighter_realized(
+                pos_for_pnl.side,
+                pos_for_pnl.avg_entry_price,
+                ev.trade.price,
+                ev.trade.size,
+            )
         current_pos = by_id[source_id].tracker.snapshot().get(ev.trade.market_id)
+        tid = ev.trade.trade_id
         if key in _pending_reduces:
             _pending_reduces[key]["net_reduced"] += fill_notional
             _pending_reduces[key]["n_fills"] += 1
+            _pending_reduces[key]["reduced_size"] += ev.trade.size
             if pnl is not None:
                 prev = _pending_reduces[key]["total_pnl"]
                 _pending_reduces[key]["total_pnl"] = (prev or Decimal(0)) + pnl
@@ -1139,6 +1342,10 @@ async def _run() -> None:
                 _pending_reduces[key]["leverage"] = ev.leverage
             if current_pos is not None:
                 _pending_reduces[key]["position"] = current_pos
+            # Track representative last fill and fill_ids for record_realization
+            _pending_reduces[key]["last_trade"] = ev.trade
+            if tid is not None:
+                _pending_reduces[key]["fill_ids"].append(tid)
             # Debounce: reset timer on every new fill (same reason as SIZE_CHANGE)
             _pending_reduces[key]["task"].cancel()
             task = asyncio.get_running_loop().create_task(
@@ -1155,6 +1362,12 @@ async def _run() -> None:
                 "total_pnl": pnl,
                 "leverage": ev.leverage,
                 "position": current_pos,
+                # New fields for record_realization
+                "reduced_size": ev.trade.size,
+                "last_trade": ev.trade,
+                "fill_ids": [tid] if tid is not None else [],
+                # Keep pre-reduce position snapshot for card context
+                "position_before": ev.position_before,
                 "task": task,
             }
 
@@ -1641,14 +1854,16 @@ async def _run() -> None:
                             _sl_tp_alerted.add(key)
 
                 elif ev.kind == EventKind.CLOSE:
-                    # Cancel any pending SIZE_CHANGE or REDUCE aggregate — position gone
+                    # Cancel any pending SIZE_CHANGE aggregate — position gone
                     _cancel_pending(key)
-                    reduce_buf = _pending_reduces.pop(key, None)
-                    # Extract PnL accumulated across prior REDUCE fills so the PnL card
-                    # shows the TOTAL position PnL (all fills combined), not just this one.
-                    accumulated_pnl = reduce_buf["total_pnl"] if reduce_buf else None
-                    if reduce_buf:
-                        reduce_buf["task"].cancel()
+
+                    # If a reduce batch is still pending for this key, flush it NOW
+                    # so its PnL is recorded as its own PARTIAL row before we record
+                    # the CLOSE.  This replaces the old "accumulated_pnl merge" approach.
+                    if key in _pending_reduces:
+                        _pending_reduces[key]["task"].cancel()
+                        await flush_reduce_aggregate(key)
+
                     # Position is gone — remove from SL/TP cache and re-arm for next open
                     _sl_tp_cache.pop(key, None)
                     _sl_tp_alerted.discard(key)
@@ -1663,104 +1878,59 @@ async def _run() -> None:
                     # Now clear the anchor (position is gone)
                     _privacy_anchor.get(src.id, {}).pop(ev.trade.market_id, None)
 
-                    # Always compute PnL card data (for DB persistence + optional TG send)
-                    pnl = calculate_pnl(ev, accumulated_pnl=accumulated_pnl)
-                    is_win = pnl is not None and pnl > 0
-                    wins, total = record_result(is_win)
-                    card_bytes = generate_pnl_card(
-                        ev, src.name, wins, total,
-                        accumulated_pnl=accumulated_pnl,
-                        privacy=privacy,
-                        is_hl=src.is_hyperliquid,
-                        anchor_entry=_close_anchor,
-                        source_id=src.id,
+                    # Compute this close fill's OWN realized PnL (no merging with reduces)
+                    realized = (
+                        ev.trade.realized_pnl
+                        if ev.trade.realized_pnl is not None
+                        else (
+                            _lighter_realized(
+                                pos_b.side,
+                                pos_b.avg_entry_price,
+                                ev.trade.price,
+                                pos_b.size,
+                            )
+                            if pos_b is not None
+                            else None
+                        )
                     )
 
-                    # Compute pct change (same formula as pnl_card.py) — EXACT
-                    pct = None
-                    if pos_b and pos_b.avg_entry_price:
-                        if pos_b.side == "long":
-                            pct = (ev.trade.price - pos_b.avg_entry_price) / pos_b.avg_entry_price * 100
-                        else:
-                            pct = (pos_b.avg_entry_price - ev.trade.price) / pos_b.avg_entry_price * 100
-
-                    # Write PNG to disk and record its web path
-                    card_path = None
-                    if card_bytes:
-                        ts_str = ev.trade.timestamp.isoformat().replace(":", "-").replace("+", "p")
-                        raw_name = f"{ts_str}_{src.name}_{ev.trade.market_symbol}"
-                        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_name) + ".png"
-                        card_file = cards_dir / safe_name
-                        await asyncio.to_thread(card_file.write_bytes, card_bytes)
-                        card_path = f"/cards/{safe_name}"
-
-                    # Compute display fields for the closed-trade record (HL only).
-                    # DB columns hold REAL values; _disp fields carry transformed values
-                    # for the JS history grid so it never needs to re-derive them.
-                    entry_disp = exit_disp = size_disp = notional_disp = ts_disp = None
-                    close_footnote = ""
-                    if src.is_hyperliquid and pos_b is not None:
-                        dv = disp_view(
-                            privacy, True,
-                            src.id, pos_b.market_symbol, pos_b.side, _close_anchor,
-                            entry=pos_b.avg_entry_price,
-                            exit=ev.trade.price,
-                            size=pos_b.size,
-                            notional=pos_b.notional_usd,
-                            ts=ev.trade.timestamp.isoformat(),
-                            now=datetime.now(timezone.utc),
-                        )
-                        entry_disp    = str(dv.get("entry",    pos_b.avg_entry_price))
-                        exit_disp     = str(dv.get("exit",     ev.trade.price))
-                        size_disp     = str(dv.get("size",     pos_b.size))
-                        notional_disp = str(dv.get("notional", pos_b.notional_usd))
-                        ts_disp       = dv.get("ts", ev.trade.timestamp.isoformat())
-                        close_footnote = dv.get("footnote", "")
-
-                    # Persist to DB (REAL values only) and update in-memory list.
-                    record = {
-                        "ts": ev.trade.timestamp.isoformat(),
-                        "source": src.name,
-                        "market_symbol": ev.trade.market_symbol,
-                        "side": pos_b.side if pos_b else None,
-                        # DB columns: real prices
-                        "entry": str(pos_b.avg_entry_price) if pos_b else None,
-                        "exit": str(ev.trade.price),
-                        "size": str(pos_b.size) if pos_b else None,
-                        "notional": str(pos_b.notional_usd) if pos_b else None,
-                        "pnl": str(pnl) if pnl is not None else None,
-                        "pct": str(pct) if pct is not None else None,
-                        "is_win": 1 if is_win else 0,
-                        "leverage": str(ev.leverage) if ev.leverage is not None else None,
-                        "wins": wins,
-                        "total": total,
-                        "card_path": card_path,
-                    }
-                    await save_closed_trade(DB_PATH, record)
-
-                    # Add display fields to the in-memory record (not persisted to DB,
-                    # but used by the JS history grid to show fuzzed values for HL).
-                    if src.is_hyperliquid:
-                        record["entry_disp"]    = entry_disp
-                        record["exit_disp"]     = exit_disp
-                        record["size_disp"]     = size_disp
-                        record["notional_disp"] = notional_disp
-                        record["ts_disp"]       = ts_disp
-                        record["is_hl"]         = True
-                        record["footnote"]      = close_footnote
-
-                    closed_trades.insert(0, record)
-                    # Do NOT truncate closed_trades here — keep full list for stats;
-                    # snapshot_payload slices to max_closed_trades for the UI.
-                    refresh_stats()
-                    await hub.broadcast(snapshot_payload("snapshot"))
+                    # Record the FULL close realization (card + DB + broadcast)
+                    await record_realization(
+                        src=src,
+                        kind="FULL",
+                        trade=ev.trade,
+                        position_before=pos_b if pos_b is not None else ev.position_before,
+                        realized_pnl=realized,
+                        reduced_size=pos_b.size if pos_b else ev.trade.size,
+                        fill_price=ev.trade.price,
+                        avg_entry=pos_b.avg_entry_price if pos_b else ev.trade.price,
+                        leverage=ev.leverage,
+                        fill_ids=[ev.trade.trade_id] if ev.trade.trade_id is not None else [],
+                        anchor_entry=_close_anchor,
+                    )
 
                     if cfg.alert_on_close:
+                        # Find the record just inserted (newest-first, index 0)
+                        _close_record = closed_trades[0] if closed_trades else {}
+                        _close_card_path = _close_record.get("card_path")
+                        if _close_card_path:
+                            # Re-read the bytes from disk for Telegram send
+                            # card_path is "/cards/<filename>" — strip the web prefix
+                            _card_filename = _close_card_path.removeprefix("/cards/")
+                            _close_card_file = cards_dir / _card_filename
+                            try:
+                                card_bytes = await asyncio.to_thread(_close_card_file.read_bytes)
+                            except Exception:
+                                card_bytes = None
+                        else:
+                            card_bytes = None
+
                         if card_bytes:
                             side_txt = (pos_b.side.upper() if pos_b else ev.trade.side.upper())
-                            if pnl is not None:
-                                sign = "+" if pnl >= 0 else "−"
-                                pnl_txt = f"{sign}${abs(pnl):,.2f}"
+                            pnl_for_log = realized
+                            if pnl_for_log is not None:
+                                sign = "+" if pnl_for_log >= 0 else "−"
+                                pnl_txt = f"{sign}${abs(pnl_for_log):,.2f}"
                             else:
                                 pnl_txt = "—"
                             log_text = (
