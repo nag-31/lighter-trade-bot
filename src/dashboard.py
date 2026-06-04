@@ -1818,10 +1818,30 @@ async def _run() -> None:
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    # Global rate-limit for the public, unauthenticated /api/send_stats endpoint:
+    # at most ONE send per hour total (the dashboard is public, so this protects
+    # the Telegram channel from being flooded by anyone who finds the URL).
+    # A 1-element list so the closure can mutate it without `nonlocal`.
+    _stats_send_gate = [0.0]
+    STATS_SEND_INTERVAL = 3600.0  # seconds (1 hour)
+
     async def send_stats(_request: web.Request) -> web.Response:
-        """POST /api/send_stats — relay current trade stats to Telegram."""
+        """POST /api/send_stats — relay current trade stats to Telegram.
+
+        Public + unauthenticated, so it is globally rate-limited to 1/hour.
+        """
         if not (tg_token and tg_channel):
             return web.json_response({"ok": False, "error": "telegram not configured"})
+        now = time.monotonic()
+        elapsed = now - _stats_send_gate[0]
+        if _stats_send_gate[0] and elapsed < STATS_SEND_INTERVAL:
+            wait_min = int((STATS_SEND_INTERVAL - elapsed) // 60) + 1
+            return web.json_response(
+                {"ok": False, "error": f"rate limited — try again in ~{wait_min} min"}
+            )
+        # Reserve the slot BEFORE sending so a burst of concurrent calls can't
+        # all slip through; a rare failed send simply costs this hour's slot.
+        _stats_send_gate[0] = now
         try:
             text = format_stats_summary(stats_state, pool_url="")
             await tg_send(text)
