@@ -7,7 +7,8 @@ parsed defensively via ``_f()``.
 
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Iterable, Optional
 
 
 def _f(x) -> Optional[float]:
@@ -18,6 +19,97 @@ def _f(x) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _parse_ts(x) -> Optional[datetime]:
+    """Parse an ISO-ish timestamp into an aware UTC datetime, or None.
+
+    Accepts full ISO strings (with optional trailing ``Z``) and date-only
+    strings (``2026-05-01``). Naive values are assumed UTC.
+    """
+    if not x:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    dt: Optional[datetime] = None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(s[:10])  # date-only fallback
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _norm_symbol(sym) -> str:
+    """Canonicalize a ticker for whitelist matching: uppercase, strip a single
+    trailing quote/perp suffix. Mirrors sources._normalize_symbol."""
+    s = str(sym or "").upper().strip()
+    for suffix in ("USDT", "USDC", "USD", "-PERP", "PERP"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)]
+    return s
+
+
+def filter_trades(
+    trades: list[dict],
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    symbols: Optional[Iterable[str]] = None,
+) -> list[dict]:
+    """Return the closed-trade records to DISPLAY, filtered and date-sorted.
+
+    Parameters
+    ----------
+    trades:
+        Closed-trade records (each a dict with ``ts`` and ``market_symbol``).
+    start_date:
+        ISO date/datetime; only trades on/after this are kept. ``None`` ⇒ no
+        lower bound.
+    end_date:
+        ISO date/datetime; only trades on/before this are kept. ``None`` ⇒ no
+        upper bound (i.e. up to the current date/time). A date-only value is
+        treated as inclusive end-of-day.
+    symbols:
+        Whitelist of tickers (normalized). Empty/``None`` ⇒ all coins.
+
+    A record whose ``ts`` can't be parsed is dropped when any date bound is set
+    (it can't be placed in the window). Result is sorted newest-first by ``ts``.
+    """
+    start = _parse_ts(start_date)
+    end = _parse_ts(end_date)
+    # A date-only end bound means "through the end of that day", inclusive.
+    if end is not None and end_date is not None and len(str(end_date).strip()) <= 10:
+        end = end.replace(hour=23, minute=59, second=59, microsecond=999_999)
+
+    allow = {_norm_symbol(s) for s in symbols} if symbols else None
+    has_bound = start is not None or end is not None
+
+    out: list[dict] = []
+    for t in trades:
+        if allow is not None and _norm_symbol(t.get("market_symbol")) not in allow:
+            continue
+        dt = _parse_ts(t.get("ts"))
+        if has_bound:
+            if dt is None:
+                continue
+            if start is not None and dt < start:
+                continue
+            if end is not None and dt > end:
+                continue
+        out.append(t)
+
+    out.sort(key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT, reverse=True)
+    return out
 
 
 def compute_stats(trades: list[dict]) -> dict:

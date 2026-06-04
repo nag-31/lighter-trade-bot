@@ -89,6 +89,17 @@ class BotSettings:
     # Stats: compute over ALL closed trades, not just the last max_closed_trades
     stats_full_history: bool = True
 
+    # ── Stats display window ─────────────────────────────────────────────────
+    # Scope which closed trades appear in the analytics + history grid without
+    # importing the entire HL history. Dates are ISO strings ("2026-05-01" or
+    # "2026-05-01T00:00:00Z"). stats_end_date None ⇒ current date/time. A
+    # date-only end is inclusive end-of-day. stats_symbols whitelists tickers;
+    # empty ⇒ every coin currently in the DB (today = only the existing
+    # dashboard coins, since no full-history import was done).
+    stats_start_date: Optional[str] = None
+    stats_end_date:   Optional[str] = None
+    stats_symbols:    tuple         = ()
+
     # ── Binance proxy pool ────────────────────────────────────────────────────
     # List of proxy URLs used to bypass Binance geo-blocks.  A tuple (not list)
     # because BotSettings is frozen.  Parsed from the YAML list at load time.
@@ -143,6 +154,13 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         v = raw.get(key, default)
         return str(v) if v is not None else default
 
+    def _str_or_none(key: str) -> Optional[str]:
+        v = raw.get(key)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
     # Privacy salt is a SECRET — it loads from the PRIVACY_SECRET_KEY env var,
     # never from config.yaml. Falling back to a fixed dev salt keeps the bot
     # running, but production MUST set the env var (a known salt is recoverable).
@@ -162,6 +180,14 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         _raw_proxies = []
     _binance_proxies: tuple = tuple(
         str(u).strip() for u in _raw_proxies if str(u).strip()
+    )
+
+    # Parse stats_symbols: accept a YAML list (or a single string) of tickers.
+    _raw_symbols = raw.get("stats_symbols") or []
+    if not isinstance(_raw_symbols, list):
+        _raw_symbols = [_raw_symbols]
+    _stats_symbols: tuple = tuple(
+        str(s).strip() for s in _raw_symbols if str(s).strip()
     )
 
     settings = BotSettings(
@@ -187,6 +213,9 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         privacy_secret_key          = privacy_secret,
         open_orders_enabled         = _bool("open_orders_enabled",        True),
         stats_full_history          = _bool("stats_full_history",         True),
+        stats_start_date            = _str_or_none("stats_start_date"),
+        stats_end_date              = _str_or_none("stats_end_date"),
+        stats_symbols               = _stats_symbols,
         binance_proxies             = _binance_proxies,
         binance_proxy_test_url      = _str(
             "binance_proxy_test_url",

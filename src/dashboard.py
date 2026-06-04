@@ -46,7 +46,7 @@ from .formatter import format_aggregate, format_event, format_reduce_aggregate, 
 from .health import HealthRegistry
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
-from .stats import compute_stats, format_stats_summary
+from .stats import compute_stats, filter_trades, format_stats_summary
 from .stats_card import render_stats_card
 from .types import Event, EventKind, OpenOrder, Position, Trade
 
@@ -288,6 +288,13 @@ const toIST = ts => {
   const d = new Date(new Date(ts).getTime() + 5.5 * 60 * 60 * 1000);
   return d.toISOString().slice(11, 19);
 };
+// Short calendar label ("Jun 3") for chart date axes; "" if unparseable.
+const toDateLabel = ts => {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+};
 const fmtNum = (s, d=2) => {
   const n = Number(s); if (!isFinite(n)) return s;
   return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -494,18 +501,27 @@ function renderStats(stats) {
     '</div>'
   ).join("");
 
-  // --- Equity curve ---
+  // --- Equity curve (x-axis = trade date) ---
   const eqData = (stats.equity_curve || []);
-  const eqLabels = eqData.map((_, i) => String(i + 1));
+  const eqLabels = eqData.map(p => toDateLabel(p.ts));
   const eqValues = eqData.map(p => Number(p.cum_pnl));
   const finalPnl = eqValues.length ? eqValues[eqValues.length - 1] : 0;
   const eqColor = finalPnl >= 0 ? GREEN : RED;
   const eqFill = finalPnl >= 0 ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.12)";
+  const eqOpts = _chartBaseOpts();
+  eqOpts.plugins.tooltip.callbacks = {
+    title: items => (items.length ? toDateLabel(eqData[items[0].dataIndex].ts) : ""),
+    label: item => "Cum P&L: " + fmtSignedUsd(item.parsed.y),
+  };
+  // Avoid an unreadable wall of date ticks when there are many trades.
+  eqOpts.scales.x.ticks.autoSkip = true;
+  eqOpts.scales.x.ticks.maxTicksLimit = 10;
   if (_chartEquity) {
     _chartEquity.data.labels = eqLabels;
     _chartEquity.data.datasets[0].data = eqValues;
     _chartEquity.data.datasets[0].borderColor = eqColor;
     _chartEquity.data.datasets[0].backgroundColor = eqFill;
+    _chartEquity.options = eqOpts;
     _chartEquity.update();
   } else {
     const ctx = document.getElementById("chart-equity").getContext("2d");
@@ -524,19 +540,32 @@ function renderStats(stats) {
           tension: 0.3,
         }],
       },
-      options: _chartBaseOpts(),
+      options: eqOpts,
     });
   }
 
-  // --- PnL per trade bar chart ---
+  // --- PnL per trade bar chart (x-axis = ticker) ---
   const pnlSeries = (stats.pnl_series || []);
-  const pnlLabels = pnlSeries.map((_, i) => String(i + 1));
+  const pnlLabels = pnlSeries.map(p => p.symbol || "?");
   const pnlValues = pnlSeries.map(p => Number(p.pnl));
   const pnlColors = pnlSeries.map(p => (p.pnl >= 0 ? "rgba(34,197,94,0.75)" : "rgba(239,68,68,0.75)"));
+  const pnlOpts = _chartBaseOpts();
+  pnlOpts.plugins.tooltip.callbacks = {
+    title: items => {
+      if (!items.length) return "";
+      const p = pnlSeries[items[0].dataIndex] || {};
+      const d = toDateLabel(p.ts);
+      return (p.symbol || "?") + (p.side ? " · " + String(p.side).toUpperCase() : "") + (d ? " · " + d : "");
+    },
+    label: item => "P&L: " + fmtSignedUsd(item.parsed.y),
+  };
+  pnlOpts.scales.x.ticks.autoSkip = true;
+  pnlOpts.scales.x.ticks.maxTicksLimit = 24;
   if (_chartPnlBar) {
     _chartPnlBar.data.labels = pnlLabels;
     _chartPnlBar.data.datasets[0].data = pnlValues;
     _chartPnlBar.data.datasets[0].backgroundColor = pnlColors;
+    _chartPnlBar.options = pnlOpts;
     _chartPnlBar.update();
   } else {
     const ctx2 = document.getElementById("chart-pnl-per-trade").getContext("2d");
@@ -551,7 +580,7 @@ function renderStats(stats) {
           borderRadius: 2,
         }],
       },
-      options: _chartBaseOpts(),
+      options: pnlOpts,
     });
   }
 
@@ -907,14 +936,35 @@ async def _run() -> None:
         except Exception:
             log.exception("failed to derive privacy disp fields for closed trade row")
 
+    # ── Stats display window ─────────────────────────────────────────────────
+    # Filter + date-sort the in-memory closed_trades into the view we actually
+    # show: trades within [stats_start_date, stats_end_date] (end None ⇒ now)
+    # whose ticker is in stats_symbols (empty ⇒ all coins currently in the DB).
+    # This backs BOTH the analytics and the history grid, so they always agree.
+    def display_trades() -> list[dict]:
+        return filter_trades(
+            closed_trades,
+            start_date=cfg.stats_start_date,
+            end_date=cfg.stats_end_date,
+            symbols=cfg.stats_symbols,
+        )
+
+    if cfg.stats_start_date or cfg.stats_end_date or cfg.stats_symbols:
+        log.info(
+            "stats window — start=%s  end=%s  symbols=%s",
+            cfg.stats_start_date or "(none)",
+            cfg.stats_end_date or "(now)",
+            list(cfg.stats_symbols) or "(all)",
+        )
+
     # Cached trade stats — recomputed after each close, served in snapshot payload.
     # Stored as a mutable dict so inner closures can update it in-place.
-    stats_state: dict = compute_stats(closed_trades)
+    stats_state: dict = compute_stats(display_trades())
 
     def refresh_stats() -> None:
-        """Recompute trade stats from the in-memory closed_trades list."""
+        """Recompute trade stats from the filtered/date-sorted display view."""
         stats_state.clear()
-        stats_state.update(compute_stats(closed_trades))
+        stats_state.update(compute_stats(display_trades()))
 
     # ── Privacy anchor store: [source_id][market_id] → frozen Decimal entry price ──
     # Seeded at OPEN; cleared (after reading) at CLOSE.
@@ -1622,7 +1672,9 @@ async def _run() -> None:
             "recent_events": recent_events[:cfg.max_recent_events],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
             # UI payload is always capped; the full list is kept in-memory for stats.
-            "closed_trades": closed_trades[:cfg.max_closed_trades],
+            # Filtered + date-sorted to the configured display window so the grid
+            # matches the analytics (only existing coins, within the date range).
+            "closed_trades": display_trades()[:cfg.max_closed_trades],
             "stats": stats_state,
             "health": health.snapshot(),
         }

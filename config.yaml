@@ -44,6 +44,19 @@ settings:
   stats_full_history: true     # analytics computed over ALL closed trades, not just last-N
   open_orders_enabled: true    # show the resting/open-orders dashboard panel
 
+  # -- Stats display window -------------------------------------------------
+  # Scope which closed trades the dashboard shows WITHOUT importing full history.
+  # Dates are ISO ("2026-05-01" or "2026-05-01T00:00:00Z").
+  #   stats_start_date : only trades on/after this date are shown (null = no start).
+  #   stats_end_date   : null = up to now (current date/time). Date-only = end of day.
+  #   stats_symbols    : whitelist of tickers. Empty/omitted = every coin in the DB
+  #                      (today that's only the coins already on the dashboard,
+  #                      since no full-history import was done). Fill this list to
+  #                      lock the view to specific coins after any future import.
+  stats_start_date: "2026-06-01"   # last 4 days (today is 2026-06-04)
+  stats_end_date: null             # null = up to now
+  stats_symbols: []                # empty = all coins currently in the DB
+
   # -- Privacy (Hyperliquid display obfuscation) ----------------------------
   # Stops followers from fingerprinting your public on-chain wallet via the
   # alerts. Posture: "exact results, fuzzy fingerprint" -- PnL $, %, win-rate
