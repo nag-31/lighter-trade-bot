@@ -41,6 +41,19 @@ import websockets
 
 from .types import OpenOrder, Position, Trade
 
+# Imported here (not TYPE_CHECKING) so proxy_pool instances can be passed
+# directly without a forward-reference cast. proxy_pool.py has no import from
+# binance_client so there is no circular dependency.
+from .proxy_pool import ProxyPool  # noqa: E402
+
+
+class BinanceUnavailable(Exception):
+    """Raised when all proxies are exhausted or Binance is unreachable.
+
+    The caller must treat this as a transient error: log it, mark the
+    source down in the health registry, and continue with other sources.
+    """
+
 log = logging.getLogger(__name__)
 
 _REST_BASE       = "https://fapi.binance.com"
@@ -85,13 +98,15 @@ class BinanceClient:
         rest_base: str = _REST_BASE,
         ws_base: str = _WS_BASE,
         proxy_url: Optional[str] = None,
+        proxy_pool: "Optional[ProxyPool]" = None,
     ) -> None:
         self.source = source
         self._api_key    = api_key
         self._api_secret = api_secret.encode()   # bytes for hmac
         self._rest_base  = rest_base.rstrip("/")
         self._ws_base    = ws_base.rstrip("/")
-        self._proxy_url  = proxy_url   # e.g. "socks5h://host:1080" or None
+        self._proxy_url  = proxy_url   # single proxy fallback (legacy)
+        self._proxy_pool = proxy_pool  # rotating pool (preferred when set)
 
         # Market maps ---------------------------------------------------
         # _sym_to_id : "BTCUSDT" → int   (full Binance symbol)
@@ -112,16 +127,26 @@ class BinanceClient:
         self._closed:     bool = False
         self._listen_key: Optional[str] = None
 
-        # Async HTTP client — routes through proxy if configured
-        self._http = httpx.AsyncClient(
-            base_url=self._rest_base,
-            headers={"X-MBX-APIKEY": self._api_key},
-            timeout=10.0,
-            **({"proxy": proxy_url} if proxy_url else {}),
-        )
-
-        if proxy_url:
-            log.info("[%s] Binance REST will route via proxy %s", source, proxy_url)
+        # When a proxy_pool is set, individual requests build per-proxy
+        # clients in _request().  Otherwise use a shared persistent client
+        # (legacy behaviour: single optional proxy or direct).
+        if proxy_pool:
+            self._http = httpx.AsyncClient(
+                base_url=self._rest_base,
+                headers={"X-MBX-APIKEY": self._api_key},
+                timeout=10.0,
+            )
+            log.info("[%s] Binance client initialised with rotating proxy pool (%d proxies)",
+                     source, proxy_pool.n_total)
+        else:
+            self._http = httpx.AsyncClient(
+                base_url=self._rest_base,
+                headers={"X-MBX-APIKEY": self._api_key},
+                timeout=10.0,
+                **({"proxy": proxy_url} if proxy_url else {}),
+            )
+            if proxy_url:
+                log.info("[%s] Binance REST will route via proxy %s", source, proxy_url)
         log.info("[%s] Binance client initialized", source)
 
     # ------------------------------------------------------------------ #
@@ -134,6 +159,111 @@ class BinanceClient:
             await self._http.aclose()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Proxy-pool aware HTTP dispatcher                                     #
+    # ------------------------------------------------------------------ #
+
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Dispatch a single HTTP request, rotating through the proxy pool on failure.
+
+        When no pool is configured, falls back to the shared ``self._http``
+        client (which may itself have a static proxy configured).
+
+        On 451 (geo-block), timeout, or connection error with a pool:
+          - marks the used proxy dead
+          - tries the next working proxy
+          - up to ``min(pool_size, 5)`` attempts total
+
+        Raises
+        ------
+        BinanceUnavailable
+            When all pool proxies fail or the pool has no working proxy.
+        httpx.HTTPError / other
+            Propagated unchanged when no pool is configured (callers handle
+            these with try/except as before).
+        """
+        pool = self._proxy_pool
+
+        # ── No pool: use the shared persistent client ───────────────────
+        if pool is None:
+            url = self._rest_base + path
+            return await self._http.request(method, url, **kwargs)
+
+        # ── Proxy-pool path ─────────────────────────────────────────────
+        max_attempts = min(pool.n_total, 5)
+        last_error   = "no working proxy"
+
+        for attempt in range(max_attempts):
+            proxy_url = await pool.get_working()
+            if proxy_url is None:
+                raise BinanceUnavailable(
+                    f"[{self.source}] Binance proxy pool exhausted — {last_error}"
+                )
+
+            t0 = time.monotonic()
+            try:
+                # Build a short-lived per-proxy client for clean rotation.
+                # httpx 0.28: proxy= (singular); older: proxies= (dict).
+                major, minor = (int(x) for x in httpx.__version__.split(".")[:2])
+                proxy_kwarg: dict
+                if (major, minor) >= (0, 28):
+                    proxy_kwarg = {"proxy": proxy_url}
+                else:
+                    proxy_kwarg = {"proxies": {"all://": proxy_url}}  # type: ignore[dict-item]
+
+                async with httpx.AsyncClient(
+                    base_url=self._rest_base,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                    timeout=kwargs.pop("timeout", 10.0),
+                    **proxy_kwarg,
+                ) as client:
+                    response = await client.request(method, path, **kwargs)
+
+                # Geo-block → rotate
+                if response.status_code == 451:
+                    last_error = f"HTTP 451 geo-block via {proxy_url}"
+                    log.warning("[%s] Binance 451 via %s — rotating proxy", self.source, proxy_url)
+                    pool.mark_dead(proxy_url, "HTTP 451 geo-block")
+                    continue
+
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                pool.mark_ok(proxy_url, latency_ms=latency_ms)
+                return response
+
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ProxyError) as exc:
+                last_error = f"{type(exc).__name__}: {exc} via {proxy_url}"
+                log.warning("[%s] Binance proxy %s failed (%s: %s) — rotating",
+                            self.source, proxy_url, type(exc).__name__, exc)
+                pool.mark_dead(proxy_url, str(exc))
+                # Remove timeout kwarg already popped above from successive attempts
+                kwargs.pop("timeout", None)
+                continue
+
+        raise BinanceUnavailable(
+            f"[{self.source}] Binance unavailable after {max_attempts} proxy attempt(s) — {last_error}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Ping / liveness check                                                #
+    # ------------------------------------------------------------------ #
+
+    async def ping(self) -> bool:
+        """Lightweight liveness probe against the Binance ping endpoint.
+
+        Routes through the proxy pool when one is configured.  Used at
+        bootstrap to decide whether the Binance source is reachable at all.
+
+        Returns True on HTTP 200, False on any error (including BinanceUnavailable).
+        """
+        try:
+            r = await self._request("GET", "/fapi/v1/ping")
+            return r.status_code == 200
+        except BinanceUnavailable:
+            return False
+        except Exception as exc:
+            log.debug("[%s] Binance ping failed: %s", self.source, exc)
+            return False
 
     # ------------------------------------------------------------------ #
     # HMAC-SHA256 signing                                                  #
@@ -156,9 +286,12 @@ class BinanceClient:
         if signed:
             p = self._sign(p)
         try:
-            r = await self._http.get(path, params=p)
+            r = await self._request("GET", path, params=p)
             r.raise_for_status()
             return r.json()
+        except BinanceUnavailable:
+            log.error("[%s] Binance GET %s — BinanceUnavailable (all proxies exhausted)", self.source, path)
+            return None
         except httpx.HTTPStatusError as e:
             log.error(
                 "[%s] Binance GET %s → HTTP %d: %s",
@@ -172,9 +305,12 @@ class BinanceClient:
     async def _post(self, path: str, params: dict | None = None):
         p = self._sign(dict(params or {}))
         try:
-            r = await self._http.post(path, params=p)
+            r = await self._request("POST", path, params=p)
             r.raise_for_status()
             return r.json()
+        except BinanceUnavailable:
+            log.error("[%s] Binance POST %s — BinanceUnavailable (all proxies exhausted)", self.source, path)
+            return None
         except httpx.HTTPStatusError as e:
             log.error(
                 "[%s] Binance POST %s → HTTP %d: %s",
@@ -188,9 +324,12 @@ class BinanceClient:
     async def _put(self, path: str, params: dict | None = None):
         p = self._sign(dict(params or {}))
         try:
-            r = await self._http.put(path, params=p)
+            r = await self._request("PUT", path, params=p)
             r.raise_for_status()
             return r.json()
+        except BinanceUnavailable:
+            log.error("[%s] Binance PUT %s — BinanceUnavailable (all proxies exhausted)", self.source, path)
+            return None
         except httpx.HTTPStatusError as e:
             log.error(
                 "[%s] Binance PUT %s → HTTP %d: %s",

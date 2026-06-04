@@ -490,3 +490,50 @@ class TestFormatStatsSummary:
         s = compute_stats(TRADES_6)
         msg = format_stats_summary(s)
         assert "drawdown" in msg.lower() or "Drawdown" in msg
+
+
+# ---------------------------------------------------------------------------
+# TASK 5 — stats are closed-trades-only: explicit pnl=None exclusion assertion
+# ---------------------------------------------------------------------------
+
+class TestClosedTradesOnly:
+    """Verify that records with pnl=None (open/unrealized positions) are fully
+    excluded from every PnL aggregate.  Stats MUST reflect realized closed
+    trades only; no unrealized/open-position data may pollute them.
+    """
+
+    def test_none_pnl_excluded_from_n_trades(self):
+        """n_trades must only count records that have a numeric pnl."""
+        trades = [
+            _rec(pnl="200.0", is_win=1),    # closed trade — counted
+            _rec(pnl=None,    is_win=0),     # open/unrealized — excluded
+            _rec(pnl=None,    is_win=0),     # open/unrealized — excluded
+        ]
+        s = compute_stats(trades)
+        assert s["n_trades"] == 1, "open-position rows (pnl=None) must not count as trades"
+
+    def test_none_pnl_excluded_from_win_rate(self):
+        """win_rate must be computed over closed trades only."""
+        trades = [
+            _rec(pnl="100.0", is_win=1),    # win
+            _rec(pnl="100.0", is_win=1),    # win
+            _rec(pnl=None,    is_win=0),     # open — excluded; must not lower win_rate
+        ]
+        s = compute_stats(trades)
+        # 2 wins / 2 closed trades = 100% — not 2/3 = 66%
+        assert s["win_rate"] == pytest.approx(100.0), (
+            "pnl=None rows must not inflate the denominator of win_rate"
+        )
+
+    def test_none_pnl_excluded_from_total_pnl(self):
+        """total_pnl must be unaffected by pnl=None rows."""
+        trades = [
+            _rec(pnl="500.0",  is_win=1),   # closed +500
+            _rec(pnl="-200.0", is_win=0),   # closed -200
+            _rec(pnl=None,     is_win=0),   # open — must not contribute anything
+        ]
+        s = compute_stats(trades)
+        assert s["total_pnl"] == pytest.approx(300.0), (
+            "pnl=None rows must not affect total_pnl"
+        )
+        assert s["n_trades"] == 2

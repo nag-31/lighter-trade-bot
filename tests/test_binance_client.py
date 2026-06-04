@@ -1,14 +1,19 @@
 """Tests for BinanceClient parsing — no network calls."""
 
+import asyncio
 import hashlib
 import hmac
 import time
 import urllib.parse
 from decimal import Decimal
+from typing import Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
-from src.binance_client import BinanceClient, _to_decimal
+from src.binance_client import BinanceClient, BinanceUnavailable, _to_decimal
+from src.proxy_pool import ProxyPool
 
 
 def make_client() -> BinanceClient:
@@ -223,3 +228,264 @@ class TestMarketId:
         c = make_client()
         c._market_id("LINKUSDT")
         assert "LINK" in c._market_symbol(c._market_id("LINKUSDT"))
+
+
+# ---------------------------------------------------------------------------
+# Helpers for proxy-pool tests
+# ---------------------------------------------------------------------------
+
+def _make_mock_pool(
+    *,
+    working_url: Optional[str] = "socks5://proxy:1080",
+    n_total: int = 3,
+    n_alive: int = 1,
+) -> MagicMock:
+    """Build a MagicMock that satisfies the ProxyPool interface."""
+    pool = MagicMock(spec=ProxyPool)
+    pool.n_total = n_total
+    pool.n_alive = n_alive
+
+    # get_working returns working_url on first call; subsequent calls exhausted
+    if working_url is not None:
+        pool.get_working = AsyncMock(return_value=working_url)
+    else:
+        pool.get_working = AsyncMock(return_value=None)
+
+    pool.mark_ok = MagicMock()
+    pool.mark_dead = MagicMock()
+    return pool
+
+
+def _make_client_with_pool(pool: MagicMock) -> BinanceClient:
+    c = BinanceClient(
+        api_key="k",
+        api_secret="s",
+        source="test",
+        rest_base="https://fapi.binance.com",
+        proxy_pool=pool,
+    )
+    c._sym_to_id  = {"BTCUSDT": 0}
+    c._id_to_disp = {0: "BTC"}
+    c._id_to_full = {0: "BTCUSDT"}
+    return c
+
+
+def _mock_response(status_code: int = 200, json_data: dict | None = None) -> MagicMock:
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value=json_data or {})
+    resp.text = ""
+    resp.raise_for_status = MagicMock()
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            f"HTTP {status_code}",
+            request=MagicMock(),
+            response=resp,
+        )
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# BinanceUnavailable exception
+# ---------------------------------------------------------------------------
+
+class TestBinanceUnavailable:
+    def test_is_exception(self):
+        exc = BinanceUnavailable("test")
+        assert isinstance(exc, Exception)
+
+    def test_message_preserved(self):
+        exc = BinanceUnavailable("proxy pool exhausted")
+        assert "proxy pool exhausted" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# _request — proxy pool path
+# ---------------------------------------------------------------------------
+
+class TestRequestWithPool:
+    """Tests for BinanceClient._request when a ProxyPool is configured.
+
+    We patch httpx.AsyncClient to avoid any real network activity.
+    """
+
+    def test_success_marks_proxy_ok(self):
+        pool = _make_mock_pool(working_url="socks5://proxy:1080")
+        c = _make_client_with_pool(pool)
+
+        ok_resp = _mock_response(200, {})
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(return_value=ok_resp)
+                result = await c._request("GET", "/fapi/v1/ping")
+                return result
+
+        result = asyncio.run(_run())
+        assert result.status_code == 200
+        pool.mark_ok.assert_called_once()
+
+    def test_451_marks_proxy_dead_and_raises_unavailable(self):
+        """When every proxy returns 451, BinanceUnavailable is raised."""
+        pool = _make_mock_pool(working_url="socks5://proxy:1080", n_total=1)
+        # make get_working always return the same proxy (pool never exhausts in get_working)
+        # but we cap attempts at min(n_total, 5) = 1
+        c = _make_client_with_pool(pool)
+
+        geo_resp = _mock_response(451)
+        geo_resp.raise_for_status = MagicMock()  # don't raise on 451 — client checks status manually
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(return_value=geo_resp)
+                await c._request("GET", "/fapi/v1/ping")
+
+        with pytest.raises(BinanceUnavailable):
+            asyncio.run(_run())
+        pool.mark_dead.assert_called()
+
+    def test_timeout_rotates_proxy_and_raises_unavailable(self):
+        pool = _make_mock_pool(working_url="socks5://proxy:1080", n_total=1)
+        c = _make_client_with_pool(pool)
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+                await c._request("GET", "/fapi/v1/exchangeInfo")
+
+        with pytest.raises(BinanceUnavailable):
+            asyncio.run(_run())
+        pool.mark_dead.assert_called()
+
+    def test_connect_error_marks_dead_raises_unavailable(self):
+        pool = _make_mock_pool(working_url="socks5://proxy:1080", n_total=1)
+        c = _make_client_with_pool(pool)
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(side_effect=httpx.ConnectError("refused"))
+                await c._request("GET", "/fapi/v1/exchangeInfo")
+
+        with pytest.raises(BinanceUnavailable):
+            asyncio.run(_run())
+        pool.mark_dead.assert_called()
+
+    def test_no_working_proxy_raises_unavailable_immediately(self):
+        pool = _make_mock_pool(working_url=None)  # pool always returns None
+        c = _make_client_with_pool(pool)
+
+        async def _run():
+            with patch("httpx.AsyncClient"):
+                await c._request("GET", "/fapi/v1/ping")
+
+        with pytest.raises(BinanceUnavailable):
+            asyncio.run(_run())
+
+    def test_second_proxy_succeeds_after_first_fails(self):
+        """Rotation: first proxy times out, second proxy works."""
+        pool = MagicMock(spec=ProxyPool)
+        pool.n_total = 2
+        pool.n_alive = 2
+        # get_working returns different proxies on successive calls
+        pool.get_working = AsyncMock(side_effect=[
+            "socks5://bad:1080",
+            "socks5://good:1080",
+            None,  # safety sentinel
+        ])
+        pool.mark_ok = MagicMock()
+        pool.mark_dead = MagicMock()
+
+        c = _make_client_with_pool(pool)
+
+        ok_resp = _mock_response(200, {})
+
+        async def _run():
+            call_count = 0
+
+            async def _side_effect(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise httpx.TimeoutException("slow")
+                return ok_resp
+
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(side_effect=_side_effect)
+                result = await c._request("GET", "/fapi/v1/ping")
+                return result
+
+        result = asyncio.run(_run())
+        assert result.status_code == 200
+        # First proxy was marked dead, second was marked ok
+        pool.mark_dead.assert_called_once()
+        pool.mark_ok.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _request — no-pool (legacy) path
+# ---------------------------------------------------------------------------
+
+class TestRequestNoPool:
+    """When no proxy_pool is set, _request delegates to self._http directly."""
+
+    def test_no_pool_uses_shared_client(self):
+        c = make_client()  # no pool
+
+        ok_resp = _mock_response(200, {})
+
+        async def _run():
+            c._http.request = AsyncMock(return_value=ok_resp)
+            return await c._request("GET", "/fapi/v1/ping")
+
+        result = asyncio.run(_run())
+        assert result.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# ping()
+# ---------------------------------------------------------------------------
+
+class TestPing:
+    def test_ping_returns_true_on_200(self):
+        pool = _make_mock_pool(working_url="socks5://p:1080")
+        c = _make_client_with_pool(pool)
+
+        ok_resp = _mock_response(200, {})
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(return_value=ok_resp)
+                return await c.ping()
+
+        assert asyncio.run(_run()) is True
+
+    def test_ping_returns_false_when_unavailable(self):
+        pool = _make_mock_pool(working_url=None)
+        c = _make_client_with_pool(pool)
+
+        async def _run():
+            with patch("httpx.AsyncClient"):
+                return await c.ping()
+
+        assert asyncio.run(_run()) is False
+
+    def test_ping_returns_false_on_non_200(self):
+        pool = _make_mock_pool(working_url="socks5://p:1080", n_total=1)
+        c = _make_client_with_pool(pool)
+
+        geo_resp = _mock_response(451)
+        geo_resp.raise_for_status = MagicMock()
+
+        async def _run():
+            with patch("httpx.AsyncClient") as MockClient:
+                ctx = MockClient.return_value.__aenter__.return_value
+                ctx.request = AsyncMock(return_value=geo_resp)
+                return await c.ping()
+
+        assert asyncio.run(_run()) is False

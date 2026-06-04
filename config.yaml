@@ -1,86 +1,115 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# SETTINGS — tweak these without touching any Python code
+# =============================================================================
+# SETTINGS -- tweak these without touching any Python code
 # Restart the bot after any change: sudo systemctl restart lighterbot
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 settings:
 
-  # ── Position size filter ─────────────────────────────────────────────────
+  # -- Position size filter -------------------------------------------------
   # Minimum position notional (USD) to fire a Telegram alert.
   # Per-source overrides in the sources list below take priority.
   # Set to 0 to alert on every fill regardless of size.
   default_min_notional_usd: 900
 
-  # ── Alert types ──────────────────────────────────────────────────────────
+  # -- Alert types ----------------------------------------------------------
   # Toggle which events send a Telegram message.
   # The dashboard always shows all events regardless of these flags.
   alert_on_open: true          # new position opened
-  alert_on_close: true         # position fully closed  (always fires — position is gone)
+  alert_on_close: true         # position fully closed  (always fires)
   alert_on_size_change: true   # same-side adds to an existing position (batched)
   alert_on_reduce: true        # partial closes / reduce-only fills (batched)
 
-  # ── Batching window ──────────────────────────────────────────────────────
+  # -- Batching window ------------------------------------------------------
   # SIZE_CHANGE and REDUCE fills that arrive within this window are merged into
   # a single alert showing total notional + fill count.
   # Lower = more real-time but noisier. Higher = cleaner but delayed.
   aggregate_window_seconds: 60
 
-  # ── Timing ───────────────────────────────────────────────────────────────
+  # -- Timing ---------------------------------------------------------------
   # How often the REST safety-net polls for any fills the WebSocket missed.
   rest_poll_seconds: 60
 
   # How often positions are re-synced from the exchange API to catch silent closes.
   reconciler_interval_seconds: 30
 
-  # ── Duplicate suppression ────────────────────────────────────────────────
+  # -- Duplicate suppression ------------------------------------------------
   # Identical Telegram messages within this window are silently dropped.
   # Protects against double-alerts when two bot instances briefly overlap.
   tg_dedup_window_seconds: 90
 
-  # ── Dashboard ────────────────────────────────────────────────────────────
+  # -- Dashboard ------------------------------------------------------------
   dashboard_port: 8080
   max_recent_events: 200       # rows visible in the browser event table
   max_closed_trades: 200       # closed trades shown in the UI history grid
   stats_full_history: true     # analytics computed over ALL closed trades, not just last-N
   open_orders_enabled: true    # show the resting/open-orders dashboard panel
 
-  # ── Privacy (Hyperliquid display obfuscation) ────────────────────────────
+  # -- Privacy (Hyperliquid display obfuscation) ----------------------------
   # Stops followers from fingerprinting your public on-chain wallet via the
-  # alerts. Posture: "exact results, fuzzy fingerprint" — PnL $, %, win-rate
+  # alerts. Posture: "exact results, fuzzy fingerprint" -- PnL $, %, win-rate
   # and win/loss stay EXACT and honest; only price/size/notional/timestamps
-  # are fuzzed. HL-only — Lighter is never touched.
+  # are fuzzed. HL-only -- Lighter is never touched.
   # Flip privacy_enabled to false to instantly show 100% real values again.
-  # NOTE: the secret salt is NOT here — set PRIVACY_SECRET_KEY in .env.
+  # NOTE: the secret salt is NOT here -- set PRIVACY_SECRET_KEY in .env.
   privacy_enabled: true
-  privacy_mag: 0.003               # price jitter ±0.3% (must be 0 < mag < 0.05)
-  privacy_entry_quantum_pct: 0.005 # coarse seed bucket (0.5% of price) — keeps a
-                                   # scaled-into position looking identical open→close
+  privacy_mag: 0.003               # price jitter +-0.3% (must be 0 < mag < 0.05)
+  privacy_entry_quantum_pct: 0.005 # coarse seed bucket (0.5% of price)
   privacy_size_sigfigs: 2          # round displayed size to N significant figures
   privacy_notional_sigfigs: 2      # round displayed notional to N significant figures
-  privacy_time_bucket: relative    # exact | hour | relative  (timing is the #1 on-chain join key)
-  privacy_disclose_footnote: true  # append "prices approx · PnL exact" to HL alerts/cards
+  privacy_time_bucket: relative    # exact | hour | relative
+  privacy_disclose_footnote: true  # append "prices approx * PnL exact" to HL alerts/cards
+
+  # -- Binance proxy pool ---------------------------------------------------
+  # Rotating proxy list used to bypass Binance HTTP 451 geo-blocks from this
+  # Azure region.  The bot tries each proxy in round-robin order, marks failing
+  # ones dead for 5 minutes, and degrades gracefully when all are dead (Binance
+  # source goes DOWN in /health; HL/Lighter keep running unaffected).
+  #
+  # IMPORTANT: free public proxies die fast -- refresh this list regularly.
+  # US-based proxies will NOT bypass the Binance.com US geo-block; use
+  # Singapore/EU/non-US proxies.  A paid SOCKS5 service is far more reliable.
+  #
+  # Used ONLY for reading positions/trades -- the bot never places orders.
+  # The Binance source below (sources section) must be uncommented to use them.
+  binance_proxy_test_url: "https://fapi.binance.com/fapi/v1/ping"
+  binance_proxies:
+    - socks5://144.31.222.205:1080
+    - socks4://45.89.111.139:1081
+    - socks4://171.248.219.6:1080
+    - socks4://67.201.39.14:4145
+    - socks4://68.71.247.130:4145
+    - socks4://68.183.52.128:9116
+    - socks4://184.182.240.211:4145
+    - http://65.108.203.35:18080
+    - socks4://192.111.137.37:18762
+    - socks4://72.49.49.11:31034
+    - socks4://194.58.37.234:65200
+    - socks4://116.100.218.33:1080
+    - socks4://117.175.168.195:1080
+    - http://195.138.235.230:8080
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SOURCES — one entry per tracked pool / wallet / account
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# SOURCES -- one entry per tracked pool / wallet / account
+# =============================================================================
 #
 # Supported types:
-#   lighter     → pool_id required (public pool URL shown in alerts)
-#   hyperliquid → wallet address loaded from HL_ADDRESS env var (never put it here)
-#   binance     → credentials loaded from BINANCE_API_KEY + BINANCE_API_SECRET env vars
-#                 (one-way / BOTH mode only; hedge mode → source disabled with clear error)
+#   lighter     -> pool_id required (public pool URL shown in alerts)
+#   hyperliquid -> wallet address loaded from HL_ADDRESS env var (never put it here)
+#   binance     -> credentials loaded from BINANCE_API_KEY + BINANCE_API_SECRET env vars
+#                  (one-way / BOTH mode only; hedge mode -> source disabled with clear error)
+#                  Geo-block bypass: set binance_proxies in settings above.
 #
 # All source types share:
-#   name              — label shown on dashboard and in Telegram alerts
-#   min_notional_usd  — per-source override (default: settings.default_min_notional_usd)
-#   footer_url        — optional public URL appended to alerts (HL/Binance only)
+#   name              -- label shown on dashboard and in Telegram alerts
+#   min_notional_usd  -- per-source override (default: settings.default_min_notional_usd)
+#   footer_url        -- optional public URL appended to alerts (HL/Binance only)
 #
 # Security rules (enforced in code):
-#   - HL wallet address  → .env only (HL_ADDRESS);                     never here
-#   - Binance API creds  → .env only (BINANCE_API_KEY / _SECRET);      never here
-#   - Lighter pool URL   → safe to show (it's a public URL)
-#   - footer_url         → only put a public website here, NOT an account URL
+#   - HL wallet address  -> .env only (HL_ADDRESS);                    never here
+#   - Binance API creds  -> .env only (BINANCE_API_KEY / _SECRET);     never here
+#   - Lighter pool URL   -> safe to show (it's a public URL)
+#   - footer_url         -> only put a public website here, NOT an account URL
 
 sources:
   - type: lighter
@@ -92,10 +121,11 @@ sources:
     # address loaded from HL_ADDRESS env var
     min_notional_usd: 900
     exclude_symbols: ["FARTCOIN"]
-    footer_url: "https://enkapital.xyz"   # ← your public website e.g. https://enkapital.com
+    footer_url: "https://enkapital.xyz"
 
-  # Binance disabled — source is HTTP 451 geo-blocked from the current region.
-  # Re-enable (uncomment) once the Singapore VPS / SOCKS5 proxy is in place.
+  # Binance disabled -- source is HTTP 451 geo-blocked from the current region.
+  # Re-enable (uncomment) once binance_proxies above are configured and working.
+  # Credentials go in .env: BINANCE_API_KEY + BINANCE_API_SECRET (read-only).
   # - type: binance
   #   name: "Binance"
   #   min_notional_usd: 900

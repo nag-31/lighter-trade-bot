@@ -32,6 +32,7 @@ from .binance_client import BinanceClient
 from .hyperliquid_client import HyperliquidClient
 from .lighter_client import LighterClient
 from .position_tracker import PositionTracker
+from .proxy_pool import ProxyPool
 from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,18 @@ class BotSettings:
     # Stats: compute over ALL closed trades, not just the last max_closed_trades
     stats_full_history: bool = True
 
+    # ── Binance proxy pool ────────────────────────────────────────────────────
+    # List of proxy URLs used to bypass Binance geo-blocks.  A tuple (not list)
+    # because BotSettings is frozen.  Parsed from the YAML list at load time.
+    # Example YAML:
+    #   binance_proxies:
+    #     - socks5://1.2.3.4:1080
+    #     - http://5.6.7.8:3128
+    # Free public proxies die fast — refresh the list regularly.
+    # US-based proxies will NOT bypass the Binance.com US ban.
+    binance_proxies: tuple = ()
+    binance_proxy_test_url: str = "https://fapi.binance.com/fapi/v1/ping"
+
 
 def load_settings(path: str | Path = "config.yaml") -> BotSettings:
     """Read the optional 'settings:' block from config.yaml.
@@ -142,6 +155,15 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         )
         privacy_secret = "lighterbot-dev-privacy-salt-CHANGE-ME"
 
+    # Parse binance_proxies: accept a YAML list of strings
+    _raw_proxies = raw.get("binance_proxies") or []
+    if not isinstance(_raw_proxies, list):
+        log.warning("settings.binance_proxies must be a list — ignoring")
+        _raw_proxies = []
+    _binance_proxies: tuple = tuple(
+        str(u).strip() for u in _raw_proxies if str(u).strip()
+    )
+
     settings = BotSettings(
         default_min_notional_usd    = _decimal("default_min_notional_usd", DEFAULT_MIN_NOTIONAL),
         alert_on_open               = _bool("alert_on_open",        True),
@@ -165,6 +187,11 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         privacy_secret_key          = privacy_secret,
         open_orders_enabled         = _bool("open_orders_enabled",        True),
         stats_full_history          = _bool("stats_full_history",         True),
+        binance_proxies             = _binance_proxies,
+        binance_proxy_test_url      = _str(
+            "binance_proxy_test_url",
+            "https://fapi.binance.com/fapi/v1/ping",
+        ),
     )
     log.info(
         "settings loaded — min_notional=$%s  window=%ds  poll=%ds  dedup=%ds  port=%d",
@@ -340,7 +367,24 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             )
             return None
         footer_url = str(raw.get("footer_url", "")).strip()
-        client = BinanceClient(api_key, api_secret, source=name, proxy_url=_proxy_url())
+
+        # Prefer the rotating proxy pool when binance_proxies is configured.
+        # Fall back to a single SOCKS_PROXY_URL when no list is present.
+        pool: Optional[ProxyPool] = None
+        if settings is not None and settings.binance_proxies:
+            pool = ProxyPool(
+                list(settings.binance_proxies),
+                settings.binance_proxy_test_url,
+            )
+            log.info(
+                "binance source '%s': using rotating proxy pool (%d proxies)",
+                name, pool.n_total,
+            )
+            client = BinanceClient(api_key, api_secret, source=name, proxy_pool=pool)
+        else:
+            # Legacy: single optional env-var proxy
+            client = BinanceClient(api_key, api_secret, source=name, proxy_url=_proxy_url())
+
         return Source(
             id=f"binance:{name.lower().replace(' ', '_')}",
             name=name,

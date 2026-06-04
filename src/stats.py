@@ -34,8 +34,12 @@ def compute_stats(trades: list[dict]) -> dict:
     dict with the canonical analytics payload shape (JSON-serializable).
     """
     # Filter to records with a usable pnl — these count toward all pnl aggregates.
-    # Records without pnl still appear in pnl_series / equity_curve as holes,
-    # but we simply skip them for numeric aggregates.
+    # Only realized/closed-trade rows have a non-None pnl; open/unrealized positions
+    # are NEVER passed into this function (callers use load_closed_trades from db.py).
+    # This explicit guard ensures that any record whose pnl is None (e.g. a partially
+    # recorded row or future open-position data) is excluded from ALL numeric aggregates
+    # (n_trades, win_rate, total_pnl, etc.).  The equity_curve and pnl_series are
+    # therefore strictly closed-trades-only.
     pnl_records = []
     for t in trades:
         v = _f(t.get("pnl"))

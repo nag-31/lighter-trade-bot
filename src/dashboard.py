@@ -43,6 +43,7 @@ from .db import (
 from .display_transform import PrivacyParams, disp_notional, disp_price, disp_size, disp_time, disp_view, footnote, price_factor
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
+from .health import HealthRegistry
 from .pnl_card import calculate_pnl, generate_pnl_card, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
 from .stats import compute_stats, format_stats_summary
@@ -178,6 +179,11 @@ INDEX_HTML = """<!doctype html>
   .chart-card-title { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #6b7280; margin-bottom: 10px; }
   .chart-wrap { position: relative; height: 240px; }
   .no-trades-msg { color: #4b5563; font-style: italic; font-size: 12px; padding: 8px 0; }
+  /* ---- source-down banner ---- */
+  #health-banner { display:none; background:#3b0f0f; border:1px solid #7f1d1d; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-size:12px; color:#fca5a5; }
+  #health-banner a { color:#fca5a5; text-decoration:underline; margin-left:8px; }
+  #health-banner .hb-issues { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:6px; }
+  #health-banner .hb-issue  { color:#f87171; }
   /* ---- open orders panel ---- */
   .oo-header { display: flex; align-items: center; justify-content: space-between; margin: 0 0 12px; }
   .oo-header h2 { margin: 0; }
@@ -196,6 +202,10 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <h1>Trade tracker</h1>
+<div id="health-banner">
+  <strong>&#x26A0; System issues detected</strong><a href="/health">details &rarr;</a>
+  <div class="hb-issues" id="hb-issues"></div>
+</div>
 <div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="sources">no sources</span> &middot; <span id="last">no events yet</span></div>
 <div class="grid">
   <div class="col-left">
@@ -711,6 +721,18 @@ document.getElementById("send-stats-btn").addEventListener("click", function() {
     });
 });
 
+function renderHealth(health) {
+  const banner = document.getElementById("health-banner");
+  const issuesEl = document.getElementById("hb-issues");
+  if (!health || health.ok) { banner.style.display = "none"; return; }
+  const bad = (health.components || []).filter(c => c.status === "down" || c.status === "degraded");
+  if (!bad.length) { banner.style.display = "none"; return; }
+  issuesEl.innerHTML = bad.map(c => {
+    const label = c.status === "down" ? "not working" : "degraded";
+    return `<span class="hb-issue">&#x26A0; ${esc(c.component)} ${esc(label)}</span>`;
+  }).join("");
+  banner.style.display = "";
+}
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => setStatus(true, "connected");
@@ -726,6 +748,7 @@ function connect() {
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
       if (data.stats) renderStats(data.stats);
+      if (data.health) renderHealth(data.health);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
@@ -737,6 +760,7 @@ function connect() {
       renderAlerts(data.tg_alerts);
       renderClosedTrades(data.closed_trades);
       if (data.stats) renderStats(data.stats);
+      if (data.health) renderHealth(data.health);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
     }
   };
@@ -788,6 +812,10 @@ async def run() -> None:
 async def _run() -> None:
     cfg = load_settings()
     hub = Hub()
+
+    # ── Health / status registry ──────────────────────────────────────────────
+    health = HealthRegistry(started_at_iso=datetime.now(timezone.utc).isoformat())
+
     sources: list[Source] = load_sources(settings=cfg)
     by_id: dict[str, Source] = {s.id: s for s in sources}
 
@@ -805,6 +833,7 @@ async def _run() -> None:
 
     log.info("initialising database…")
     await init_db(DB_PATH)
+    health.mark_up("database")
 
     # Backfill closed_trades from events (idempotent — no-op if already populated)
     backfill_count = await backfill_closed_trades_from_events(DB_PATH)
@@ -913,31 +942,90 @@ async def _run() -> None:
 
     # Bootstrap every source: markets, seed positions, anchor last_trade_id so
     # we don't replay history.
+    #
+    # Each source is wrapped in an individual try/except so a Binance failure
+    # (e.g. all proxies dead) never prevents HL/Lighter from starting.
+    # Failed sources are marked down in health and omitted from the active loop.
+    _active_sources: list[Source] = []
     for s in sources:
-        log.info("[%s] bootstrapping markets…", s.name)
-        await s.client.bootstrap_markets()
-        init_pos = await s.client.current_positions()
-        init_pos = {mid: p for mid, p in init_pos.items() if not s.is_excluded(p.market_symbol)}
-        s.tracker.seed(init_pos)
-        _dash_positions[s.id] = init_pos
-        log.info("[%s] seeded with %d positions", s.name, len(init_pos))
-        # Arm every already-open position so the reconciler never fires a SL/TP alert
-        # for positions that existed before this bot session started.
-        for mid in init_pos:
-            _sl_tp_alerted.add((s.id, mid))
-        # Seed privacy anchors for pre-existing HL positions using current avg_entry_price
-        if s.is_hyperliquid and init_pos:
-            _privacy_anchor.setdefault(s.id, {})
-            for mid, pos in init_pos.items():
-                if mid not in _privacy_anchor[s.id]:
-                    _privacy_anchor[s.id][mid] = pos.avg_entry_price
-        latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
-        if latest:
-            s.last_trade_id = latest[-1].trade_id
-            log.info("[%s] anchored last_trade_id=%d", s.name, s.last_trade_id)
-        # Tell HL client the anchor so WS snapshot is filtered correctly
-        if hasattr(s.client, "set_anchor"):
-            s.client.set_anchor(s.last_trade_id)
+        try:
+            # Binance: quick ping through the proxy pool before full bootstrap.
+            # If the pool has no working proxy we skip the source immediately
+            # rather than letting every subsequent REST call time out.
+            if hasattr(s.client, "ping") and hasattr(s.client, "_proxy_pool"):
+                pool = s.client._proxy_pool
+                if pool is not None:
+                    # Update proxy-pool health status
+                    n_alive = pool.n_alive
+                    n_total = pool.n_total
+                    if n_total:
+                        pool_status = "up" if n_alive > 0 else "down"
+                        health.set(
+                            "binance_proxies",
+                            pool_status,
+                            detail=f"{n_alive}/{n_total} alive",
+                        )
+                    reachable = await s.client.ping()
+                    if not reachable:
+                        # Re-check after ping attempt
+                        n_alive = pool.n_alive
+                        health.set(
+                            "binance_proxies",
+                            "down" if n_alive == 0 else "degraded",
+                            detail=f"{n_alive}/{n_total} alive after ping",
+                        )
+                        health.mark_down(
+                            f"source:{s.name}",
+                            "no working proxy / Binance unreachable at bootstrap",
+                        )
+                        log.warning(
+                            "[%s] Binance unreachable at bootstrap (all proxies dead?) — "
+                            "skipping source; HL/Lighter unaffected",
+                            s.name,
+                        )
+                        continue
+
+            log.info("[%s] bootstrapping markets…", s.name)
+            await s.client.bootstrap_markets()
+            init_pos = await s.client.current_positions()
+            init_pos = {mid: p for mid, p in init_pos.items() if not s.is_excluded(p.market_symbol)}
+            s.tracker.seed(init_pos)
+            _dash_positions[s.id] = init_pos
+            log.info("[%s] seeded with %d positions", s.name, len(init_pos))
+            # Arm every already-open position so the reconciler never fires a SL/TP alert
+            # for positions that existed before this bot session started.
+            for mid in init_pos:
+                _sl_tp_alerted.add((s.id, mid))
+            # Seed privacy anchors for pre-existing HL positions using current avg_entry_price
+            if s.is_hyperliquid and init_pos:
+                _privacy_anchor.setdefault(s.id, {})
+                for mid, pos in init_pos.items():
+                    if mid not in _privacy_anchor[s.id]:
+                        _privacy_anchor[s.id][mid] = pos.avg_entry_price
+            latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
+            if latest:
+                s.last_trade_id = latest[-1].trade_id
+                log.info("[%s] anchored last_trade_id=%d", s.name, s.last_trade_id)
+            # Tell HL client the anchor so WS snapshot is filtered correctly
+            if hasattr(s.client, "set_anchor"):
+                s.client.set_anchor(s.last_trade_id)
+            health.mark_up(f"source:{s.name}")
+            _active_sources.append(s)
+
+        except Exception as _bootstrap_exc:
+            log.error(
+                "[%s] bootstrap failed — source skipped; bot continues with remaining sources. "
+                "Error: %s",
+                s.name,
+                _bootstrap_exc,
+                exc_info=True,
+            )
+            health.mark_down(f"source:{s.name}", str(_bootstrap_exc))
+
+    # Replace the sources list with only those that bootstrapped successfully.
+    # HL/Lighter sources that already appended to _active_sources are unaffected.
+    sources = _active_sources
+    by_id   = {s.id: s for s in sources}
 
     def _anchor(src: "Source", market_id: int, fallback_entry: Decimal) -> Decimal:
         """Return the frozen open-time anchor entry for (src, market_id).
@@ -1017,8 +1105,12 @@ async def _run() -> None:
             )
             if not r.json().get("ok"):
                 log.warning("tg sendMessage failed: %s", r.text[:200])
-        except Exception:
+                health.mark_down("telegram", error=f"sendMessage API error: {r.text[:120]}")
+            else:
+                health.mark_up("telegram")
+        except Exception as _tg_exc:
             log.exception("tg_send failed")
+            health.mark_down("telegram", error=str(_tg_exc))
         # Push the new alert to dashboard clients live (alerts can fire from the
         # aggregate flush / reconciler at times with no other broadcast).
         await hub.broadcast(snapshot_payload("snapshot"))
@@ -1532,6 +1624,7 @@ async def _run() -> None:
             # UI payload is always capped; the full list is kept in-memory for stats.
             "closed_trades": closed_trades[:cfg.max_closed_trades],
             "stats": stats_state,
+            "health": health.snapshot(),
         }
         if extra:
             payload.update(extra)
@@ -1737,10 +1830,12 @@ async def _run() -> None:
 
                 # ── 6. Advance dashboard snapshot ────────────────────────────────────
                 _dash_positions[src.id] = actual
+                health.mark_up(f"source:{src.name}", ok_ts=datetime.now(timezone.utc).isoformat())
                 await hub.broadcast(snapshot_payload("snapshot"))
 
-            except Exception:
+            except Exception as _rec_exc:
                 log.exception("[%s] position reconciler failed", src.name)
+                health.mark_degraded(f"source:{src.name}", error=str(_rec_exc))
 
     async def ws_producer(src: Source) -> None:
         async for trade in src.client.stream_trades():
@@ -1753,8 +1848,10 @@ async def _run() -> None:
                 trades = await src.client.fetch_trades_since(src.last_trade_id)
                 for t in trades:
                     await queue.put((src.id, t))
-            except Exception:
+                health.mark_up(f"source:{src.name}", ok_ts=datetime.now(timezone.utc).isoformat())
+            except Exception as _poll_exc:
                 log.exception("[%s] safety poll failed", src.name)
+                health.mark_degraded(f"source:{src.name}", error=str(_poll_exc))
 
     async def consumer() -> None:
         while True:
@@ -1988,6 +2085,87 @@ async def _run() -> None:
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def health_json(_request: web.Request) -> web.Response:
+        """GET /health.json — machine-readable health snapshot."""
+        return web.json_response(health.snapshot())
+
+    async def health_page(_request: web.Request) -> web.Response:
+        """GET /health — human-readable component status page (dark theme)."""
+        snap = health.snapshot()
+        started = snap["started_at"]
+        now_ts = snap["now"]
+        ok = snap["ok"]
+        components = snap["components"]
+
+        # Compute uptime string
+        try:
+            from datetime import timedelta
+            dt_started = datetime.fromisoformat(started)
+            dt_now = datetime.fromisoformat(now_ts)
+            uptime_sec = int((dt_now - dt_started).total_seconds())
+            hours, rem = divmod(uptime_sec, 3600)
+            minutes, seconds = divmod(rem, 60)
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+        except Exception:
+            uptime_str = "unknown"
+
+        banner_color = "#166534" if ok else "#7f1d1d"
+        banner_text_color = "#86efac" if ok else "#fca5a5"
+        banner_msg = "All systems operational" if ok else f"Degraded &mdash; {sum(1 for c in components if c['status'] in ('down','degraded'))} issue(s)"
+
+        status_dot = {
+            "up": '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#22c55e;margin-right:8px;vertical-align:-1px"></span>',
+            "degraded": '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#f59e0b;margin-right:8px;vertical-align:-1px"></span>',
+            "down": '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef4444;margin-right:8px;vertical-align:-1px"></span>',
+            "disabled": '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#6b7280;margin-right:8px;vertical-align:-1px"></span>',
+        }
+
+        rows_html = ""
+        for c in components:
+            dot = status_dot.get(c["status"], status_dot["disabled"])
+            detail_html = f'<span style="color:#9ca3af;margin-left:8px">{c["detail"]}</span>' if c.get("detail") else ""
+            error_html = f'<div style="color:#ef4444;font-size:11px;margin-top:3px">&#x26A0; {c["error"]}</div>' if c.get("error") else ""
+            last_ok_html = f'<div style="color:#6b7280;font-size:11px;margin-top:2px">last ok: {c["last_ok"]}</div>' if c.get("last_ok") else ""
+            rows_html += f"""
+<tr>
+  <td style="padding:10px 8px">{dot}<strong>{c["component"]}</strong>{detail_html}</td>
+  <td style="padding:10px 8px;text-transform:uppercase;font-size:11px;letter-spacing:.5px;color:{'#22c55e' if c['status']=='up' else '#f59e0b' if c['status']=='degraded' else '#ef4444' if c['status']=='down' else '#6b7280'}">{c["status"]}</td>
+  <td style="padding:10px 8px;font-size:11px">{error_html}{last_ok_html}</td>
+</tr>"""
+
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Health &mdash; Trade tracker</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; padding: 24px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: #0b0d10; color: #d8dbe0; }}
+  h1 {{ font-size: 18px; margin: 0 0 4px; color: #fff; }}
+  a {{ color: #60a5fa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .banner {{ border-radius:6px; padding:12px 16px; margin-bottom:20px; font-size:14px; font-weight:600; }}
+  table {{ width:100%; border-collapse: collapse; font-size: 12px; background:#13161b; border:1px solid #1f242c; border-radius:8px; }}
+  th {{ text-align:left; color:#6b7280; font-weight:500; padding: 8px; border-bottom: 1px solid #1f242c; font-size:11px; text-transform:uppercase; letter-spacing:.8px; }}
+  tr:last-child td {{ border-bottom: none; }}
+  td {{ border-bottom: 1px solid #11141a; }}
+  .meta {{ font-size:11px; color:#6b7280; margin-bottom:16px; }}
+</style>
+</head>
+<body>
+<h1><a href="/">&#x2190; Trade tracker</a> &mdash; Health</h1>
+<div class="meta">Uptime: {uptime_str} &nbsp;&middot;&nbsp; Started: {started} &nbsp;&middot;&nbsp; <a href="/health.json">/health.json</a></div>
+<div class="banner" style="background:{banner_color};color:{banner_text_color}">{banner_msg}</div>
+<table>
+  <thead><tr><th>Component</th><th>Status</th><th>Detail / Last OK</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html")
+
     # Global rate-limit for the public, unauthenticated /api/send_stats endpoint:
     # at most ONE send per hour total (the dashboard is public, so this protects
     # the Telegram channel from being flooded by anyone who finds the URL).
@@ -2027,6 +2205,8 @@ async def _run() -> None:
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/health", health_page)
+    app.router.add_get("/health.json", health_json)
     app.router.add_post("/api/send_stats", send_stats)
     app.router.add_static("/cards/", path=str(cards_dir), show_index=False)
 
