@@ -957,12 +957,17 @@ async def _run() -> None:
             _derive_hl_disp_fields(row)
 
     # ── Stats display window + round-trip aggregation ────────────────────────
-    # The recorder writes one row per realization (each scale-out + the final
-    # close). For display we collapse each round-trip into ONE entry via
-    # aggregate_round_trips (closed trade = total of all its scale-outs; an
-    # in-progress position = its realized-so-far), then re-derive HL disp on the
-    # aggregates, then apply the [start,end]+symbols window. Used by BOTH the
-    # analytics and the history grid so they always agree.
+    # ORDER MATTERS. We filter the raw per-fill rows to the [start,end]+symbols
+    # window FIRST, then build round-trips from the survivors. Aggregating first
+    # and filtering after would drag a trade's PRE-cutoff fills into the window
+    # whenever its final close happened to land after the cutoff — bleeding old
+    # (e.g. May) PnL into June. Filtering fills first means "everything before
+    # the cutoff is disregarded" literally, fill by fill.
+    #
+    # A round-trip = the run of a (source, coin)'s fills ending in a CLOSE row
+    # (FULL / legacy None). A complete close = position flat = one distinct
+    # trade; the next time the coin is opened it's a brand-new round-trip — so a
+    # closed trade and a later reopen of the same ticker are NEVER summed.
     #   include_open=True  → grid (shows in-progress round-trips, flagged OPEN)
     #   include_open=False → stats (CLOSED-only, per the "closed trades only" rule)
     # Union of every source's exclude_symbols (already normalized) — these
@@ -973,18 +978,22 @@ async def _run() -> None:
     ) if sources else frozenset()
 
     def display_trades(include_open: bool = True) -> list[dict]:
-        agg = aggregate_round_trips(closed_trades)
-        for row in agg:
-            _derive_hl_disp_fields(row)
-        if not include_open:
-            agg = [r for r in agg if (r.get("realization_kind") or "").upper() == "FULL"]
-        return filter_trades(
-            agg,
+        # 1. Disregard everything before the cutoff (+ excluded symbols) at the
+        #    FILL level, before any trade is assembled.
+        rows = filter_trades(
+            closed_trades,
             start_date=cfg.stats_start_date,
             end_date=cfg.stats_end_date,
             symbols=cfg.stats_symbols,
             exclude_symbols=_excluded_symbols,
         )
+        # 2. Build one record per round-trip from the surviving fills.
+        agg = aggregate_round_trips(rows)
+        for row in agg:
+            _derive_hl_disp_fields(row)
+        if not include_open:
+            agg = [r for r in agg if (r.get("realization_kind") or "").upper() == "FULL"]
+        return agg  # already newest-first from aggregate_round_trips
 
     if cfg.stats_start_date or cfg.stats_end_date or cfg.stats_symbols:
         log.info(

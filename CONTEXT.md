@@ -68,7 +68,15 @@ then `sudo systemctl restart lighterbot` (**restart requires explicit user OK ea
     into one perpetual "in progress" blob and dropped ~$1.4k from stats.)
   - Excluded symbols (e.g. FARTCOIN via `exclude_symbols`) are dropped from the
     grid AND stats at the display layer (`filter_trades(exclude_symbols=…)`),
-    not just at record time. Dashboard index sends `Cache-Control: no-cache`
+    not just at record time.
+  - **ORDER: filter fills by the cutoff window FIRST, then aggregate** (bug fixed
+    2026-06-04). Aggregating first and date-filtering after dragged a trade's
+    pre-cutoff fills into the window whenever its close landed after the cutoff
+    (bled old May PnL into June — showed −$393 instead of +$2,081). Now
+    `display_trades` calls `filter_trades(closed_trades, …)` then
+    `aggregate_round_trips(rows)`, so everything before the cutoff is literally
+    disregarded fill-by-fill. A complete close = position flat = a distinct
+    trade; a reopen of the same ticker is a brand-new round-trip (never summed). Dashboard index sends `Cache-Control: no-cache`
   so browsers pick up new frontend JS after a deploy.
 - **Stats computed on CLOSED trades only** (rows with non-None pnl).
 - **Binance**: rotating `ProxyPool` (round-robin + cooldown + failover) to bypass

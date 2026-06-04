@@ -3,7 +3,7 @@ rows into one record per round-trip (a coin's scale-outs + its final close)."""
 
 from __future__ import annotations
 
-from src.stats import aggregate_round_trips, compute_stats
+from src.stats import aggregate_round_trips, compute_stats, filter_trades
 
 
 def _row(ts, sym, pnl, kind, *, source="HL", side="long",
@@ -131,6 +131,34 @@ def test_close_then_reopen_separates_closed_from_in_progress():
     assert agg[0]["realization_kind"] == "FULL" and agg[0]["pnl"] == 200.0
     assert agg[1]["realization_kind"] == "OPEN" and agg[1]["pnl"] == 30.0
     # The previous close is NOT marked in-progress; only the reopen is.
+
+
+def test_filter_first_disregards_precutoff_fills():
+    # A NEAR position scaled out for a big loss in May, then closed in June.
+    rows = [
+        _row("2026-05-20T10:00:00Z", "NEAR", -2000, "PARTIAL"),
+        _row("2026-06-03T10:00:00Z", "NEAR", 500, "FULL"),
+    ]
+    # CORRECT: filter fills first, THEN aggregate — May loss is gone.
+    agg = aggregate_round_trips(filter_trades(rows, start_date="2026-06-01"))
+    assert len(agg) == 1
+    assert agg[0]["pnl"] == 500.0
+
+    # WRONG (the old order): aggregate first, filter after — May bleeds into June.
+    bled = filter_trades(aggregate_round_trips(rows), start_date="2026-06-01")
+    assert bled[0]["pnl"] == -1500.0  # -2000 + 500, mis-attributed to June
+
+
+def test_reopened_ticker_never_summed_with_prior_close():
+    # NEAR closed +600, reopened and closed -130, reopened and closed -120.
+    rows = [
+        _row("2026-06-01T10:00:00Z", "NEAR", 600, "FULL"),
+        _row("2026-06-02T10:00:00Z", "NEAR", -130, "FULL"),
+        _row("2026-06-03T10:00:00Z", "NEAR", -120, "FULL"),
+    ]
+    agg = sorted(aggregate_round_trips(rows), key=lambda a: a["ts"])
+    assert [a["pnl"] for a in agg] == [600.0, -130.0, -120.0]  # 3 distinct trades
+    assert len(agg) == 3
 
 
 def test_running_win_total_counts_closed_only():
