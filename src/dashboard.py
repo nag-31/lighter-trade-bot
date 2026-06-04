@@ -765,7 +765,12 @@ function renderHealth(health) {
   banner.style.display = "";
 }
 function connect() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
+  // Match the page scheme: wss:// behind HTTPS (e.g. the domain via Caddy),
+  // ws:// on plain HTTP (e.g. the raw IP:8080). An HTTPS page CANNOT open an
+  // insecure ws:// socket (mixed content) — that's why the domain showed
+  // "connecting" with no data. location.host keeps the correct port for both.
+  const wsScheme = location.protocol === "https:" ? "wss://" : "ws://";
+  const ws = new WebSocket(`${wsScheme}${location.host}/ws`);
   ws.onopen = () => setStatus(true, "connected");
   ws.onclose = () => { setStatus(false, "disconnected — retrying"); setTimeout(connect, 2000); };
   ws.onerror = () => setStatus(false, "error");
