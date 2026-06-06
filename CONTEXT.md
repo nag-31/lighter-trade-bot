@@ -4,7 +4,67 @@
 > Narrative history lives in [BUILD_STORY.md](BUILD_STORY.md); this file is the
 > "where we are right now + the rules that must never be broken" snapshot.
 
-Last updated: 2026-06-04
+Last updated: 2026-06-07
+
+---
+
+## Issues raised & how they were resolved (chronological)
+
+Every problem reported during the build, newest at the bottom. Status: ✅ fixed,
+🟡 mitigated/by-design, 🔲 open.
+
+1. ✅ **Binance blocked from Azure (HTTP 451 geo-block).** → Rotating `ProxyPool`
+   (round-robin + 5-min cooldown + failover), fail-safe so HL/Lighter keep
+   running if Binance is down, `/health` page. (Binance source currently
+   commented out in config.)
+2. ✅ **HL wallet must never leak.** → Address in `.env` only, masked `0x…4c74`,
+   source id = sha256 hash. (See SECURITY CONSTRAINTS.)
+3. ✅ **Want price privacy without lying about PnL.** → "Exact results, fuzzy
+   fingerprint": PnL/%/win-rate exact, price/size/notional/time fuzzed (HL-only),
+   master rollback switch `privacy_enabled`, disclosure footnote.
+4. ✅ **Multi-fill close only logged the LAST fill — scale-out PnL lost.** →
+   One record per realization (every reduce-batch + close writes its own row);
+   later collapsed for display into one card per round-trip.
+5. ✅ **Reconciliation parse bug: 37 coins collapsed to 1** (`_parse_fill` used a
+   map mutated mid-iteration). → stable `_perp_universe` set; script must
+   `bootstrap_markets()` first. Also fixed `limit=2000` truncation.
+6. ✅ **Stats should use closed trades only** (not open/unrealized). → enforced.
+7. ✅ **Date window: show only from a cutoff (e.g. last 4 days → June 1); end
+   = now.** → `stats_start_date` / `stats_end_date` config.
+8. ✅ **Don't import full history; show only existing dashboard coins.** →
+   scoped view + `stats_symbols` whitelist; `--apply` never run.
+9. ✅ **Sort trades by date; equity x-axis by date; PnL-per-trade show ticker.**
+10. ✅ **One PnL card per fully-closed trade (not per scale-out).** →
+    display-layer round-trip aggregation; in-progress positions shown as tiles.
+11. ✅ **Ticker labels not showing on the chart.** → was browser cache; added
+    `Cache-Control: no-cache` so deploys are picked up.
+12. ✅ **PnL showed $820 instead of ~$2k.** → legacy `None`-kind rows were
+    treated as never-closing and dropped from stats; now any non-`PARTIAL` row
+    closes a round-trip.
+13. ✅ **FARTCOIN must be fully excluded from PnL.** → dropped at the display
+    layer too (`filter_trades(exclude_symbols=…)`), not just at record time.
+14. ✅ **Closed-then-reopened ticker shouldn't show the old one as in-progress.**
+    → a full close = a distinct trade; the reopen is a new round-trip.
+15. ✅ **Put the dashboard on a real domain, not a random link.** →
+    `https://dashboard.enkapital.xyz` via Caddy + Let's Encrypt; GoDaddy A record;
+    Azure NSG 80/443 opened via CLI.
+16. ✅ **Domain loaded but stuck "connecting · no data".** → frontend opened
+    `ws://` from an HTTPS page (blocked as mixed content); now picks `wss://`
+    by page scheme.
+17. 🟡 **Lighter WebSocket HTTP 400 reconnect loop.** → it's a Lighter
+    *geo-block* on the `/stream` WS endpoint (REST stays open). Made it warn once
+    + back off 300s; REST poll covers all trades (≤60s delay). Real-time needs a
+    `LIGHTER_WS_PROXY` in an allowed region (not yet provided).
+18. ✅ **Remove the privacy footnote text.** → `privacy_disclose_footnote: false`.
+19. ✅ **"All fucked up" — PnL showed −$393; old trades' PnL bleeding in.** →
+    date filter ran AFTER aggregation, so a trade that closed in-window but opened
+    pre-cutoff dragged its old fills in. Now fills are filtered by the cutoff
+    FIRST, then round-trips are built. Verified live: **+$2,080.91 / 23 closed
+    trades / 56.5% win rate** for June 1+.
+20. 🔲 **Possible TON duplicate:** two TON closes on Jun 3 both exactly +$42.00
+    (one legacy `None` row + one 6-fill `PPPPPF` sequence) — may be the same trade
+    recorded twice (would double-count ~$42; true total ~$2,039). Not yet
+    investigated/de-duped.
 
 ---
 
