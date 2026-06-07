@@ -1455,9 +1455,14 @@ async def _run() -> None:
             log.info("[%s] aggregate flush: market %d already closed, skipping",
                      src.name, market_id)
             return
-        if pos.notional_usd < src.min_notional:
-            log.info("[%s] aggregate flush: %s notional $%.0f below min, skipping",
-                     src.name, pos.market_symbol, pos.notional_usd)
+        # Gate on the AGGREGATED added notional across the window, not the
+        # standing position size: a small scale-tweak to a large position must
+        # NOT alert. Only fire if the net added over the window >= min_notional.
+        if buf["net_added"] < src.min_notional:
+            log.info("[%s] aggregate flush: %s added $%.0f across %d fills below "
+                     "min $%.0f, skipping alert",
+                     src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
+                     src.min_notional)
             return
         sl, tp = await _get_sl_tp(src, market_id)
         ae = _anchor(src, market_id, pos.avg_entry_price)
@@ -1495,25 +1500,35 @@ async def _run() -> None:
             return
         sl, tp = await _get_sl_tp(src, market_id)
         ae = _anchor(src, market_id, pos.avg_entry_price)
-        text = format_reduce_aggregate(
-            position=pos,
-            net_reduced_usd=buf["net_reduced"],
-            n_fills=buf["n_fills"],
-            realized_pnl=buf["total_pnl"],
-            leverage=buf["leverage"],
-            pool_url=src.url,
-            source_name=src.name,
-            sl=sl,
-            tp=tp,
-            privacy=privacy,
-            is_hl=src.is_hyperliquid,
-            anchor_entry=ae,
-            source_id=src.id,
-        )
-        log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
-                 src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
-                 pos.notional_usd)
-        await tg_send(text)
+        # Gate the ALERT on the aggregated reduced notional across the window —
+        # a small partial-close on a large position must not spam. The partial
+        # is STILL recorded below regardless, so PnL/stats stay exact; only the
+        # Telegram message is suppressed when the net reduced is below min.
+        if buf["net_reduced"] >= src.min_notional:
+            text = format_reduce_aggregate(
+                position=pos,
+                net_reduced_usd=buf["net_reduced"],
+                n_fills=buf["n_fills"],
+                realized_pnl=buf["total_pnl"],
+                leverage=buf["leverage"],
+                pool_url=src.url,
+                source_name=src.name,
+                sl=sl,
+                tp=tp,
+                privacy=privacy,
+                is_hl=src.is_hyperliquid,
+                anchor_entry=ae,
+                source_id=src.id,
+            )
+            log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
+                     src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
+                     pos.notional_usd)
+            await tg_send(text)
+        else:
+            log.info("[%s] reduce aggregate: %s −$%.0f across %d fills below min $%.0f, "
+                     "suppressing alert (still recording realization)",
+                     src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
+                     src.min_notional)
 
         # ── Record this partial close as its own realization row ───────────────
         last_trade = buf.get("last_trade")

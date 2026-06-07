@@ -9,7 +9,11 @@ settings:
   # Minimum position notional (USD) to fire a Telegram alert.
   # Per-source overrides in the sources list below take priority.
   # Set to 0 to alert on every fill regardless of size.
-  default_min_notional_usd: 900
+  # NOTE: for batched add/reduce alerts this threshold is applied to the
+  # AGGREGATED fill notional after the window closes (i.e. an alert fires only
+  # if the net added/reduced across the window is >= this amount), not to the
+  # standing position size — so small scale-tweaks no longer spam.
+  default_min_notional_usd: 1000
 
   # -- Alert types ----------------------------------------------------------
   # Toggle which events send a Telegram message.
@@ -132,7 +136,7 @@ sources:
   - type: hyperliquid
     name: "HL"
     # address loaded from HL_ADDRESS env var
-    min_notional_usd: 900
+    min_notional_usd: 1000
     exclude_symbols: ["FARTCOIN"]
     footer_url: "https://enkapital.xyz"
 

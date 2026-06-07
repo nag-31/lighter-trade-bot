@@ -161,6 +161,44 @@ def test_reopened_ticker_never_summed_with_prior_close():
     assert len(agg) == 3
 
 
+def test_legacy_null_row_duplicating_fill_sequence_is_dropped():
+    # The TON +$42 case: a legacy NULL-kind aggregate row restates a round-trip
+    # that ALSO exists as a real PARTIAL/FULL fill sequence at the same instant.
+    # The legacy row must be dropped so +$42 is counted once, not twice.
+    rows = [
+        _row("2026-06-03T19:36:39Z", "TON", 42, None),        # legacy duplicate
+        _row("2026-06-03T19:36:39Z", "TON", 20, "PARTIAL"),   # real fills...
+        _row("2026-06-03T19:36:39Z", "TON", 22, "FULL"),
+    ]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 1
+    assert agg[0]["pnl"] == 42.0          # 20 + 22, NOT 84
+    assert agg[0]["realization_kind"] == "FULL"
+
+
+def test_legacy_null_row_without_fill_counterpart_is_kept():
+    # ENA/SPX case: a genuine standalone legacy round-trip with no fill-based
+    # counterpart must survive — it is real PnL, not a duplicate.
+    rows = [_row("2026-06-03T19:36:45Z", "ENA", 165.01, None)]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 1
+    assert abs(agg[0]["pnl"] - 165.01) < 1e-9
+    assert agg[0]["realization_kind"] == "FULL"
+
+
+def test_legacy_null_row_outside_window_is_kept():
+    # A legacy row hours away from an unrelated later fill-based trade on the
+    # same coin is NOT a duplicate — both are distinct round-trips.
+    rows = [
+        _row("2026-06-01T10:00:00Z", "WLD", 100, None),    # legacy, hours earlier
+        _row("2026-06-03T19:36:00Z", "WLD", 50, "FULL"),   # unrelated later trade
+    ]
+    agg = sorted(aggregate_round_trips(rows), key=lambda a: a["ts"])
+    assert len(agg) == 2
+    assert agg[0]["pnl"] == 100.0
+    assert agg[1]["pnl"] == 50.0
+
+
 def test_running_win_total_counts_closed_only():
     rows = [
         _row("2026-06-01T10:00:00Z", "BTC", 100, "FULL"),   # win  -> 1/1

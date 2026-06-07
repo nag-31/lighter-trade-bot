@@ -61,10 +61,30 @@ Every problem reported during the build, newest at the bottom. Status: ✅ fixed
     pre-cutoff dragged its old fills in. Now fills are filtered by the cutoff
     FIRST, then round-trips are built. Verified live: **+$2,080.91 / 23 closed
     trades / 56.5% win rate** for June 1+.
-20. 🔲 **Possible TON duplicate:** two TON closes on Jun 3 both exactly +$42.00
-    (one legacy `None` row + one 6-fill `PPPPPF` sequence) — may be the same trade
-    recorded twice (would double-count ~$42; true total ~$2,039). Not yet
-    investigated/de-duped.
+20. ✅ **TON duplicate — and 5 more like it.** Audit confirmed the TON +$42 was
+    one of **8 legacy `None`-kind rows** (ids 1–8, written in the 06-03/06-04
+    migration window, `trade_id`/`fill_ids` NULL). 6 of them (SOL +397.71,
+    TON +42, FET +148.85, LIT +369.11, WLD +115.09, LIT +236.42) restate a
+    real PARTIAL/FULL fill sequence at the same instant → **+$1,448 double-count**.
+    The dashboard's June-1+ figure was inflated from a true ~+$496 to +$1,944.
+    → `stats.aggregate_round_trips()` now calls `_drop_legacy_duplicate_rows()`:
+    a legacy NULL row is dropped when a fill-based row for the same
+    (source, symbol) exists within `_LEGACY_DEDUP_WINDOW_SEC` (1h). Pure
+    display-layer (no DB writes). ENA (+165.01) and SPX (−25.93) have **no**
+    fill counterpart → kept as genuine standalone legacy round-trips
+    (**flagged for manual eyeball**). Also noted: stale baseline — DB now holds
+    564 rows, all-history grand total is actually **−$1,885.64** (driven by a
+    real **ZEC −$1,267** loss); no `fill_id` is reused across rows; `is_win`
+    vs `pnl` sign is clean.
+21. ✅ **Telegram alerts too spammy (~79/day, peak 134/day, all from HL).**
+    Audit: 56% of HL alerts were small scale-in/scale-out (`added`/`reduced`).
+    Root cause: the $900 gate was on the *standing position* size, so a small
+    add to a large position still alerted. → Raised min size to **$1000** and
+    moved the gate onto the **aggregated fill notional after the 60s window**:
+    an add/reduce alert now fires only if the net added/reduced across the
+    window ≥ $1000 (`flush_aggregate` gates on `net_added`, `flush_reduce_aggregate`
+    on `net_reduced`). Sub-$1000 reduces are **still recorded** (PnL stays
+    exact) — only the Telegram message is suppressed.
 
 ---
 

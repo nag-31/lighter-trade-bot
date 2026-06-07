@@ -120,6 +120,67 @@ def filter_trades(
     return out
 
 
+# Legacy migration rows (realization_kind NULL, no fill_ids) that fall within
+# this many seconds of a real fill-based row for the same (source, symbol) are
+# treated as duplicates of that fill sequence and dropped. The known dupes share
+# the fill's exact sub-second timestamp; the window is generous head-room and is
+# only ever reachable by legacy rows (current code always writes PARTIAL/FULL).
+_LEGACY_DEDUP_WINDOW_SEC = 3600.0
+
+
+def _is_legacy_kind(r: dict) -> bool:
+    """A legacy migration row: realization_kind is NULL/blank (not PARTIAL/FULL)."""
+    return not (r.get("realization_kind") or "").strip()
+
+
+def _has_fill_ids(r: dict) -> bool:
+    """True if the row carries fill identifiers (i.e. it is a real fill-based row)."""
+    fids = r.get("fill_ids")
+    if fids is None:
+        return False
+    if isinstance(fids, str):
+        return fids.strip() not in ("", "[]", "null")
+    try:
+        return len(fids) > 0
+    except TypeError:
+        return False
+
+
+def _drop_legacy_duplicate_rows(trades: list[dict]) -> list[dict]:
+    """Remove legacy NULL-kind rows that double-count a fill-based sequence.
+
+    During an earlier migration, 8 aggregate rows were written with
+    ``realization_kind=None`` and no ``fill_ids``/``trade_id``. Six of them
+    re-state a round-trip that ALSO exists as a PARTIAL/FULL fill sequence for
+    the same coin at the same instant — summing both double-counts the PnL
+    (e.g. the TON +$42 seen twice). This drops a legacy row when a real
+    fill-based row for the same ``(source, market_symbol)`` exists within
+    ``_LEGACY_DEDUP_WINDOW_SEC``. A legacy row with NO fill-based counterpart
+    (a genuine standalone legacy round-trip, e.g. ENA/SPX) is kept untouched.
+    """
+    fill_ts: dict[tuple[str, str], list[datetime]] = {}
+    for r in trades:
+        if not _is_legacy_kind(r):
+            key = (r.get("source") or "", r.get("market_symbol") or "")
+            dt = _parse_ts(r.get("ts"))
+            if dt is not None:
+                fill_ts.setdefault(key, []).append(dt)
+
+    out: list[dict] = []
+    for r in trades:
+        if _is_legacy_kind(r) and not _has_fill_ids(r):
+            key = (r.get("source") or "", r.get("market_symbol") or "")
+            dt = _parse_ts(r.get("ts"))
+            near = fill_ts.get(key)
+            if dt is not None and near and any(
+                abs((dt - t).total_seconds()) <= _LEGACY_DEDUP_WINDOW_SEC
+                for t in near
+            ):
+                continue  # legacy duplicate of a fill sequence → drop
+        out.append(r)
+    return out
+
+
 def aggregate_round_trips(trades: list[dict]) -> list[dict]:
     """Collapse per-fill realization rows into one record per round-trip.
 
@@ -143,6 +204,10 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
     - ``realization_kind`` = ``"FULL"`` (closed) | ``"OPEN"`` (in progress)
     - ``wins`` / ``total`` = running CLOSED-trade record through this trade
     """
+    # Drop legacy NULL-kind rows that duplicate a real fill sequence (otherwise
+    # their PnL is counted twice — see _drop_legacy_duplicate_rows).
+    trades = _drop_legacy_duplicate_rows(trades)
+
     # Group by (source, market_symbol), preserving deterministic ordering.
     groups: dict[tuple[str, str], list[dict]] = {}
     for t in trades:
