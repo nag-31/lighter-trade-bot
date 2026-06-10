@@ -189,9 +189,11 @@ def _generate_card(
         cards_dir.mkdir(parents=True, exist_ok=True)
         trade_id = rec.get("trade_id") or int(time.time() * 1000)
         card_filename = f"hl_recon_{trade_id}.png"
-        card_path = cards_dir / card_filename
-        card_path.write_bytes(png_bytes)
-        return str(card_path)
+        (cards_dir / card_filename).write_bytes(png_bytes)
+        # Store the WEB path (same shape record_realization writes) — the
+        # dashboard uses card_path directly as the <img> src. Storing the
+        # filesystem path here broke every rebuilt card tile (blank images).
+        return f"/cards/{card_filename}"
 
     except Exception as exc:
         log.warning("card generation failed for trade_id=%s: %s", rec.get("trade_id"), exc)

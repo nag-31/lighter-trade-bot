@@ -401,7 +401,7 @@ function renderClosedTrades(trades) {
     const tileFootnote = tr.footnote ? `<div style="font-size:10px;color:#6b7280;margin-top:4px">${esc(tr.footnote)}</div>` : '';
     let thumbHtml = '';
     if (tr.card_path) {
-      thumbHtml = `<div class="tile-thumb-wrap"><img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="window.open('${esc(tr.card_path)}','_blank')"></div>`;
+      thumbHtml = `<div class="tile-thumb-wrap"><img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="showCardModal('${esc(tr.card_path)}')"></div>`;
     }
     return `<div class="trade-tile ${isWin ? 'win' : 'loss'}">
   <div class="tile-header">${esc(tr.source || '')} &middot; ${esc(tr.market_symbol || '')}</div>
@@ -801,8 +801,27 @@ function connect() {
     }
   };
 }
+// ── PnL card lightbox: click a card thumb → in-page overlay (no new tab) ──
+function showCardModal(src) {
+  const ov = document.getElementById("card-modal");
+  document.getElementById("card-modal-img").src = src;
+  ov.style.display = "flex";
+}
+function hideCardModal() {
+  const ov = document.getElementById("card-modal");
+  ov.style.display = "none";
+  document.getElementById("card-modal-img").src = "";
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideCardModal(); });
 connect();
 </script>
+<div id="card-modal" onclick="hideCardModal()"
+     style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.82);
+            align-items:center;justify-content:center;cursor:zoom-out;padding:24px">
+  <img id="card-modal-img" alt="PnL card"
+       style="max-width:min(92vw,720px);max-height:88vh;border-radius:12px;
+              box-shadow:0 12px 48px rgba(0,0,0,.6)">
+</div>
 </body>
 </html>
 """
