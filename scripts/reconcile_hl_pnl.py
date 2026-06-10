@@ -147,6 +147,7 @@ def _generate_card(
     hl_source_id: str,
     privacy: PrivacyParams,
     cards_dir: Path,
+    card_pnl_override: "Decimal | None" = None,
 ) -> str | None:
     """Generate a PnL card PNG for a single record. Returns card_path or None."""
     try:
@@ -175,7 +176,11 @@ def _generate_card(
             hl_source_name,
             rec["wins"],
             rec["total"],
-            pnl_override=realized,
+            # FULL-close cards must show the whole round-trip's total (every
+            # scale-out + the close), matching the live bot's card_pnl_override
+            # behaviour — a per-fill figure on the close card disagreed with
+            # the dashboard tile on 58 of 74 trips (some with flipped signs).
+            pnl_override=(card_pnl_override if card_pnl_override is not None else realized),
             is_partial=is_partial,
             privacy=privacy,
             is_hl=True,
@@ -428,9 +433,21 @@ async def main(
         return
 
     # 10c. Insert rebuilt records (with optional card generation)
+    # Round-trip running totals (records are oldest-first): a FULL row's card
+    # shows the SUM of its trip's partials + itself, same as the live bot.
+    _trip_running: dict[str, Decimal] = {}
     cards_written = 0
     cards_failed = 0
     for rec in rebuilt_records:
+        _sym = rec.get("market_symbol") or "?"
+        _own_pnl = Decimal(str(rec.get("pnl") or "0"))
+        _trip_total = _trip_running.get(_sym, Decimal(0)) + _own_pnl
+        if rec.get("realization_kind") == "FULL":
+            _trip_running[_sym] = Decimal(0)
+            _card_override = _trip_total if _trip_total != _own_pnl else None
+        else:
+            _trip_running[_sym] = _trip_total
+            _card_override = None  # PARTIAL cards show their own batch, like live
         if not no_cards:
             card_path = _generate_card(
                 rec,
@@ -438,6 +455,7 @@ async def main(
                 hl_source_id=hl_source.id,
                 privacy=privacy,
                 cards_dir=CARDS_DIR,
+                card_pnl_override=_card_override,
             )
             if card_path:
                 rec["card_path"] = card_path
