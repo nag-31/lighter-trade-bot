@@ -831,6 +831,9 @@ class HyperliquidClient:
                 realized_pnl=realized_pnl,
                 dir=trade_dir,
                 closed_pnl=realized_pnl,
+                # Signed position size BEFORE this fill — lets consumers tell a
+                # FULL close (fill size >= |startPosition|) from a scale-out.
+                start_position=_to_decimal(raw.get("startPosition")),
             )
         except (KeyError, ValueError, TypeError) as e:
             log.warning("[%s] could not parse HL fill %r: %s", self.source, raw, e)

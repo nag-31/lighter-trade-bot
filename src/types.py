@@ -43,6 +43,7 @@ class Trade:
     realized_pnl: Optional[Decimal] = None  # HL closedPnl; None for Lighter
     dir: Optional[str] = None               # HL intent string e.g. "Open Long", "Close Short"; None for Lighter
     closed_pnl: Optional[Decimal] = None    # Alias for realized_pnl from HL fill; None for Lighter
+    start_position: Optional[Decimal] = None  # HL startPosition: signed position size BEFORE this fill; None for Lighter
 
     @property
     def notional_usd(self) -> Decimal:

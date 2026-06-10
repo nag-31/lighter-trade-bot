@@ -63,17 +63,18 @@ def _safe_decimal(value) -> Optional[Decimal]:
 # ---------------------------------------------------------------------------
 
 class RealizationKindTracker:
-    """Tracks per-market cumulative closed size to infer FULL vs PARTIAL.
+    """Tags each realizing fill FULL (position flat after it) or PARTIAL.
 
-    Usage: walk fills oldest-first; call ``classify(fill)`` for each.
-    The tracker maintains a running cumulative-closed-size per market.
-    When a fill brings the cumulative size to near-zero, the fill is tagged
-    "FULL" and the counter resets; otherwise "PARTIAL".
+    Primary rule (exact): HL fills carry ``startPosition`` — the signed
+    position size BEFORE the fill. A fill is a FULL close iff it closes the
+    whole remainder: ``fill.size >= |startPosition| - ε``. This is exchange
+    fact, not a heuristic, and correctly tags EVERY round-trip of a coin
+    (the old one-FULL-per-window approximation collapsed a coin's multiple
+    trades into one closed + one perpetual in-progress blob).
 
-    This is an approximation: without the original open size we can only
-    detect when all of the observed closes sum to zero (i.e. a flat position
-    from the perspective of this fill window).  It works well in practice
-    because HL fills arrive as coherent open→close sequences.
+    Fallback (fills without start_position, e.g. synthetic test fills):
+    the legacy first-fill-FULL heuristic, corrected afterwards by
+    ``finalize()`` — which the caller must then apply to those markets.
     """
 
     def __init__(self) -> None:
@@ -83,92 +84,25 @@ class RealizationKindTracker:
     def classify(self, fill: Trade) -> str:
         """Return "FULL" or "PARTIAL" for this fill, updating internal state.
 
-        The heuristic:
-          - Accumulate closed size for the market.
-          - After this fill, if the cumulative size is <= _ZERO_THRESHOLD,
-            call it "FULL" (the position appears fully closed in this window)
-            and reset the counter so the next open/close cycle starts fresh.
-          - Otherwise "PARTIAL".
+        Exact rule when the fill carries HL's ``startPosition`` (the signed
+        position size before the fill): FULL iff this fill closes the whole
+        remainder, i.e. ``size >= |startPosition| - ε``. This tags every
+        round-trip of a coin correctly (close → reopen → close = two FULLs).
+
+        Fallback for fills WITHOUT start_position: first-fill-FULL heuristic;
+        the caller must then run ``finalize()`` over those markets so their
+        LAST fill ends up FULL instead.
         """
         sym = fill.market_symbol
-        prev = self._cumulative.get(sym, Decimal("0"))
-        new_total = prev + fill.size
+        sp = getattr(fill, "start_position", None)
+        if sp is not None:
+            return (
+                "FULL"
+                if fill.size >= abs(sp) - _ZERO_THRESHOLD
+                else "PARTIAL"
+            )
 
-        # If cumulative is approximately zero after this fill: FULL close.
-        # We use a simple check: if new_total is essentially zero.
-        # But since all sizes are positive (realizing fills always have
-        # positive size), the cumulative only ever grows.  The "reset" signal
-        # must come from a different cue.
-        #
-        # Better heuristic: a FULL close is one where the position's size
-        # drops to zero.  Since we can't observe that directly, we instead
-        # look for a gap: if there was NO prior cumulative (first fill for
-        # this market in the window, or after a reset), the FIRST fill is
-        # ambiguous — we call it PARTIAL unless we see a subsequent fill
-        # start a new group.
-        #
-        # Practical approach used here: track the maximum cumulative size seen
-        # per market across the window; when a fill brings the running total
-        # back below a prior peak by a large fraction, treat the prior fills
-        # as a PARTIAL group and this one as starting a new cycle.
-        #
-        # Even simpler (and chosen for clarity): if the next fill after a gap
-        # resets the direction we emit FULL for the last fill of the prior
-        # group.  But that requires look-ahead.
-        #
-        # FINAL DECISION: use the simplest defensible rule that avoids false
-        # positives on PnL accuracy (which is exact regardless):
-        #   - Tag all fills as "PARTIAL" EXCEPT the last fill in each
-        #     monotonically increasing sequence per market — we detect this by
-        #     checking whether the NEXT fill for the same market starts a new
-        #     group (size drops back toward zero).  Since we process left-to-
-        #     right we can't do look-ahead, so we default to "FULL" only when
-        #     there is no prior cumulative for the market (i.e. first fill
-        #     seen after a reset).
-        #
-        # The above is still ambiguous.  The SIMPLEST correct behaviour:
-        # default everything to "FULL" and note the approximation clearly.
-        # The dashboard's "PARTIAL CLOSE" label is cosmetic; PnL is exact.
-        # A follow-up pass could re-tag by comparing sizes against open
-        # position snapshots.
-        #
-        # IMPLEMENTATION: We use a two-state machine per market:
-        #   state 0 (fresh / after reset): next fill → "FULL" if size looks
-        #     like a complete position (we have no open-size reference, so
-        #     default "FULL").
-        #   state 1 (accumulating): subsequent fills before a reset → "PARTIAL".
-        # A "reset" is emitted when a NEW fill would add to a market that had
-        # a prior run AND has been idle (not seen in this batch).  But we
-        # can't detect idle without timestamps.
-        #
-        # FINAL FINAL SIMPLEST: all fills default to "FULL"; scale-outs
-        # (multiple fills for the same market in the same batch) are tagged
-        # "PARTIAL" except the last one for each market in the sorted sequence.
-        # We approximate this as: if there is already a prior cumulative for
-        # the market from THIS run (prior fill in same market), mark the
-        # PREVIOUS fill as PARTIAL (retroactively) — but retroactive tagging
-        # requires mutable records.  Too complex.
-        #
-        # ACCEPTED APPROXIMATION:
-        # - Track per-market fill count in this run.
-        # - If fill_count[sym] == 1 when we see a second fill: we can't
-        #   retroactively change the first.  Instead:
-        # - If fill_count[sym] > 0 BEFORE this fill: "PARTIAL"
-        # - If fill_count[sym] == 0 BEFORE this fill: "FULL"
-        # This means the FIRST fill per market is always FULL, subsequent are
-        # PARTIAL.  It's backward from reality (last fill should be FULL) but
-        # avoids retroactive mutation.  The label is cosmetic; flip the logic
-        # if needed.
-        #
-        # BETTER: first fill = "PARTIAL" (assume there might be more),
-        # but we can't know from left-to-right.  Marking last-seen as FULL
-        # requires a two-pass algorithm.
-        #
-        # TWO-PASS (used here): caller can run a post-processing step that
-        # sets the LAST fill per market to "FULL".  We expose a
-        # `finalize(records)` method for this.
-
-        self._cumulative[sym] = new_total
+        self._cumulative[sym] = self._cumulative.get(sym, Decimal("0")) + fill.size
         count = self._fill_count.get(sym, 0)
         kind = "PARTIAL" if count > 0 else "FULL"
         self._fill_count[sym] = count + 1
@@ -327,19 +261,30 @@ def reconstruct_all(fills: list[Trade]) -> list[dict]:
     records: list[dict] = []
     running_wins = 0
     running_total = 0
+    # Markets where any fill lacked start_position → their tags came from the
+    # legacy heuristic and need the finalize() correction pass. Markets where
+    # every fill carried start_position are tagged EXACTLY by classify() —
+    # finalize() must NOT touch them (it would force one FULL per window and
+    # collapse a coin's multiple round-trips into one).
+    fallback_syms: set[str] = set()
 
     for fill in fills:
         # Guard: skip zero-size or no-pnl fills
         if fill.size == 0 or fill.realized_pnl is None:
             continue
 
+        if getattr(fill, "start_position", None) is None:
+            fallback_syms.add(fill.market_symbol)
         kind = tracker.classify(fill)
         rec = reconstruct_record(fill, kind, running_wins, running_total)
         running_wins = rec["wins"]
         running_total = rec["total"]
         records.append(rec)
 
-    # Post-processing: ensure last fill per market is tagged FULL
-    RealizationKindTracker.finalize(records)
+    # Post-processing for heuristic-tagged markets only: last fill → FULL.
+    if fallback_syms:
+        RealizationKindTracker.finalize(
+            [r for r in records if r.get("market_symbol") in fallback_syms]
+        )
 
     return records

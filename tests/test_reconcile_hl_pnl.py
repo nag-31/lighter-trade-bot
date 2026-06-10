@@ -47,6 +47,7 @@ def _make_fill(
     realized_pnl: str | None = "500",
     source: str = "HL Test",
     timestamp: datetime | None = None,
+    start_position: str | None = None,
 ) -> Trade:
     return Trade(
         trade_id=trade_id,
@@ -58,6 +59,7 @@ def _make_fill(
         price=Decimal(price),
         source=source,
         realized_pnl=Decimal(realized_pnl) if realized_pnl is not None else None,
+        start_position=Decimal(start_position) if start_position is not None else None,
     )
 
 
@@ -308,6 +310,44 @@ class TestRealizationKind:
         records = reconstruct_all(fills)
         assert records[0]["realization_kind"] == "FULL"
         assert records[1]["realization_kind"] == "FULL"
+
+    def test_start_position_exact_tagging_multi_round_trip(self):
+        # SOL traded 3 times in the window — each close must be its own FULL
+        # (the legacy heuristic collapsed this to ONE FULL per window, hiding
+        # finished trades inside an "in progress" blob).
+        fills = [
+            # trip 1: scale-out 2 of 5, then close remaining 3
+            _make_fill(trade_id=1, market_symbol="SOL", size="2", start_position="5", realized_pnl="100"),
+            _make_fill(trade_id=2, market_symbol="SOL", size="3", start_position="3", realized_pnl="297.71"),
+            # trip 2: single-fill full close of a short (negative startPosition)
+            _make_fill(trade_id=3, market_symbol="SOL", size="4", start_position="-4", realized_pnl="-105.12"),
+            # trip 3: scale-out then close
+            _make_fill(trade_id=4, market_symbol="SOL", size="1", start_position="6", realized_pnl="50"),
+            _make_fill(trade_id=5, market_symbol="SOL", size="5", start_position="5", realized_pnl="502.55"),
+        ]
+        records = reconstruct_all(fills)
+        kinds = [r["realization_kind"] for r in records]
+        assert kinds == ["PARTIAL", "FULL", "FULL", "PARTIAL", "FULL"]
+
+    def test_start_position_flip_counts_as_full(self):
+        # A flip ("Long > Short") closes the whole position: size > |startPosition|.
+        fills = [_make_fill(trade_id=1, market_symbol="ETH", size="7", start_position="3", realized_pnl="10")]
+        records = reconstruct_all(fills)
+        assert records[0]["realization_kind"] == "FULL"
+
+    def test_start_position_markets_skip_finalize_but_fallback_markets_get_it(self):
+        # BTC fills carry start_position (exact tags: two FULL closes) while
+        # DOGE fills don't (heuristic + finalize → last DOGE fill FULL).
+        fills = [
+            _make_fill(trade_id=1, market_symbol="BTC", size="1", start_position="1", realized_pnl="5"),
+            _make_fill(trade_id=2, market_symbol="DOGE", size="1", realized_pnl="1"),
+            _make_fill(trade_id=3, market_symbol="BTC", size="2", start_position="2", realized_pnl="7"),
+            _make_fill(trade_id=4, market_symbol="DOGE", size="1", realized_pnl="2"),
+        ]
+        records = reconstruct_all(fills)
+        by_id = {r["trade_id"]: r["realization_kind"] for r in records}
+        assert by_id[1] == "FULL" and by_id[3] == "FULL"   # exact, untouched by finalize
+        assert by_id[2] == "PARTIAL" and by_id[4] == "FULL"  # heuristic + finalize
 
     def test_finalize_static_method(self):
         records = [
