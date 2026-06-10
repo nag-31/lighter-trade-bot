@@ -85,6 +85,43 @@ Every problem reported during the build, newest at the bottom. Status: ✅ fixed
     window ≥ $1000 (`flush_aggregate` gates on `net_added`, `flush_reduce_aggregate`
     on `net_reduced`). Sub-$1000 reduces are **still recorded** (PnL stays
     exact) — only the Telegram message is suppressed.
+22. ✅ **Sent-alert audit: 28 of ~124 PnL-bearing TG alerts were WRONG.**
+    Ground truth (HL `userFillsByTime`): true June-1+ PnL = **+$1,556.04**
+    (the "$645" was a stale Jun-6 snapshot; "$2,000" matched the double-counted
+    no-dedup figure; the dedup itself was verified correct on all 8 legacy rows).
+    Three causes, three fixes (2026-06-10, local, NOT yet deployed):
+    (a) **Backstop re-booking** — silent-close backstop fetched last-2000 fills
+    unbounded and re-booked old fills the legacy NULL rows never dedup-guarded
+    (worst: SOL card said **+$292.59** when the trade was a **−$105.12 loss**;
+    a stats card said +$1,229 vs true −$155). → fetch now bounded to
+    `max(900s, 10×reconciler_interval)`.
+    (b) **NULL-row leak into card totals** — `_roundtrip_partial_pnl` broke only
+    on `FULL`, so legacy NULL rows of the PREVIOUS trade summed into the next
+    card (FET +165.47 vs true +16.61). → breaks on any non-PARTIAL row (same
+    rule as `aggregate_round_trips`).
+    (c) **Missed fills understated 18 cards/reduces** (HYPE +13.37 vs +61.79,
+    TAO +33.44 vs +101.47…). → on FULL close (HL), the card total is re-summed
+    from the exchange's own closedPnl over the round-trip window
+    (`_roundtrip_start_ts` → `fetch_realizing_fills`), falling back to the
+    local sum on API failure. Also: the close log line now shows the card's
+    figure, not just the final fill's.
+    **Still open:** DB is missing fills (all PURR +258.22, all 18 SPX, the ENA
+    close) — pre-anchor history, only fixable by the reconcile rebuild
+    (`reconcile_hl_pnl.py --apply`, dry-run pending user OK).
+23. ✅ **TG alert quality-of-life (4 features, 2026-06-10, local, NOT deployed):**
+    (a) **Cross-coin session digest** — add/reduce alerts flushing within
+    `digest_window_seconds` (20s) per source are combined into ONE message
+    ("📦 HL — N updates") instead of one per coin; single message sends as-is;
+    chunked under Telegram's 4096-char cap. 0 ⇒ disabled.
+    (b) **Daily recap** — at 00:01 UTC posts the previous day's closed-trades
+    stats (text + card) to the channel; skips empty days. `daily_recap_enabled`.
+    (c) **Daily self-audit** — after the recap, per-coin DB PnL for the day is
+    compared against the exchange's own closedPnl (HL only); any coin off by
+    >$1 → **private DM to TELEGRAM_OWNER_USER_ID** (env, channel never sees it).
+    `daily_self_audit_enabled`. Requires TELEGRAM_OWNER_USER_ID in .env on the VM.
+    (d) **Searchable close cards** — caption now carries "COIN SIDE · ±$PnL"
+    (+ footer URL) instead of just the URL, so the channel is searchable by
+    ticker. PnL-exact is allowed by the privacy posture; no price/size in caption.
 
 ---
 

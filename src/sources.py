@@ -63,6 +63,17 @@ class BotSettings:
     reconciler_interval_seconds: int = 60
     tg_dedup_window_seconds:     int = 90
 
+    # Cross-coin session digest: add/reduce alerts that flush within this many
+    # seconds of each other (per source) are combined into ONE Telegram message
+    # instead of one message per coin. 0 ⇒ disabled (send each immediately).
+    digest_window_seconds:       int = 20
+
+    # Daily jobs (UTC midnight): channel recap of the day's closed trades, and
+    # a private self-audit DM to TELEGRAM_OWNER_USER_ID when the DB's per-coin
+    # PnL disagrees with the exchange's own figures.
+    daily_recap_enabled:      bool = True
+    daily_self_audit_enabled: bool = True
+
     # Dashboard
     dashboard_port:      int = 8080
     max_recent_events:   int = 200
@@ -200,6 +211,9 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         rest_poll_seconds           = _int("rest_poll_seconds",           60),
         reconciler_interval_seconds = _int("reconciler_interval_seconds", 60),
         tg_dedup_window_seconds     = _int("tg_dedup_window_seconds",     90),
+        digest_window_seconds       = _int("digest_window_seconds",       20),
+        daily_recap_enabled         = _bool("daily_recap_enabled",        True),
+        daily_self_audit_enabled    = _bool("daily_self_audit_enabled",   True),
         dashboard_port              = _int("dashboard_port",              8080),
         max_recent_events           = _int("max_recent_events",           200),
         max_closed_trades           = _int("max_closed_trades",           200),

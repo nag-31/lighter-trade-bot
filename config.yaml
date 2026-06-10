@@ -29,6 +29,18 @@ settings:
   # Lower = more real-time but noisier. Higher = cleaner but delayed.
   aggregate_window_seconds: 60
 
+  # -- Cross-coin session digest ---------------------------------------------
+  # Add/reduce alerts that flush within this window (per source) are combined
+  # into ONE Telegram message instead of one per coin. 0 = off (immediate).
+  digest_window_seconds: 20
+
+  # -- Daily jobs (UTC midnight) ----------------------------------------------
+  # daily_recap_enabled    : post a recap of the day's closed trades to the channel.
+  # daily_self_audit_enabled: privately DM TELEGRAM_OWNER_USER_ID if the DB's
+  #                           per-coin PnL disagrees with the exchange (>$1).
+  daily_recap_enabled: true
+  daily_self_audit_enabled: true
+
   # -- Timing ---------------------------------------------------------------
   # How often the REST safety-net polls for any fills the WebSocket missed.
   rest_poll_seconds: 60

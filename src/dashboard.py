@@ -19,7 +19,7 @@ import re
 import signal
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -1135,6 +1135,8 @@ async def _run() -> None:
     # --- Telegram ---
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_channel = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+    # Owner's PRIVATE chat for self-audit warnings — never the public channel.
+    tg_owner = os.environ.get("TELEGRAM_OWNER_USER_ID", "").strip()
     tg_client = httpx.AsyncClient(timeout=15.0)
     AGGREGATE_WINDOW = cfg.aggregate_window_seconds
 
@@ -1234,6 +1236,84 @@ async def _run() -> None:
                 await tg_send(caption)
         await hub.broadcast(snapshot_payload("snapshot"))
 
+    async def tg_dm_owner(text: str) -> None:
+        """Send a PRIVATE message to the owner (TELEGRAM_OWNER_USER_ID).
+
+        Used by the daily self-audit — warnings about wrong numbers go to the
+        owner only, never to the public channel. No-op (with a log) if the
+        owner id isn't configured. Not recorded in the public alert log.
+        """
+        if not (tg_token and tg_owner):
+            log.warning("tg_dm_owner: TELEGRAM_OWNER_USER_ID not set — dropping: %.120s", text)
+            return
+        try:
+            r = await tg_client.post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                data={"chat_id": tg_owner, "text": text},
+            )
+            if not r.json().get("ok"):
+                log.warning("tg_dm_owner failed: %s", r.text[:200])
+        except Exception:
+            log.exception("tg_dm_owner failed")
+
+    # ── Cross-coin session digest ──────────────────────────────────────────────
+    # flush_aggregate / flush_reduce_aggregate produce one message per coin; in a
+    # multi-coin session that fired 4-5 separate alerts within seconds. Instead
+    # of sending each immediately, buffer them per SOURCE and send one combined
+    # message once the source goes quiet for DIGEST_WINDOW seconds. A single
+    # buffered message is sent as-is (no header noise for the common case).
+    DIGEST_WINDOW = cfg.digest_window_seconds
+    _TG_TEXT_LIMIT = 3900  # headroom under Telegram's 4096-char cap
+    _digest_pending: dict[str, dict] = {}  # source_id → {"msgs": [str], "task": Task}
+
+    async def _flush_digest(source_id: str) -> None:
+        buf = _digest_pending.pop(source_id, None)
+        if not buf or not buf["msgs"]:
+            return
+        msgs = buf["msgs"]
+        if len(msgs) == 1:
+            await tg_send(msgs[0])
+            return
+        src = by_id.get(source_id)
+        header = f"📦 {src.name if src else source_id} — {len(msgs)} updates"
+        # Pack messages into as few sends as the 4096-char cap allows.
+        chunk: list[str] = []
+        chunk_len = len(header)
+        for m in msgs:
+            if chunk and chunk_len + len(m) + 10 > _TG_TEXT_LIMIT:
+                await tg_send(header + "\n\n" + "\n――――――\n".join(chunk))
+                chunk, chunk_len = [], len(header)
+            chunk.append(m)
+            chunk_len += len(m) + 10
+        if chunk:
+            await tg_send(header + "\n\n" + "\n――――――\n".join(chunk))
+
+    async def _delayed_digest_flush(source_id: str, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await _flush_digest(source_id)
+
+    def _digest_send(source_id: str, text: str) -> None:
+        """Queue an add/reduce alert into the per-source digest (or send
+        immediately when the digest is disabled). Debounced: every new message
+        restarts the quiet-period timer, same pattern as the fill batchers."""
+        if DIGEST_WINDOW <= 0:
+            asyncio.get_running_loop().create_task(tg_send(text))
+            return
+        buf = _digest_pending.get(source_id)
+        if buf is None:
+            _digest_pending[source_id] = {
+                "msgs": [text],
+                "task": asyncio.get_running_loop().create_task(
+                    _delayed_digest_flush(source_id, DIGEST_WINDOW)
+                ),
+            }
+        else:
+            buf["msgs"].append(text)
+            buf["task"].cancel()
+            buf["task"] = asyncio.get_running_loop().create_task(
+                _delayed_digest_flush(source_id, DIGEST_WINDOW)
+            )
+
     async def _get_sl_tp(src: Source, market_id: int):
         """Fetch SL/TP from client; returns (None, None) silently on any error."""
         try:
@@ -1253,7 +1333,7 @@ async def _run() -> None:
         PARTIAL rows for this (source, coin).
 
         closed_trades is newest-first; walk from the front collecting PARTIAL
-        rows until the previous FULL (a round-trip boundary). Used to make the
+        rows until the previous close (a round-trip boundary). Used to make the
         FULL close card show the whole trade's total. Restart-safe: the partials
         were persisted, so they're back in closed_trades after a reboot.
         """
@@ -1261,7 +1341,11 @@ async def _run() -> None:
         for row in closed_trades:
             if row.get("source") != source_name or row.get("market_symbol") != market_symbol:
                 continue
-            if (row.get("realization_kind") or "").upper() == "FULL":
+            # ANY non-PARTIAL row (FULL, legacy NULL, unknown) closes a round-trip
+            # — same rule as stats.aggregate_round_trips. Breaking only on FULL
+            # let legacy NULL rows from the PREVIOUS trade leak into this card's
+            # total (e.g. a FET card showed +165.47 instead of +16.61).
+            if (row.get("realization_kind") or "").upper() != "PARTIAL":
                 break  # boundary of the previous round-trip
             p = row.get("pnl")
             if p is not None:
@@ -1270,6 +1354,21 @@ async def _run() -> None:
                 except Exception:
                     pass
         return total
+
+    def _roundtrip_start_ts(source_name: str, market_symbol: str) -> "str | None":
+        """ISO ts of the OLDEST recorded PARTIAL in the current (not-yet-closed)
+        round-trip for this (source, coin), or None if it has no partials.
+        Same walk/boundary rule as _roundtrip_partial_pnl."""
+        oldest: "str | None" = None
+        for row in closed_trades:
+            if row.get("source") != source_name or row.get("market_symbol") != market_symbol:
+                continue
+            if (row.get("realization_kind") or "").upper() != "PARTIAL":
+                break
+            ts = row.get("ts")
+            if ts:
+                oldest = ts  # newest-first walk → last seen is the oldest
+        return oldest
 
     # ── Shared realization recorder ───────────────────────────────────────────
     async def record_realization(
@@ -1483,7 +1582,7 @@ async def _run() -> None:
         log.info("[%s] aggregate alert: %s +$%.0f across %d fills → $%.0f",
                  src.name, pos.market_symbol, buf["net_added"], buf["n_fills"],
                  pos.notional_usd)
-        await tg_send(text)
+        _digest_send(source_id, text)
 
     async def flush_reduce_aggregate(key: tuple[str, int]) -> None:
         buf = _pending_reduces.pop(key, None)
@@ -1523,7 +1622,7 @@ async def _run() -> None:
             log.info("[%s] reduce aggregate alert: %s −$%.0f across %d fills → remaining $%.0f",
                      src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
                      pos.notional_usd)
-            await tg_send(text)
+            _digest_send(source_id, text)
         else:
             log.info("[%s] reduce aggregate: %s −$%.0f across %d fills below min $%.0f, "
                      "suppressing alert (still recording realization)",
@@ -1895,12 +1994,17 @@ async def _run() -> None:
                         # ── HL-only: fetch realizing fills and record PnL ──────────
                         if src.is_hyperliquid:
                             try:
-                                # Use last-2000 user_fills (start_time_ms=None) and
-                                # filter to this market_id — simple and avoids
-                                # needing a reliable last-known timestamp.
+                                # The unobserved close happened since the PREVIOUS
+                                # reconciler pass, so only fills from the recent
+                                # window can belong to it. An unbounded fetch
+                                # (start_time_ms=None → last 2000 fills) once
+                                # re-booked a 2-day-old SOL close as a fresh
+                                # partial and flipped a −$105 loss into a +$292
+                                # "win" on the card — never fetch unbounded here.
+                                _sc_window_s = max(900, cfg.reconciler_interval_seconds * 10)
                                 _sc_fills = await src.client.fetch_realizing_fills(
                                     market_id=market_id,
-                                    start_time_ms=None,
+                                    start_time_ms=int((time.time() - _sc_window_s) * 1000),
                                 )
                                 # Only the fills we haven't booked yet (oldest-first).
                                 _sc_new = [
@@ -2212,6 +2316,50 @@ async def _run() -> None:
                         else None  # no scale-outs → card shows this fill's pnl as usual
                     )
 
+                    # ── Exchange-truth upgrade (HL only) ─────────────────────
+                    # The local sum only covers fills the stream actually saw;
+                    # dropped fills made 18 cards understate PnL (e.g. HYPE
+                    # +$13.37 shown vs +$61.79 true). When this round-trip has
+                    # recorded scale-outs we know its start, so re-sum ALL the
+                    # exchange's realizing fills for this market since then —
+                    # HL closedPnl is ground truth. Falls back to the local
+                    # total on any API hiccup.
+                    if src.is_hyperliquid and realized is not None:
+                        _rt_start = _roundtrip_start_ts(src.name, ev.trade.market_symbol)
+                        if _rt_start is not None:
+                            try:
+                                _rt_start_dt = datetime.fromisoformat(
+                                    str(_rt_start).replace("Z", "+00:00")
+                                )
+                                _ex_fills = await src.client.fetch_realizing_fills(
+                                    market_id=ev.trade.market_id,
+                                    start_time_ms=int(_rt_start_dt.timestamp() * 1000) - 2000,
+                                )
+                                _ex_total = Decimal(0)
+                                for _exf in _ex_fills:
+                                    if _exf.realized_pnl is not None:
+                                        _ex_total += _exf.realized_pnl
+                                # The close fill itself may not be visible on the
+                                # API yet (we're reacting to it in real time).
+                                if not any(
+                                    _exf.trade_id == ev.trade.trade_id for _exf in _ex_fills
+                                ):
+                                    _ex_total += realized
+                                if _card_total is None or _ex_total != _card_total:
+                                    log.info(
+                                        "[%s] close card %s: exchange-truth total $%s "
+                                        "(local sum was $%s)",
+                                        src.name, ev.trade.market_symbol,
+                                        _ex_total, _card_total,
+                                    )
+                                _card_total = _ex_total
+                            except Exception:
+                                log.warning(
+                                    "[%s] exchange-truth recompute failed for %s — "
+                                    "using local round-trip sum",
+                                    src.name, ev.trade.market_symbol, exc_info=True,
+                                )
+
                     # Record the FULL close realization (card + DB + broadcast)
                     await record_realization(
                         src=src,
@@ -2246,7 +2394,11 @@ async def _run() -> None:
 
                         if card_bytes:
                             side_txt = (pos_b.side.upper() if pos_b else ev.trade.side.upper())
-                            pnl_for_log = realized
+                            # Log the figure the card IMAGE shows (round-trip
+                            # total when there is one), not just this fill's pnl
+                            # — otherwise the log can't be audited against what
+                            # subscribers actually saw.
+                            pnl_for_log = _card_total if _card_total is not None else realized
                             if pnl_for_log is not None:
                                 sign = "+" if pnl_for_log >= 0 else "−"
                                 pnl_txt = f"{sign}${abs(pnl_for_log):,.2f}"
@@ -2256,7 +2408,14 @@ async def _run() -> None:
                                 f"🖼 PnL card · CLOSE {side_txt} "
                                 f"{ev.trade.market_symbol} · {pnl_txt}  [{src.name}]"
                             )
-                            await tg_send_photo(card_bytes, caption=src.url, log_text=log_text)
+                            # Caption carries coin/side/PnL so the channel is
+                            # searchable by ticker (the figures were previously
+                            # only inside the image). PnL exact = allowed by the
+                            # privacy posture; no price/size in the caption.
+                            _caption = f"{ev.trade.market_symbol} {side_txt} · {pnl_txt}"
+                            if src.url:
+                                _caption += f"\n{src.url}"
+                            await tg_send_photo(card_bytes, caption=_caption, log_text=log_text)
                         else:
                             ae = _close_anchor
                             await tg_send(format_event(
@@ -2444,7 +2603,112 @@ async def _run() -> None:
     await site.start()
     log.info("dashboard on http://localhost:%d/  (%d source(s))", cfg.dashboard_port, len(sources))
 
-    tasks = [consumer()]
+    # ── Daily jobs: channel recap + private self-audit (UTC midnight) ─────────
+    async def _daily_recap(day_iso: str) -> None:
+        """Post a recap of the given UTC day's CLOSED trades to the channel.
+        Skips silently when the day had no closed trades (no empty-spam)."""
+        rows = filter_trades(
+            closed_trades,
+            start_date=day_iso,
+            end_date=day_iso,  # date-only ⇒ inclusive end-of-day
+            symbols=cfg.stats_symbols,
+            exclude_symbols=_excluded_symbols,
+        )
+        agg = [
+            r for r in aggregate_round_trips(rows)
+            if (r.get("realization_kind") or "").upper() == "FULL"
+        ]
+        if not agg:
+            log.info("daily recap %s: no closed trades — skipping", day_iso)
+            return
+        s = compute_stats(agg)
+        await tg_send(format_stats_summary(s, title=f"📅 Daily recap — {day_iso}"))
+        card = render_stats_card(s)
+        if card:
+            await tg_send_photo(card, log_text=f"📅 Daily recap card — {day_iso}")
+
+    async def _daily_self_audit(day_start: datetime) -> None:
+        """Compare the DB's per-coin realized PnL for the given UTC day against
+        the exchange's own closedPnl (HL sources only). Any coin off by more
+        than $1 → PRIVATE DM to the owner. The public channel never sees this."""
+        day_end = day_start + timedelta(days=1)
+        day_iso = day_start.date().isoformat()
+        for s in _active_sources:
+            if not s.is_hyperliquid:
+                continue
+            try:
+                ex_fills = await s.client.fetch_realizing_fills(
+                    start_time_ms=int(day_start.timestamp() * 1000),
+                )
+            except Exception:
+                log.exception("self-audit: fetch_realizing_fills failed for %s", s.name)
+                continue
+            ex_by_coin: dict[str, Decimal] = {}
+            for f in ex_fills:
+                if f.timestamp >= day_end or s.is_excluded(f.market_symbol):
+                    continue
+                if f.realized_pnl is not None:
+                    ex_by_coin[f.market_symbol] = (
+                        ex_by_coin.get(f.market_symbol, Decimal(0)) + f.realized_pnl
+                    )
+            db_by_coin: dict[str, Decimal] = {}
+            for row in closed_trades:
+                if row.get("source") != s.name:
+                    continue
+                ts = row.get("ts") or ""
+                if not (day_iso <= ts[:10] < day_end.date().isoformat()):
+                    continue
+                sym = row.get("market_symbol") or "?"
+                if s.is_excluded(sym):
+                    continue
+                p = row.get("pnl")
+                if p is not None:
+                    try:
+                        db_by_coin[sym] = db_by_coin.get(sym, Decimal(0)) + Decimal(str(p))
+                    except Exception:
+                        pass
+            diffs = []
+            for sym in sorted(set(ex_by_coin) | set(db_by_coin)):
+                ex_v = ex_by_coin.get(sym, Decimal(0))
+                db_v = db_by_coin.get(sym, Decimal(0))
+                if abs(ex_v - db_v) > Decimal("1"):
+                    diffs.append(f"{sym}: recorded ${db_v:+,.2f} vs exchange ${ex_v:+,.2f}")
+            if diffs:
+                await tg_dm_owner(
+                    f"⚠️ PnL self-audit {day_iso} [{s.name}]: "
+                    f"{len(diffs)} coin(s) disagree with the exchange:\n"
+                    + "\n".join(diffs)
+                    + "\n\nChannel alerts for these may have shown wrong figures."
+                )
+                log.warning("self-audit %s [%s]: %d mismatches", day_iso, s.name, len(diffs))
+            else:
+                log.info("self-audit %s [%s]: clean", day_iso, s.name)
+
+    async def daily_jobs() -> None:
+        """Sleep until just past UTC midnight, then recap + self-audit yesterday."""
+        if not (cfg.daily_recap_enabled or cfg.daily_self_audit_enabled):
+            return
+        while True:
+            now = datetime.now(timezone.utc)
+            next_run = (now + timedelta(days=1)).replace(
+                hour=0, minute=1, second=0, microsecond=0
+            )
+            await asyncio.sleep((next_run - now).total_seconds())
+            day_start = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            if cfg.daily_recap_enabled and tg_token and tg_channel:
+                try:
+                    await _daily_recap(day_start.date().isoformat())
+                except Exception:
+                    log.exception("daily recap failed")
+            if cfg.daily_self_audit_enabled:
+                try:
+                    await _daily_self_audit(day_start)
+                except Exception:
+                    log.exception("daily self-audit failed")
+
+    tasks = [consumer(), daily_jobs()]
     for s in sources:
         tasks.append(ws_producer(s))
         tasks.append(rest_safety_producer(s))
