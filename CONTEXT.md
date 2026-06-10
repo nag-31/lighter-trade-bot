@@ -105,9 +105,16 @@ Every problem reported during the build, newest at the bottom. Status: ✅ fixed
     (`_roundtrip_start_ts` → `fetch_realizing_fills`), falling back to the
     local sum on API failure. Also: the close log line now shows the card's
     figure, not just the final fill's.
-    **Still open:** DB is missing fills (all PURR +258.22, all 18 SPX, the ENA
-    close) — pre-anchor history, only fixable by the reconcile rebuild
-    (`reconcile_hl_pnl.py --apply`, dry-run pending user OK).
+    **Resolved 2026-06-10:** the reconcile rebuild was APPLIED (user OK'd):
+    `reconcile_hl_pnl.py --days 10 --apply` — backup `events.db.bak-1781082272`,
+    185 bot rows replaced by 365 exchange-truth fills (PURR/SPX/ENA recovered).
+    Found+fixed in the process: the script tagged ONE FULL per coin per window
+    (`finalize()` heuristic), hiding later finished trades in "in progress" —
+    now `Trade.start_position` (HL `startPosition`) gives EXACT tags: FULL iff
+    fill size ≥ |startPosition| (commit 242863e). Verified post-apply: SOL 3
+    closed trips = +845.14 exact; per-coin closed+open sums match HL truth to
+    the cent (ZEC −1,581.44, PURR +258.22, SPX −154.53). Dashboard June-1+:
+    74 closed / +$1,934.90 / 50.0% win.
 23. ✅ **TG alert quality-of-life (4 features, 2026-06-10, local, NOT deployed):**
     (a) **Cross-coin session digest** — add/reduce alerts flushing within
     `digest_window_seconds` (20s) per source are combined into ONE message
