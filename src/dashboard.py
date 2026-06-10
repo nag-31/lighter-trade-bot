@@ -401,7 +401,13 @@ function renderClosedTrades(trades) {
     const tileFootnote = tr.footnote ? `<div style="font-size:10px;color:#6b7280;margin-top:4px">${esc(tr.footnote)}</div>` : '';
     let thumbHtml = '';
     if (tr.card_path) {
-      thumbHtml = `<div class="tile-thumb-wrap"><img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="showCardModal('${esc(tr.card_path)}')"></div>`;
+      // On an IN PROGRESS tile the thumb is the LATEST scale-out's card, not
+      // the running total — label it so the smaller figure isn't read as a
+      // contradiction of the tile's number.
+      const thumbNote = _rk === 'OPEN'
+        ? `<div style="font-size:9px;letter-spacing:.6px;color:#6b7280;text-transform:uppercase;margin:2px 0 3px">latest scale-out — not the trade total</div>`
+        : '';
+      thumbHtml = `<div class="tile-thumb-wrap">${thumbNote}<img class="card-thumb" src="${esc(tr.card_path)}" loading="lazy" alt="PnL card" onclick="showCardModal('${esc(tr.card_path)}')"></div>`;
     }
     return `<div class="trade-tile ${isWin ? 'win' : 'loss'}">
   <div class="tile-header">${esc(tr.source || '')} &middot; ${esc(tr.market_symbol || '')}</div>
@@ -2615,7 +2621,19 @@ async def _run() -> None:
             log.exception("send_stats failed")
             return web.json_response({"ok": False, "error": str(exc)})
 
-    app = web.Application()
+    # Card PNGs keep the same filename when regenerated (rebuilds overwrite in
+    # place), so browsers must revalidate instead of serving a cached image —
+    # a stale cache once showed a card with the previous rebuild's win-rate
+    # ("150/198") after the data on disk was already fixed. no-cache still
+    # allows 304 Not Modified, so unchanged cards cost almost nothing.
+    @web.middleware
+    async def _cards_no_cache(request: web.Request, handler):
+        resp = await handler(request)
+        if request.path.startswith("/cards/"):
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
+    app = web.Application(middlewares=[_cards_no_cache])
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/healthz", healthz)
