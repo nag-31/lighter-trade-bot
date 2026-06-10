@@ -352,6 +352,17 @@ async def main(
     )
     log.info("Fetched %d realizing fills", len(fills))
 
+    # A burst close can land several fills in the SAME millisecond, and the
+    # API's intra-ms order is arbitrary — that scattered a 6-fill MEGA close
+    # into a fake 2-fill "closed" + 4-fill "in progress". startPosition (size
+    # before the fill) strictly SHRINKS through a close burst, so sorting
+    # same-ts fills by descending |startPosition| restores the true sequence
+    # (the flattening fill comes last).
+    fills.sort(key=lambda f: (
+        f.timestamp,
+        -abs(f.start_position) if f.start_position is not None else Decimal(0),
+    ))
+
     # 6. Reconstruct records (pure logic in hl_pnl_logic.py)
     rebuilt_records = reconstruct_all(fills)
     log.info("Reconstructed %d records", len(rebuilt_records))

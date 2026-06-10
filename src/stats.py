@@ -216,7 +216,17 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
 
     aggregated: list[dict] = []
     for (source, symbol), rows in groups.items():
-        rows_sorted = sorted(rows, key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT)
+        # Tiebreaker for fills sharing the SAME timestamp (burst close): the
+        # close row goes LAST — the position physically flattens at the end of
+        # the burst. Without this, an arbitrarily-ordered same-ms burst split
+        # one trade into a fake small "closed" + a phantom "in progress" blob.
+        rows_sorted = sorted(
+            rows,
+            key=lambda r: (
+                _parse_ts(r.get("ts")) or _MIN_DT,
+                0 if (r.get("realization_kind") or "").upper() == "PARTIAL" else 1,
+            ),
+        )
         segment: list[dict] = []
         for r in rows_sorted:
             segment.append(r)

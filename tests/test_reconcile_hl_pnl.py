@@ -349,6 +349,23 @@ class TestRealizationKind:
         assert by_id[1] == "FULL" and by_id[3] == "FULL"   # exact, untouched by finalize
         assert by_id[2] == "PARTIAL" and by_id[4] == "FULL"  # heuristic + finalize
 
+    def test_same_ts_burst_sorted_by_start_position_descending(self):
+        # Same-millisecond burst close: sorting by (ts, -|startPosition|)
+        # restores the physical order — the flattening fill (sp == size) last.
+        fills = [
+            _make_fill(trade_id=1, market_symbol="MEGA", size="500", start_position="500", realized_pnl="-26.50"),
+            _make_fill(trade_id=2, market_symbol="MEGA", size="1500", start_position="3500", realized_pnl="-14.39"),
+            _make_fill(trade_id=3, market_symbol="MEGA", size="1500", start_position="2000", realized_pnl="-34.76"),
+        ]
+        fills.sort(key=lambda f: (
+            f.timestamp,
+            -abs(f.start_position) if f.start_position is not None else Decimal(0),
+        ))
+        assert [f.trade_id for f in fills] == [2, 3, 1]
+        records = reconstruct_all(fills)
+        kinds = [r["realization_kind"] for r in records]
+        assert kinds == ["PARTIAL", "PARTIAL", "FULL"]
+
     def test_finalize_static_method(self):
         records = [
             {"market_symbol": "BTC", "realization_kind": "FULL"},

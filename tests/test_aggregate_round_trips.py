@@ -199,6 +199,26 @@ def test_legacy_null_row_outside_window_is_kept():
     assert agg[1]["pnl"] == 50.0
 
 
+def test_same_timestamp_burst_close_groups_into_one_trip():
+    # A burst close lands all fills in the SAME millisecond; the API/DB order
+    # is arbitrary and may put the FULL row mid-burst. The close must still be
+    # treated as the trip's LAST row: one closed trade, no phantom in-progress.
+    ts = "2026-06-10T06:55:39.743000+00:00"
+    rows = [
+        _row(ts, "MEGA", -14.39, "PARTIAL"),
+        _row(ts, "MEGA", -26.50, "FULL"),     # arbitrary position in the list
+        _row(ts, "MEGA", -34.76, "PARTIAL"),
+        _row(ts, "MEGA", -0.04, "PARTIAL"),
+        _row(ts, "MEGA", -1.89, "PARTIAL"),
+        _row(ts, "MEGA", -13.99, "PARTIAL"),
+    ]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 1
+    assert agg[0]["realization_kind"] == "FULL"
+    assert abs(agg[0]["pnl"] - (-91.57)) < 0.01  # ALL six fills in one trade
+    assert agg[0]["n_fills"] == 6
+
+
 def test_running_win_total_counts_closed_only():
     rows = [
         _row("2026-06-01T10:00:00Z", "BTC", 100, "FULL"),   # win  -> 1/1
