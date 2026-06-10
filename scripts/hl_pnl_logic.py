@@ -213,9 +213,12 @@ def reconstruct_record(
 
     is_win = realized > 0
 
-    # Accumulate win counter
-    new_total = running_total + 1
-    new_wins = running_wins + (1 if is_win else 0)
+    # wins/total are computed by reconstruct_all at TRADE granularity (one
+    # increment per FULL close, judged on the round-trip's total PnL) and
+    # passed in here verbatim. Per-fill incrementing here once put "149/327"
+    # on a card's win-rate bar.
+    new_total = running_total
+    new_wins = running_wins
 
     return {
         "ts": fill.timestamp.isoformat(),
@@ -261,6 +264,10 @@ def reconstruct_all(fills: list[Trade]) -> list[dict]:
     records: list[dict] = []
     running_wins = 0
     running_total = 0
+    # Running PnL of each symbol's CURRENT round-trip — a FULL close judges
+    # win/loss on this total (a trade can close on a red fill yet be a win
+    # overall, e.g. NEAR +193 trip ending in a −41 close fill).
+    trip_pnl: dict[str, Decimal] = {}
     # Markets where any fill lacked start_position → their tags came from the
     # legacy heuristic and need the finalize() correction pass. Markets where
     # every fill carried start_position are tagged EXACTLY by classify() —
@@ -276,9 +283,16 @@ def reconstruct_all(fills: list[Trade]) -> list[dict]:
         if getattr(fill, "start_position", None) is None:
             fallback_syms.add(fill.market_symbol)
         kind = tracker.classify(fill)
+        sym = fill.market_symbol
+        trip_total = trip_pnl.get(sym, Decimal(0)) + fill.realized_pnl
+        if kind == "FULL":
+            trip_pnl[sym] = Decimal(0)
+            running_total += 1
+            if trip_total > 0:
+                running_wins += 1
+        else:
+            trip_pnl[sym] = trip_total
         rec = reconstruct_record(fill, kind, running_wins, running_total)
-        running_wins = rec["wins"]
-        running_total = rec["total"]
         records.append(rec)
 
     # Post-processing for heuristic-tagged markets only: last fill → FULL.

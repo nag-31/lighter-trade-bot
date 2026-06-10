@@ -44,7 +44,7 @@ from .display_transform import PrivacyParams, disp_notional, disp_price, disp_si
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .health import HealthRegistry
-from .pnl_card import calculate_pnl, generate_pnl_card, record_result
+from .pnl_card import calculate_pnl, generate_pnl_card, peek_result, record_result
 from .sources import BotSettings, Source, load_settings, load_sources
 from .stats import aggregate_round_trips, compute_stats, filter_trades, format_stats_summary
 from .stats_card import render_stats_card
@@ -1460,7 +1460,15 @@ async def _run() -> None:
 
         # ── PnL / pct ─────────────────────────────────────────────────────────
         is_win = realized_pnl is not None and realized_pnl > 0
-        wins, total = record_result(is_win)
+        # The win-rate record counts CLOSED TRADES: only a FULL close advances
+        # it, judged on the ROUND-TRIP total (card_pnl_override when the trade
+        # had scale-outs — a trade can end on a red fill yet be a win overall).
+        # Partial cards just display the current record.
+        if kind == "FULL":
+            _trade_pnl = card_pnl_override if card_pnl_override is not None else realized_pnl
+            wins, total = record_result(_trade_pnl is not None and _trade_pnl > 0)
+        else:
+            wins, total = peek_result()
 
         pct: "Decimal | None" = None
         if avg_entry and avg_entry != 0:

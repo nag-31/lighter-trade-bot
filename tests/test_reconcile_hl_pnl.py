@@ -232,32 +232,48 @@ class TestNoPnlGuard:
 # ---------------------------------------------------------------------------
 
 class TestRunningCounters:
-    def test_first_win_sets_wins_1_total_1(self):
+    # wins/total count CLOSED TRADES (one per FULL close, judged on the
+    # round-trip total) — not fills. reconstruct_record stores the counters
+    # verbatim; reconstruct_all computes them.
+
+    def test_reconstruct_record_stores_counters_verbatim(self):
         fill = _make_fill(realized_pnl="100")
-        rec = reconstruct_record(fill, "FULL", 0, 0)
-        assert rec["wins"] == 1
-        assert rec["total"] == 1
+        rec = reconstruct_record(fill, "FULL", 3, 7)
+        assert rec["wins"] == 3
+        assert rec["total"] == 7
 
-    def test_first_loss_sets_wins_0_total_1(self):
-        fill = _make_fill(realized_pnl="-100")
-        rec = reconstruct_record(fill, "FULL", 0, 0)
-        assert rec["wins"] == 0
-        assert rec["total"] == 1
+    def test_single_trade_win_and_loss(self):
+        win = reconstruct_all([_make_fill(realized_pnl="100", size="1", start_position="1")])
+        assert win[0]["wins"] == 1 and win[0]["total"] == 1
+        loss = reconstruct_all([_make_fill(realized_pnl="-100", size="1", start_position="1")])
+        assert loss[0]["wins"] == 0 and loss[0]["total"] == 1
 
-    def test_accumulation_across_calls(self):
+    def test_accumulation_across_trades(self):
         fills = [
-            _make_fill(trade_id=1, realized_pnl="100"),   # win
-            _make_fill(trade_id=2, realized_pnl="-50"),   # loss
-            _make_fill(trade_id=3, realized_pnl="200"),   # win
+            _make_fill(trade_id=1, realized_pnl="100", size="1", start_position="1"),   # win
+            _make_fill(trade_id=2, realized_pnl="-50", size="1", start_position="1"),   # loss
+            _make_fill(trade_id=3, realized_pnl="200", size="1", start_position="1"),   # win
         ]
         records = reconstruct_all(fills)
         assert records[0]["wins"] == 1 and records[0]["total"] == 1
         assert records[1]["wins"] == 1 and records[1]["total"] == 2
         assert records[2]["wins"] == 2 and records[2]["total"] == 3
 
+    def test_partials_do_not_advance_counter(self):
+        # 3 fills, ONE trade: scale-out +100, scale-out +50, close -5.
+        # The trade total is +145 → ONE win, even though the close fill is red.
+        fills = [
+            _make_fill(trade_id=1, realized_pnl="100", size="2", start_position="10"),
+            _make_fill(trade_id=2, realized_pnl="50", size="3", start_position="8"),
+            _make_fill(trade_id=3, realized_pnl="-5", size="5", start_position="5"),
+        ]
+        records = reconstruct_all(fills)
+        assert [(r["wins"], r["total"]) for r in records] == [(0, 0), (0, 0), (1, 1)]
+
     def test_all_losses(self):
         fills = [
-            _make_fill(trade_id=i, realized_pnl="-10") for i in range(1, 4)
+            _make_fill(trade_id=i, realized_pnl="-10", size="1", start_position="1")
+            for i in range(1, 4)
         ]
         records = reconstruct_all(fills)
         assert records[-1]["wins"] == 0
@@ -265,7 +281,8 @@ class TestRunningCounters:
 
     def test_all_wins(self):
         fills = [
-            _make_fill(trade_id=i, realized_pnl="10") for i in range(1, 6)
+            _make_fill(trade_id=i, realized_pnl="10", size="1", start_position="1")
+            for i in range(1, 6)
         ]
         records = reconstruct_all(fills)
         assert records[-1]["wins"] == 5
@@ -467,9 +484,9 @@ class TestReconstructAll:
     def test_multi_market_counters_span_markets(self):
         # wins/total should count across ALL markets, not per-market
         fills = [
-            _make_fill(trade_id=1, market_symbol="BTC", realized_pnl="100"),
-            _make_fill(trade_id=2, market_symbol="ETH", realized_pnl="-50"),
-            _make_fill(trade_id=3, market_symbol="BTC", realized_pnl="200"),
+            _make_fill(trade_id=1, market_symbol="BTC", realized_pnl="100", size="1", start_position="1"),
+            _make_fill(trade_id=2, market_symbol="ETH", realized_pnl="-50", size="1", start_position="1"),
+            _make_fill(trade_id=3, market_symbol="BTC", realized_pnl="200", size="1", start_position="1"),
         ]
         records = reconstruct_all(fills)
         assert records[2]["total"] == 3

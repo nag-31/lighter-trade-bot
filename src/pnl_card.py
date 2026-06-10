@@ -66,11 +66,20 @@ _score_window: deque[bool] = deque(maxlen=50)
 
 
 def record_result(is_win: bool) -> tuple[int, int]:
-    """Record a close result and return (wins, total) from recent window."""
+    """Record a CLOSED-TRADE result and return (wins, total) from recent window.
+
+    Call ONLY on a full close — a scale-out is not a trade. (Recording every
+    partial batch inflated the card's win-rate bar with phantom "trades".)
+    """
     _score_window.append(is_win)
     wins = sum(_score_window)
     total = len(_score_window)
     return wins, total
+
+
+def peek_result() -> tuple[int, int]:
+    """Current (wins, total) WITHOUT recording — for partial-close cards."""
+    return sum(_score_window), len(_score_window)
 
 
 # ---------------------------------------------------------------------------
