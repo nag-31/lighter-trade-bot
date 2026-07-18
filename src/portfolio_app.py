@@ -1,4 +1,4 @@
-﻿"""Local portfolio overview webapp.
+"""Local portfolio overview webapp.
 
 Run with:
     python -m src.portfolio_app
@@ -190,6 +190,8 @@ async def _privacy_headers(request: web.Request, handler: Any) -> web.StreamResp
     if request.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
+    elif request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 
 

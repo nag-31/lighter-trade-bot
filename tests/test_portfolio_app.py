@@ -95,6 +95,7 @@ def test_static_serving(tmp_path, monkeypatch):
             )
             resp = await client.get("/static/app.js")
             assert resp.status == 200
+            assert resp.headers["Cache-Control"] == "no-cache, must-revalidate"
             assert "console.log" in await resp.text()
         finally:
             await client.close()
