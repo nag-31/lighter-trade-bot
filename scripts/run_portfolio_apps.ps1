@@ -20,7 +20,8 @@ if (-not (Test-Path -LiteralPath $SecretFile)) {
         $plain = $null
     }
     $bytes = New-Object byte[] 48
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $sessionSecret = [Convert]::ToBase64String($bytes)
     @(
         "PORTFOLIO_PASSWORD_HASH=$hash"
