@@ -783,7 +783,7 @@ class HyperliquidClient:
             trade_id = int(raw["tid"])
             coin = str(raw["coin"])
 
-            # Perp-only filter — skip spot / builder fills once we have the
+            # Perp-only filter — skip spot fills once we have the
             # stable universe set.  We intentionally use _perp_universe (not
             # _coin_to_id) here: _market_id() adds synthetic entries to
             # _coin_to_id as a side-effect, which made _coin_to_id non-empty
@@ -794,7 +794,12 @@ class HyperliquidClient:
             # is never mutated afterwards, so the filter is stable.
             # When _perp_universe is empty (bootstrap not called) the filter is
             # skipped entirely — safe fallback, all fills are parsed.
-            if self._perp_universe and coin.upper() not in self._perp_universe:
+            # HIP-3 / builder-deployed perps use a dex-prefixed coin such as
+            # "xyz:XYZ100"; spot fills use "@<spot_index>". Keep HIP-3 perps
+            # even though they are not present in the default meta() universe.
+            is_spot_fill = coin.startswith("@")
+            is_hip3_perp = ":" in coin and not is_spot_fill
+            if self._perp_universe and not is_hip3_perp and coin.upper() not in self._perp_universe:
                 log.debug(
                     "[%s] HL fill skipped (not perp): coin=%s tid=%d",
                     self.source, coin, trade_id,

@@ -1,0 +1,20 @@
+[Unit]
+Description=Crypto apps hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/lighter-trade-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=APP_HUB_PUBLIC_SUFFIX=8-231-102-153.sslip.io
+Environment=APP_HUB_PUBLIC_SCHEME=https
+ExecStart=/home/ADMIN/apps/lighter-trade-bot/.venv/bin/python -B -m apps_hub.access_page --host 127.0.0.1 --port 8800
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -53,8 +53,11 @@ from .types import Event, EventKind, OpenOrder, Position, Trade
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
 
-DB_PATH = Path(__file__).parent.parent / "data" / "events.db"
-PIDFILE = Path("/tmp/lighterbot.pid")
+DATA_DIR = Path(__file__).parent.parent / "data"
+DB_PATH = DATA_DIR / "events.db"
+PIDFILE = Path(os.environ.get("LIGHTERBOT_PIDFILE") or (
+    DATA_DIR / "lighterbot.pid" if os.name == "nt" else "/tmp/lighterbot.pid"
+))
 
 
 def _acquire_pid_lock() -> bool:

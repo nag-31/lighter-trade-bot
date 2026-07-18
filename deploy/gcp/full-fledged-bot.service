@@ -1,0 +1,18 @@
+[Unit]
+Description=Full-fledged crypto bot dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/lighter-trade-bot/bots/full_fledged_bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ADMIN/apps/lighter-trade-bot/.venv/bin/python -B -m full_fledged_bot.cli --config config.example.yaml serve
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -331,24 +331,28 @@ class TestMultiCoinCascadeBug:
         assert "RENDER" in symbols, "RENDER fills must not be dropped"
         assert len(result) == 3
 
-    def test_spot_fill_dropped_perps_kept(self):
-        """A spot-like coin ('xyz:GOLD') is dropped; perp coins survive."""
+    def test_spot_fill_dropped_hip3_and_default_perps_kept(self):
+        """Spot '@index' fills are dropped; default and HIP-3 perp coins survive."""
         c = self._make_bootstrapped_client()
         raw_fills = [
-            _raw_fill(tid=10, coin="BTC",      closed_pnl="100", dir_="Close Long"),
-            _raw_fill(tid=11, coin="ETH",      closed_pnl="200", dir_="Close Long"),
-            _raw_fill(tid=12, coin="xyz:GOLD", closed_pnl="5",   dir_="Close Long"),
-            _raw_fill(tid=13, coin="RENDER",   closed_pnl="30",  dir_="Close Short"),
+            _raw_fill(tid=10, coin="BTC",         closed_pnl="100", dir_="Close Long"),
+            _raw_fill(tid=11, coin="ETH",         closed_pnl="200", dir_="Close Long"),
+            _raw_fill(tid=12, coin="@107",        closed_pnl="5",   dir_="Sell"),
+            _raw_fill(tid=13, coin="RENDER",      closed_pnl="30",  dir_="Close Short"),
+            _raw_fill(tid=14, coin="rwa:SKHYNIX", closed_pnl="25",  dir_="Close Long"),
         ]
         with patch.object(c._info, "user_fills", return_value=raw_fills):
             result = _run(c.fetch_realizing_fills())
 
         tids = {t.trade_id for t in result}
+        symbols = {t.market_symbol for t in result}
         assert 10 in tids, "BTC fill must be kept"
         assert 11 in tids, "ETH fill must be kept"
-        assert 12 not in tids, "spot fill 'xyz:GOLD' must be dropped by perp filter"
+        assert 12 not in tids, "spot fill '@107' must be dropped by perp filter"
         assert 13 in tids, "RENDER fill must be kept"
-        assert len(result) == 3
+        assert 14 in tids, "HIP-3 stock perp fill must be kept"
+        assert "RWA:SKHYNIX" in symbols
+        assert len(result) == 4
 
     def test_empty_perp_universe_skips_filter_parses_all(self):
         """When _perp_universe is empty (no bootstrap), the filter is skipped."""

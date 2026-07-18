@@ -1,0 +1,250 @@
+{
+  "report": {
+    "fills_ingested": 13,
+    "duplicate_fills_skipped": 0,
+    "closed_round_trips_reconstructed": 6,
+    "open_positions_remaining": 0,
+    "net_pnl": "10.00000000",
+    "fees": "0E-8",
+    "funding": "0E-8",
+    "win_rate": "50.00000000",
+    "mismatches_vs_exchange_reported_pnl": [],
+    "sample_cards_generated": 5,
+    "telegram_alerts_sent": 0,
+    "telegram_alerts_skipped_historical": 0,
+    "cutoff_mode": "raw-fill"
+  },
+  "analytics": {
+    "closed_trades": 6,
+    "open_positions": 0,
+    "wins": 3,
+    "losses": 3,
+    "breakevens": 0,
+    "non_wins": 3,
+    "win_rate": "50.00000000",
+    "net_pnl": "10.00000000",
+    "gross_pnl": "10.00000000",
+    "total_fees": "0E-8",
+    "funding": "0E-8",
+    "avg_win": "20.00000000",
+    "avg_loss": "-16.66666667",
+    "expectancy": "1.66666667",
+    "profit_factor": "1.20000000",
+    "payoff_ratio": "1.20000000",
+    "best_trade_net": {
+      "id": "Lighter:fixture:PARTWIN:2026-06-01T00:05:00+00:00:6",
+      "source": "Lighter",
+      "symbol": "PARTWIN",
+      "direction": "long",
+      "closed_at": "2026-06-01T00:07:00+00:00",
+      "net_pnl": "30.00000000",
+      "return_on_cost": "10.00000000"
+    },
+    "worst_trade_net": {
+      "id": "Lighter:fixture:LOSS:2026-06-01T00:03:00+00:00:4",
+      "source": "Lighter",
+      "symbol": "LOSS",
+      "direction": "long",
+      "closed_at": "2026-06-01T00:04:00+00:00",
+      "net_pnl": "-20.00000000",
+      "return_on_cost": "-20.00000000"
+    },
+    "best_trade_return": {
+      "id": "Lighter:fixture:WIN:2026-06-01T00:01:00+00:00:2",
+      "source": "Lighter",
+      "symbol": "WIN",
+      "direction": "long",
+      "closed_at": "2026-06-01T00:02:00+00:00",
+      "net_pnl": "20.00000000",
+      "return_on_cost": "20.00000000"
+    },
+    "worst_trade_return": {
+      "id": "Lighter:fixture:LOSS:2026-06-01T00:03:00+00:00:4",
+      "source": "Lighter",
+      "symbol": "LOSS",
+      "direction": "long",
+      "closed_at": "2026-06-01T00:04:00+00:00",
+      "net_pnl": "-20.00000000",
+      "return_on_cost": "-20.00000000"
+    },
+    "max_win_streak": 1,
+    "max_loss_streak": 2,
+    "max_drawdown": "-30.00000000",
+    "equity_curve": [
+      {
+        "index": 1,
+        "closed_at": "2026-06-01T00:02:00+00:00",
+        "symbol": "WIN",
+        "net_pnl": "20.00000000",
+        "equity": "20.00000000",
+        "drawdown": "0E-8"
+      },
+      {
+        "index": 2,
+        "closed_at": "2026-06-01T00:04:00+00:00",
+        "symbol": "LOSS",
+        "net_pnl": "-20.00000000",
+        "equity": "0E-8",
+        "drawdown": "-20.00000000"
+      },
+      {
+        "index": 3,
+        "closed_at": "2026-06-01T00:07:00+00:00",
+        "symbol": "PARTWIN",
+        "net_pnl": "30.00000000",
+        "equity": "30.00000000",
+        "drawdown": "0E-8"
+      },
+      {
+        "index": 4,
+        "closed_at": "2026-06-01T00:10:00+00:00",
+        "symbol": "PARTLOSS",
+        "net_pnl": "-10.00000000",
+        "equity": "20.00000000",
+        "drawdown": "-10.00000000"
+      },
+      {
+        "index": 5,
+        "closed_at": "2026-06-01T00:12:00+00:00",
+        "symbol": "FLIP",
+        "net_pnl": "-20.00000000",
+        "equity": "0E-8",
+        "drawdown": "-30.00000000"
+      },
+      {
+        "index": 6,
+        "closed_at": "2026-06-01T00:13:00+00:00",
+        "symbol": "FLIP",
+        "net_pnl": "10.00000000",
+        "equity": "10.00000000",
+        "drawdown": "-20.00000000"
+      }
+    ],
+    "by_source": [
+      {
+        "name": "Lighter",
+        "closed_trades": 6,
+        "wins": 3,
+        "losses": 3,
+        "breakevens": 0,
+        "non_wins": 3,
+        "win_rate": "50.00000000",
+        "net_pnl": "10.00000000"
+      }
+    ],
+    "by_symbol": [
+      {
+        "name": "FLIP",
+        "closed_trades": 2,
+        "wins": 1,
+        "losses": 1,
+        "breakevens": 0,
+        "non_wins": 1,
+        "win_rate": "50.00000000",
+        "net_pnl": "-10.00000000"
+      },
+      {
+        "name": "LOSS",
+        "closed_trades": 1,
+        "wins": 0,
+        "losses": 1,
+        "breakevens": 0,
+        "non_wins": 1,
+        "win_rate": "0E-8",
+        "net_pnl": "-20.00000000"
+      },
+      {
+        "name": "PARTLOSS",
+        "closed_trades": 1,
+        "wins": 0,
+        "losses": 1,
+        "breakevens": 0,
+        "non_wins": 1,
+        "win_rate": "0E-8",
+        "net_pnl": "-10.00000000"
+      },
+      {
+        "name": "PARTWIN",
+        "closed_trades": 1,
+        "wins": 1,
+        "losses": 0,
+        "breakevens": 0,
+        "non_wins": 0,
+        "win_rate": "100.00000000",
+        "net_pnl": "30.00000000"
+      },
+      {
+        "name": "WIN",
+        "closed_trades": 1,
+        "wins": 1,
+        "losses": 0,
+        "breakevens": 0,
+        "non_wins": 0,
+        "win_rate": "100.00000000",
+        "net_pnl": "20.00000000"
+      }
+    ],
+    "by_direction": [
+      {
+        "name": "long",
+        "closed_trades": 5,
+        "wins": 2,
+        "losses": 3,
+        "breakevens": 0,
+        "non_wins": 3,
+        "win_rate": "40.00000000",
+        "net_pnl": "0E-8"
+      },
+      {
+        "name": "short",
+        "closed_trades": 1,
+        "wins": 1,
+        "losses": 0,
+        "breakevens": 0,
+        "non_wins": 0,
+        "win_rate": "100.00000000",
+        "net_pnl": "10.00000000"
+      }
+    ],
+    "by_period": {
+      "day": [
+        {
+          "name": "2026-06-01",
+          "closed_trades": 6,
+          "wins": 3,
+          "losses": 3,
+          "breakevens": 0,
+          "non_wins": 3,
+          "win_rate": "50.00000000",
+          "net_pnl": "10.00000000"
+        }
+      ],
+      "week": [
+        {
+          "name": "2026-W23",
+          "closed_trades": 6,
+          "wins": 3,
+          "losses": 3,
+          "breakevens": 0,
+          "non_wins": 3,
+          "win_rate": "50.00000000",
+          "net_pnl": "10.00000000"
+        }
+      ],
+      "month": [
+        {
+          "name": "2026-06",
+          "closed_trades": 6,
+          "wins": 3,
+          "losses": 3,
+          "breakevens": 0,
+          "non_wins": 3,
+          "win_rate": "50.00000000",
+          "net_pnl": "10.00000000"
+        }
+      ]
+    },
+    "open_position_details": [],
+    "include_open": false
+  }
+}

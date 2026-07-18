@@ -1,0 +1,17 @@
+[Unit]
+Description=eNKapital static website
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/eNKapital/eNKapital-main/eNKapital-main
+ExecStart=/usr/bin/python3 -B -m http.server 8088 --bind 127.0.0.1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

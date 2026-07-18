@@ -1,0 +1,20 @@
+[Unit]
+Description=Private crypto portfolio dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/lighter-trade-bot
+EnvironmentFile=/home/ADMIN/apps/lighter-trade-bot/.env
+EnvironmentFile=/home/ADMIN/apps/lighter-trade-bot/.env.portfolio-private
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ADMIN/apps/lighter-trade-bot/.venv/bin/python -B -m src.portfolio_app --host 127.0.0.1 --port 8791 --storage-mode private --db-path /home/ADMIN/apps/lighter-trade-bot/data/portfolio.db
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

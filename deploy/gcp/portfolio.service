@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto portfolio dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/lighter-trade-bot
+EnvironmentFile=/home/ADMIN/apps/lighter-trade-bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ADMIN/apps/lighter-trade-bot/.venv/bin/python -B -m src.portfolio_app --host 127.0.0.1 --port 8790 --storage-mode guest
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
