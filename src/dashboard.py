@@ -95,6 +95,13 @@ def _to_jsonable(obj: Any) -> Any:
     return obj
 
 
+def _trade_dedup_key(trade: Trade) -> tuple[str, int]:
+    """Identify a fill without conflating independent Hyperliquid DEX tids."""
+    symbol = str(trade.market_symbol).upper()
+    dex = symbol.split(":", 1)[0] if ":" in symbol else ""
+    return dex, trade.trade_id
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -2210,9 +2217,10 @@ async def _run() -> None:
             if src is None:
                 continue
             # Set-based dedup catches WS replay and REST/WS overlap regardless of order.
-            if trade.trade_id in src.seen_tids:
+            trade_key = _trade_dedup_key(trade)
+            if trade_key in src.seen_tids:
                 continue
-            src.seen_tids.add(trade.trade_id)
+            src.seen_tids.add(trade_key)
             src.last_trade_id = max(src.last_trade_id or 0, trade.trade_id)
             events = src.tracker.apply(trade)
             for ev in events:

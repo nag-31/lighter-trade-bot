@@ -471,3 +471,7 @@ Database migrations and Timescale setup were applied. Existing schema setup emit
 7. After restart, verify the unit/container, its local health endpoint, the public HTTPS endpoint, and `https://hub.8-231-102-153.sslip.io/api/status`.
 
 Deployment definitions live in `deploy/gcp/`, including the systemd units and `crypto-apps-nginx.conf`. The Apps Hub's cloud hostname handling is in `apps_hub/access_page.py` and uses `APP_HUB_PUBLIC_SUFFIX` plus `APP_HUB_PUBLIC_SCHEME`.
+
+### HIP-3 Hyperliquid tracking fix (2026-07-23)
+
+Hyperliquid builder-deployed perps (for example `xyz:AMD`) use separate DEX metadata universes, asset-ID offsets, and `tid` sequences. The tracker now loads `perpDexs` plus each DEX's `meta(dex=...)`, maps HIP-3 assets with the SDK's `110000 + DEX index * 10000` offsets, keeps per-DEX REST/WS cursors, and deduplicates by `(DEX namespace, tid)`. Mixed-DEX REST results are limited by fill timestamp so default-Dex volume cannot hide recent HIP-3 fills. The dashboard consumer uses the same namespaced dedup key. This preserves the existing snapshot-warm behavior: WS snapshots seed cursors but are not emitted as new trade events.

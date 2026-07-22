@@ -107,8 +107,10 @@ class HyperliquidClient:
         self._ch_cache: Optional[dict] = None
         self._ch_cache_ts: float = 0.0
 
-        # Tracks the highest tid seen; used for dedup and gap-fill.
+        # Tracks the highest tid seen for compatibility/logging. HIP-3 DEXes
+        # have independent tid sequences, so filtering must use the per-DEX map.
         self._last_tid: Optional[int] = None
+        self._last_tid_by_dex: dict[str, int] = {}
 
         # asyncio event loop captured when stream_trades() first runs.
         # Used to bridge sync WS callbacks -> async queue via call_soon_threadsafe.
@@ -149,10 +151,38 @@ class HyperliquidClient:
                 if name:
                     self._coin_to_id[name] = idx
                     self._id_to_coin[idx] = name
+            # Builder-deployed HIP-3 perps live in separate DEX metadata
+            # universes. Their asset IDs use the official 110000 + DEX offset
+            # scheme; do not create order-dependent synthetic IDs for them.
+            try:
+                dex_rows = await loop.run_in_executor(None, self._info.perp_dexs)
+                dex_names = [
+                    str(row.get("name", "")).strip()
+                    for row in (dex_rows or [])
+                    if isinstance(row, dict) and str(row.get("name", "")).strip()
+                ]
+                for dex_index, dex_name in enumerate(dex_names):
+                    dex_meta = await loop.run_in_executor(
+                        None, lambda d=dex_name: self._info.meta(dex=d)
+                    )
+                    dex_universe = dex_meta.get("universe") if isinstance(dex_meta, dict) else None
+                    if not isinstance(dex_universe, list):
+                        continue
+                    offset = 110000 + dex_index * 10000
+                    for asset_index, item in enumerate(dex_universe):
+                        name = str(item.get("name", "")).upper() if isinstance(item, dict) else ""
+                        if name:
+                            self._coin_to_id[name] = offset + asset_index
+                            self._id_to_coin[offset + asset_index] = name
+                log.info(
+                    "[%s] loaded %d HL market symbols across default + DEXs %s",
+                    self.source, len(self._id_to_coin), dex_names,
+                )
+            except Exception:
+                log.exception("[%s] failed to load HIP-3 DEX metadata", self.source)
             # Populate the stable perp-universe set so _parse_fill can use it
             # as a filter without being affected by _market_id()'s side-effects.
             self._perp_universe = set(self._coin_to_id.keys())
-            log.info("[%s] loaded %d HL market symbols", self.source, len(self._id_to_coin))
         else:
             log.warning(
                 "[%s] HL meta() returned no universe — coins get synthetic ids",
@@ -430,21 +460,39 @@ class HyperliquidClient:
             return []
 
         trades: list[Trade] = []
+        max_tid_by_dex: dict[str, int] = {}
         for raw in raw_fills:
+            if isinstance(raw, dict) and raw.get("tid") is not None:
+                dex = self._dex_key(str(raw.get("coin", "")))
+                tid = int(raw["tid"])
+                max_tid_by_dex[dex] = max(max_tid_by_dex.get(dex, tid), tid)
             t = self._parse_fill(raw)
             if t is None:
                 continue
-            if since_trade_id is not None and t.trade_id <= since_trade_id:
-                continue
+            if since_trade_id is not None:
+                dex = self._dex_key(t.market_symbol)
+                anchor = self._last_tid_by_dex.get(dex)
+                if anchor is not None and t.trade_id <= anchor:
+                    continue
+                # Preserve the old default-Dex fallback for callers that pass
+                # a tid before this client has seen a per-DEX anchor. HIP-3
+                # tids must not be compared with that default-Dex tid.
+                if anchor is None and dex == "" and t.trade_id <= since_trade_id:
+                    continue
             trades.append(t)
 
-        trades.sort(key=lambda x: x.trade_id)
+        # Tids are only monotonic within one DEX. Sort by fill time so a busy
+        # default DEX cannot push recent HIP-3 fills out of the limit window.
+        trades.sort(key=lambda x: (x.timestamp, x.trade_id))
 
-        # Advance _last_tid so the WS anchor is primed
-        if trades:
-            latest = trades[-1].trade_id
-            if self._last_tid is None or latest > self._last_tid:
-                self._last_tid = latest
+        # Advance per-DEX anchors from the complete API window, including
+        # fills that were filtered as already seen. This primes all DEXes on
+        # startup and makes reconnect gap-fill independent of tid ordering.
+        for dex, tid in max_tid_by_dex.items():
+            if tid > self._last_tid_by_dex.get(dex, -1):
+                self._last_tid_by_dex[dex] = tid
+            if self._last_tid is None or tid > self._last_tid:
+                self._last_tid = tid
 
         return trades[-limit:] if limit else trades
 
@@ -480,7 +528,7 @@ class HyperliquidClient:
             if start_time_ms is not None:
                 # Page user_fills_by_time from start_time_ms to now.
                 raw_fills: list[dict] = []
-                seen_tids_page: set[int] = set()
+                seen_tids_page: set[tuple[str, int]] = set()
                 page_start = start_time_ms
                 now_ms = int(time.time() * 1000)
 
@@ -499,10 +547,11 @@ class HyperliquidClient:
                         if not isinstance(fill, dict):
                             continue
                         tid = fill.get("tid")
-                        if tid is not None and int(tid) in seen_tids_page:
+                        fill_key = self._fill_key(fill)
+                        if fill_key is not None and fill_key in seen_tids_page:
                             continue
-                        if tid is not None:
-                            seen_tids_page.add(int(tid))
+                        if fill_key is not None:
+                            seen_tids_page.add(fill_key)
                         raw_fills.append(fill)
                         added += 1
                         fill_time = int(fill.get("time", page_start))
@@ -534,7 +583,7 @@ class HyperliquidClient:
 
         # Parse and filter
         trades: list[Trade] = []
-        seen_ids: set[int] = set()
+        seen_ids: set[tuple[str, int]] = set()
         for raw in raw_fills:
             try:
                 t = self._parse_fill(raw)
@@ -544,9 +593,11 @@ class HyperliquidClient:
             if t is None:
                 continue
             # De-dupe by trade_id
-            if t.trade_id in seen_ids:
+            fill_key = self._fill_key(raw)
+            if fill_key is not None and fill_key in seen_ids:
                 continue
-            seen_ids.add(t.trade_id)
+            if fill_key is not None:
+                seen_ids.add(fill_key)
 
             # Market-id filter
             if market_id is not None and t.market_id != market_id:
@@ -594,7 +645,7 @@ class HyperliquidClient:
         # Capture the running loop for use in sync WS callbacks.
         self._loop = asyncio.get_event_loop()
 
-        seen_tids: set[int] = set()
+        seen_tids: set[tuple[str, int]] = set()
         backoff = _BACKOFF_INITIAL
 
         while True:
@@ -666,12 +717,14 @@ class HyperliquidClient:
                         if t is None:
                             continue
 
-                    if t.trade_id in seen_tids:
+                    key = self._trade_key(t)
+                    if key in seen_tids:
                         log.debug(
                             "[%s] HL dedup skipped tid=%d", self.source, t.trade_id
                         )
                         continue
-                    seen_tids.add(t.trade_id)
+                    seen_tids.add(key)
+                    self._last_tid_by_dex[self._dex_key(t.market_symbol)] = t.trade_id
                     self._last_tid = t.trade_id
                     yield t
 
@@ -702,8 +755,9 @@ class HyperliquidClient:
                 try:
                     missed = await self.fetch_trades_since(self._last_tid)
                     for t in missed:
-                        if t.trade_id not in seen_tids:
-                            seen_tids.add(t.trade_id)
+                        key = self._trade_key(t)
+                        if key not in seen_tids:
+                            seen_tids.add(key)
                             # Put pre-parsed Trade directly to avoid re-parsing
                             await self._fill_queue.put(t)
                 except Exception:
@@ -713,7 +767,7 @@ class HyperliquidClient:
     # WS callbacks (called from SDK's sync thread — must be thread-safe)  #
     # ------------------------------------------------------------------ #
 
-    def _make_fills_callback(self, seen_tids: set[int]):
+    def _make_fills_callback(self, seen_tids: set[tuple[str, int]]):
         """Return a callback closure for the userFills WS subscription.
 
         Called by WebsocketManager on its own thread. Uses call_soon_threadsafe
@@ -733,12 +787,15 @@ class HyperliquidClient:
             if is_snapshot:
                 # Warm _last_tid and seen_tids from snapshot data.
                 # NEVER enqueue snapshot fills as trade events.
-                tids = [int(f.get("tid", 0)) for f in fills if f.get("tid")]
-                if tids:
-                    snap_max = max(tids)
-                    if self._last_tid is None or snap_max > self._last_tid:
-                        self._last_tid = snap_max
-                    seen_tids.update(tids)
+                keys = [self._fill_key(f) for f in fills]
+                keys = [key for key in keys if key is not None]
+                if keys:
+                    for dex, tid in keys:
+                        if tid > self._last_tid_by_dex.get(dex, -1):
+                            self._last_tid_by_dex[dex] = tid
+                        if self._last_tid is None or tid > self._last_tid:
+                            self._last_tid = tid
+                    seen_tids.update(keys)
                 log.info(
                     "[%s] HL WS isSnapshot=true — %d fills (warm state only, NOT yielded as events)",
                     self.source, len(fills),
@@ -774,6 +831,24 @@ class HyperliquidClient:
     # ------------------------------------------------------------------ #
     # Fill parsing                                                         #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _dex_key(coin: str) -> str:
+        """Return the DEX namespace used by a fill (empty for the default DEX)."""
+        return str(coin).split(":", 1)[0].lower() if ":" in str(coin) else ""
+
+    @classmethod
+    def _fill_key(cls, raw) -> Optional[tuple[str, int]]:
+        if not isinstance(raw, dict) or raw.get("tid") is None:
+            return None
+        try:
+            return cls._dex_key(str(raw.get("coin", ""))), int(raw["tid"])
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _trade_key(cls, trade: Trade) -> tuple[str, int]:
+        return cls._dex_key(trade.market_symbol), trade.trade_id
 
     def _parse_fill(self, raw) -> Optional[Trade]:
         """Parse a raw HL fill dict into a Trade. Returns None on any error."""

@@ -131,6 +131,37 @@ class TestFetchRealizingFillsFiltering:
         assert [t.trade_id for t in result] == [10, 20, 30]
 
 
+class TestFetchTradesSinceHip3Cursors:
+    def test_since_filter_uses_independent_dex_tid_anchors(self):
+        c = make_client()
+        c._last_tid_by_dex = {"": 100, "xyz": 1000}
+        fills = [
+            _raw_fill(tid=99, coin="BTC", time_ms=1700000001000),
+            _raw_fill(tid=101, coin="BTC", time_ms=1700000002000),
+            _raw_fill(tid=900, coin="xyz:AMD", time_ms=1700000003000),
+            _raw_fill(tid=1001, coin="xyz:AMD", time_ms=1700000004000),
+        ]
+        with patch.object(c._info, "user_fills", return_value=fills):
+            result = _run(c.fetch_trades_since(100))
+
+        assert {(t.market_symbol, t.trade_id) for t in result} == {
+            ("BTC", 101),
+            ("XYZ:AMD", 1001),
+        }
+
+    def test_limit_keeps_recent_hip3_fills_when_default_tid_is_larger(self):
+        c = make_client()
+        fills = [
+            _raw_fill(tid=900000 + i, coin="BTC", time_ms=1700000000000 + i * 1000)
+            for i in range(3)
+        ]
+        fills.append(_raw_fill(tid=7, coin="xyz:AMD", time_ms=1700000004000))
+        with patch.object(c._info, "user_fills", return_value=fills):
+            result = _run(c.fetch_trades_since(None, limit=1))
+
+        assert [(t.market_symbol, t.trade_id) for t in result] == [("XYZ:AMD", 7)]
+
+
 # ---------------------------------------------------------------------------
 # fetch_realizing_fills — market_id filtering
 # ---------------------------------------------------------------------------
@@ -217,6 +248,20 @@ class TestFetchRealizingFillsErrorHandling:
             result = _run(c.fetch_realizing_fills())
         assert len(result) == 1
         assert result[0].trade_id == 7
+
+    def test_same_tid_in_different_hip3_dex_namespaces_is_kept(self):
+        c = make_client()
+        fills = [
+            _raw_fill(tid=7, coin="xyz:AMD", closed_pnl="100", dir_="Close Long"),
+            _raw_fill(tid=7, coin="flx:BTC", closed_pnl="200", dir_="Close Long"),
+        ]
+        with patch.object(c._info, "user_fills", return_value=fills):
+            result = _run(c.fetch_realizing_fills())
+
+        assert {(t.market_symbol, t.trade_id) for t in result} == {
+            ("XYZ:AMD", 7),
+            ("FLX:BTC", 7),
+        }
 
 
 # ---------------------------------------------------------------------------

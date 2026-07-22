@@ -184,6 +184,12 @@ class TestSeenTids:
         seen.add(5)       # set.add is idempotent
         assert len(seen) == 1
 
+    def test_same_tid_in_separate_hip3_dexes_is_not_conflated(self):
+        seen: set[tuple[str, int]] = set()
+        seen.add(("xyz", 7))
+        assert ("flx", 7) not in seen
+        assert ("xyz", 7) in seen
+
 
 # ---------------------------------------------------------------------------
 # Position snapshot in aggregate buffer

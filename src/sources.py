@@ -278,7 +278,7 @@ class Source:
     last_trade_id: Optional[int] = None
     # Set-based dedup: protects against WS replay and REST/WS overlap.
     # Using a set catches duplicates with any tid, not just the last one.
-    seen_tids: set[int] = field(default_factory=set)
+    seen_tids: set[tuple[str, int]] = field(default_factory=set)
     # Normalized ticker symbols to hide entirely: no dashboard row, no TG
     # alert, no reconciler notification. Populated from config.yaml
     # `exclude_symbols`. Compared via _normalize_symbol (case-insensitive,
