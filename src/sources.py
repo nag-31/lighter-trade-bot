@@ -10,6 +10,10 @@ config.yaml shape:
       - type: lighter
         name: "My NK pool"
         pool_id: 281474976684763
+      - type: lighter
+        id: lighter-wallet
+        name: "Lighter wallet"
+        address_env: LIGHTER_ADDRESS
       - type: hyperliquid
         id: hl-whale-a
         name: "Whale A"
@@ -421,11 +425,33 @@ def _source_issue_detail(raw: dict) -> str:
         except Exception:
             return "min_notional_usd must be a finite non-negative number"
     if stype == "lighter":
-        try:
-            if int(raw.get("pool_id")) < 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            return "pool_id must be a non-negative integer"
+        has_pool = raw.get("pool_id") is not None
+        has_address = raw.get("address_env") is not None
+        if has_pool == has_address:
+            return "configure exactly one of pool_id or address_env"
+        if has_pool:
+            try:
+                if int(raw["pool_id"]) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return "pool_id must be a non-negative integer"
+        else:
+            try:
+                env_name, address = _secret_env(
+                    raw, "address_env", "LIGHTER_ADDRESS"
+                )
+            except ValueError as exc:
+                return str(exc)
+            if not address:
+                return f"missing environment variable {env_name}"
+            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+                return f"{env_name} does not contain a valid address"
+            try:
+                account_slot = int(raw.get("account_slot", 0))
+                if account_slot < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return "account_slot must be a non-negative integer"
     elif stype == "hyperliquid":
         try:
             env_name, address = _secret_env(raw, "address_env", "HL_ADDRESS")
@@ -453,10 +479,20 @@ def _preview_source_identity(raw: dict) -> tuple[str, str]:
     """Compute stable source/account identities without constructing a client."""
     stype = str(raw.get("type", "")).lower().strip()
     if stype == "lighter":
-        pool_id = int(raw["pool_id"])
+        if raw.get("pool_id") is not None:
+            pool_id = int(raw["pool_id"])
+            return (
+                _configured_id(raw, stype, str(pool_id)),
+                f"lighter:{pool_id}",
+            )
+        _env_name, address = _secret_env(
+            raw, "address_env", "LIGHTER_ADDRESS"
+        )
+        account_slot = int(raw.get("account_slot", 0))
+        address_hash = hashlib.sha256(address.lower().encode()).hexdigest()[:12]
         return (
-            _configured_id(raw, stype, str(pool_id)),
-            f"lighter:{pool_id}",
+            _configured_id(raw, stype, f"{address_hash}-{account_slot}"),
+            f"lighter-wallet:{address_hash}:{account_slot}",
         )
     if stype == "hyperliquid":
         _env_name, address = _secret_env(raw, "address_env", "HL_ADDRESS")
@@ -538,14 +574,32 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
 
     if stype == "lighter":
         pool_id = raw.get("pool_id")
-        if pool_id is None:
-            log.warning("lighter source '%s' missing 'pool_id' — skipping", name)
-            return None
+        l1_address: Optional[str] = None
+        account_slot = 0
         try:
-            pool_id = int(pool_id)
-            if pool_id < 0:
-                raise ValueError("pool_id must be non-negative")
-            source_id = _configured_id(raw, "lighter", str(pool_id))
+            if pool_id is not None:
+                pool_id = int(pool_id)
+                if pool_id < 0:
+                    raise ValueError("pool_id must be non-negative")
+                identity_suffix = str(pool_id)
+                account_fingerprint = f"lighter:{pool_id}"
+            else:
+                _env_name, l1_address = _secret_env(
+                    raw, "address_env", "LIGHTER_ADDRESS"
+                )
+                if not re.fullmatch(r"0x[0-9a-fA-F]{40}", l1_address):
+                    raise ValueError("address_env does not contain a valid address")
+                account_slot = int(raw.get("account_slot", 0))
+                if account_slot < 0:
+                    raise ValueError("account_slot must be non-negative")
+                address_hash = hashlib.sha256(
+                    l1_address.lower().encode()
+                ).hexdigest()[:12]
+                identity_suffix = f"{address_hash}-{account_slot}"
+                account_fingerprint = (
+                    f"lighter-wallet:{address_hash}:{account_slot}"
+                )
+            source_id = _configured_id(raw, "lighter", identity_suffix)
         except (TypeError, ValueError) as exc:
             log.warning("lighter source '%s' has invalid configuration: %s", name, exc)
             return None
@@ -557,16 +611,21 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         client = LighterClient(
             pool_id, LIGHTER_REST_BASE, LIGHTER_WS_URL,
             source=name, proxy_url=_proxy_url(), ws_proxy_url=ws_proxy,
+            l1_address=l1_address, account_slot=account_slot,
         )
         return Source(
             id=source_id,
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
-            url=f"https://app.lighter.xyz/public-pools/{pool_id}",
+            url=(
+                f"https://app.lighter.xyz/public-pools/{pool_id}"
+                if pool_id is not None
+                else ""
+            ),
             min_notional=min_notional,
             exchange="lighter",
-            account_fingerprint=f"lighter:{pool_id}",
+            account_fingerprint=account_fingerprint,
             exclude_symbols=exclude_symbols,
         )
 

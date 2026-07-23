@@ -125,7 +125,7 @@ settings:
 # =============================================================================
 #
 # Supported types:
-#   lighter     -> pool_id required (public pool URL shown in alerts)
+#   lighter     -> either pool_id (public pool) or address_env (wallet account)
 #   hyperliquid -> wallet address loaded from the configured address_env
 #   binance     -> credentials loaded from api_key_env + api_secret_env
 #                  (both one-way and hedge mode are supported)
@@ -138,6 +138,7 @@ settings:
 #   footer_url        -- optional public URL appended to alerts (HL/Binance only)
 #
 # Security rules (enforced in code):
+#   - Lighter wallet     -> .env only (LIGHTER_ADDRESS);               never here
 #   - HL wallet address  -> .env only (HL_ADDRESS);                    never here
 #   - Binance API creds  -> .env only (BINANCE_API_KEY / _SECRET);     never here
 #   - Lighter pool URL   -> safe to show (it's a public URL)
@@ -176,8 +177,17 @@ sources:
   #
   # - type: lighter
   #   id: lighter-second
-  #   name: "Lighter 2"
+  #   name: "Lighter Pool 2"
   #   pool_id: 123456789
+  #
+  # - type: lighter
+  #   id: lighter-wallet-2
+  #   name: "Lighter Wallet 2"
+  #   address_env: LIGHTER_ADDRESS_2
+  #   account_slot: 0
+  #
+  # If one wallet has Lighter subaccounts, repeat the wallet entry with the
+  # same address_env, a unique id, and account_slot: 1, 2, etc.
   #
   # - type: binance
   #   id: binance-second

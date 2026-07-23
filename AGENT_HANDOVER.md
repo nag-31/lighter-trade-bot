@@ -343,7 +343,8 @@ python scripts/reconcile_hl_pnl.py --days 10 --apply
 Status: deployed to the GCP VM on 2026-07-23 from commit `12b7019`
 (`codex/private-portfolio-app`). The production SQLite database was backed up
 and migrated to schema v2, `lighterbot` was restarted, and local/public health
-reported ready. The complete suite now contains 788 passing tests.
+reported ready. Lighter wallet-address source support was added on 2026-07-23.
+The complete suite now contains 793 passing tests.
 
 Production backup:
 
@@ -355,7 +356,10 @@ Production backup:
 
 - Any number of Hyperliquid wallets, each using a stable `id` and its own
   `address_env`.
-- Any number of Lighter pools, each using a stable `id` and public `pool_id`.
+- Any number of Lighter public pools, each using a stable `id` and `pool_id`.
+- Any number of Lighter wallet accounts using `address_env`; raw wallet
+  addresses stay only in `.env`. `account_slot` selects a master/subaccount
+  from Lighter's `accountsByL1Address` response and defaults to `0`.
 - Any number of Binance accounts, each using a stable `id` and separate
   `api_key_env` / `api_secret_env`.
 - Any protocol may be absent. The dashboard starts with zero active sources.
@@ -381,6 +385,12 @@ sources:
     name: "Lighter"
     pool_id: 281474976684763
 
+  - type: lighter
+    id: lighter-wallet
+    name: "Lighter Wallet"
+    address_env: LIGHTER_ADDRESS
+    account_slot: 0
+
   - type: binance
     id: binance-main
     name: "Binance"
@@ -389,7 +399,9 @@ sources:
 ```
 
 Put the corresponding values in `.env`; never put wallet addresses or Binance
-credentials in `config.yaml`.
+credentials in `config.yaml`. Lighter wallet lookup is public and needs no API
+key. If one L1 address has subaccounts, repeat the source with the same
+`address_env`, a unique `id`, and `account_slot: 1`, `2`, etc.
 
 ### Safety and recovery changes
 

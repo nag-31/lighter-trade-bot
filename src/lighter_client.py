@@ -39,14 +39,19 @@ _WS_GEO_BACKOFF = 300.0  # seconds
 class LighterClient:
     def __init__(
         self,
-        pool_id: int,
+        pool_id: Optional[int],
         rest_base: str,
         ws_url: str,
         source: str = "",
         proxy_url: Optional[str] = None,
         ws_proxy_url: Optional[str] = None,
+        l1_address: Optional[str] = None,
+        account_slot: int = 0,
     ):
         self.pool_id = pool_id
+        self._l1_address = l1_address
+        self._account_slot = account_slot
+        self._account_resolve_lock = asyncio.Lock()
         self.source = source
         self._rest_base = rest_base.rstrip("/")
         self._ws_url = ws_url
@@ -75,6 +80,81 @@ class LighterClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    async def _ensure_account_index(self) -> int:
+        """Resolve a configured L1 wallet to its Lighter account index once."""
+        if self.pool_id is not None:
+            return self.pool_id
+        if not self._l1_address:
+            raise RuntimeError("Lighter account has neither pool_id nor wallet address")
+
+        async with self._account_resolve_lock:
+            if self.pool_id is not None:
+                return self.pool_id
+
+            indexes: list[int] = []
+            seen_indexes: set[int] = set()
+            seen_cursors: set[str] = set()
+            cursor: Optional[str] = None
+            for _ in range(20):
+                params = {"l1_address": self._l1_address}
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    response = await self._http.get(
+                        f"{self._rest_base}/accountsByL1Address",
+                        params=params,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except Exception as exc:
+                    # HTTP client exceptions can contain the full query URL,
+                    # including the configured wallet. Never propagate it.
+                    raise RuntimeError(
+                        "Lighter account discovery failed: "
+                        f"{type(exc).__name__}"
+                    ) from None
+                rows = payload.get("sub_accounts") or []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    raw_index = row.get("index", row.get("account_index"))
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if index not in seen_indexes:
+                        seen_indexes.add(index)
+                        indexes.append(index)
+
+                next_cursor = payload.get("next_cursor")
+                if not next_cursor:
+                    break
+                cursor = str(next_cursor)
+                if cursor in seen_cursors:
+                    raise RuntimeError("Lighter account discovery returned a repeated cursor")
+                seen_cursors.add(cursor)
+            else:
+                raise RuntimeError("Lighter account discovery exceeded 20 pages")
+
+            if not indexes:
+                raise RuntimeError("no Lighter account found for configured wallet")
+            if self._account_slot >= len(indexes):
+                raise RuntimeError(
+                    f"Lighter account_slot {self._account_slot} is unavailable "
+                    f"(wallet has {len(indexes)} account(s))"
+                )
+
+            self.pool_id = indexes[self._account_slot]
+            log.info(
+                "[%s] resolved Lighter wallet account_slot %d to account index %s "
+                "(%d account(s) discovered)",
+                self.source,
+                self._account_slot,
+                self.pool_id,
+                len(indexes),
+            )
+            return self.pool_id
 
     # ----- bootstrap -----
 
@@ -109,9 +189,10 @@ class LighterClient:
     # ----- positions / leverage snapshot -----
 
     async def fetch_account(self) -> dict:
+        account_index = await self._ensure_account_index()
         r = await self._http.get(
             f"{self._rest_base}/account",
-            params={"by": "index", "value": str(self.pool_id)},
+            params={"by": "index", "value": str(account_index)},
         )
         r.raise_for_status()
         return r.json()
@@ -219,9 +300,10 @@ class LighterClient:
         still fire without SL/TP.
         """
         try:
+            account_index = await self._ensure_account_index()
             r = await self._http.get(
                 f"{self._rest_base}/orders",
-                params={"account_index": self.pool_id, "status": "open"},
+                params={"account_index": account_index, "status": "open"},
             )
             if r.status_code != 200:
                 return None, None
@@ -275,9 +357,10 @@ class LighterClient:
         as fetch_sl_tp.  Does not raise.
         """
         try:
+            account_index = await self._ensure_account_index()
             r = await self._http.get(
                 f"{self._rest_base}/orders",
-                params={"account_index": self.pool_id, "status": "open"},
+                params={"account_index": account_index, "status": "open"},
             )
             if r.status_code != 200:
                 return []
@@ -394,10 +477,11 @@ class LighterClient:
         Lighter's endpoint requires sort_by + limit. We pull desc and reverse.
         """
         try:
+            account_index = await self._ensure_account_index()
             r = await self._http.get(
                 f"{self._rest_base}/trades",
                 params={
-                    "account_index": str(self.pool_id),
+                    "account_index": str(account_index),
                     "sort_by": "trade_id",
                     "sort_dir": "desc",
                     "limit": str(limit),
@@ -434,6 +518,7 @@ class LighterClient:
         backoff = 1.0
         while True:
             try:
+                account_index = await self._ensure_account_index()
                 connect_kwargs: dict = {
                     "ping_interval": 20,
                     "ping_timeout": 20,
@@ -444,9 +529,9 @@ class LighterClient:
                 async with websockets.connect(self._ws_url, **connect_kwargs) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
-                        "channel": f"account_all_trades/{self.pool_id}",
+                        "channel": f"account_all_trades/{account_index}",
                     }))
-                    log.info("WS subscribed to account_all_trades/%s", self.pool_id)
+                    log.info("WS subscribed to account_all_trades/%s", account_index)
                     backoff = 1.0
                     self._ws_geo_warned = False  # connected — re-arm the warning
 

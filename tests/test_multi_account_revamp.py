@@ -98,6 +98,80 @@ def test_multiple_hyperliquid_wallet_envs(tmp_path, monkeypatch):
     assert all(source.exchange == "hyperliquid" for source in report.sources)
 
 
+def test_multiple_lighter_wallet_envs_and_subaccount_slots(tmp_path, monkeypatch):
+    wallet_a = "0x" + "3" * 40
+    wallet_b = "0x" + "4" * 40
+    monkeypatch.setenv("LIGHTER_WALLET_A", wallet_a)
+    monkeypatch.setenv("LIGHTER_WALLET_B", wallet_b)
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        [
+            {
+                "type": "lighter",
+                "id": "lighter-a-main",
+                "name": "Lighter A Main",
+                "address_env": "LIGHTER_WALLET_A",
+            },
+            {
+                "type": "lighter",
+                "id": "lighter-a-sub",
+                "name": "Lighter A Sub",
+                "address_env": "LIGHTER_WALLET_A",
+                "account_slot": 1,
+            },
+            {
+                "type": "lighter",
+                "id": "lighter-b-main",
+                "name": "Lighter B Main",
+                "address_env": "LIGHTER_WALLET_B",
+            },
+        ],
+    )
+    report = load_source_report(config)
+    assert {source.id for source in report.sources} == {
+        "lighter-a-main",
+        "lighter-a-sub",
+        "lighter-b-main",
+    }
+    assert all(source.exchange == "lighter" for source in report.sources)
+    assert all(source.url == "" for source in report.sources)
+    assert len({source.account_fingerprint for source in report.sources}) == 3
+
+
+def test_missing_lighter_wallet_env_disables_only_that_source(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("LIGHTER_MISSING_WALLET", raising=False)
+    config = tmp_path / "config.yaml"
+    _write_config(
+        config,
+        [
+            {
+                "type": "lighter",
+                "id": "lighter-pool",
+                "name": "Lighter Pool",
+                "pool_id": 123,
+            },
+            {
+                "type": "lighter",
+                "id": "lighter-wallet",
+                "name": "Lighter Wallet",
+                "address_env": "LIGHTER_MISSING_WALLET",
+            },
+        ],
+    )
+    report = load_source_report(config)
+    assert [source.id for source in report.sources] == ["lighter-pool"]
+    assert any(
+        issue.source_id == "lighter-wallet"
+        and issue.status == "disabled"
+        and issue.detail
+        == "missing environment variable LIGHTER_MISSING_WALLET"
+        for issue in report.issues
+    )
+
+
 def test_duplicate_explicit_source_id_is_rejected(tmp_path):
     config = tmp_path / "config.yaml"
     _write_config(

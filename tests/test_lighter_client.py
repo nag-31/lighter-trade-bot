@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from src.lighter_client import LighterClient
@@ -19,6 +20,91 @@ def make_client() -> LighterClient:
     )
     client._symbols = {0: "BTC", 1: "ETH", 2: "SOL"}
     return client
+
+
+@pytest.mark.asyncio
+async def test_wallet_address_resolves_selected_account_slot():
+    requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "sub_accounts": [
+                    {"index": 7402},
+                    {"account_index": 7403},
+                ],
+                "next_cursor": None,
+            },
+        )
+
+    client = LighterClient(
+        pool_id=None,
+        rest_base="https://example.com/api/v1",
+        ws_url="wss://example.com/stream",
+        source="wallet",
+        l1_address="0x" + "1" * 40,
+        account_slot=1,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await client._ensure_account_index() == 7403
+        assert await client._ensure_account_index() == 7403
+        assert requests == [{"l1_address": "0x" + "1" * 40}]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_wallet_address_rejects_unavailable_account_slot():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"sub_accounts": [{"index": 7402}], "next_cursor": None},
+        )
+
+    client = LighterClient(
+        pool_id=None,
+        rest_base="https://example.com/api/v1",
+        ws_url="wss://example.com/stream",
+        source="wallet",
+        l1_address="0x" + "2" * 40,
+        account_slot=1,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(RuntimeError, match="account_slot 1 is unavailable"):
+            await client._ensure_account_index()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_wallet_discovery_error_does_not_expose_address():
+    address = "0x" + "5" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request, json={"error": "down"})
+
+    client = LighterClient(
+        pool_id=None,
+        rest_base="https://example.com/api/v1",
+        ws_url="wss://example.com/stream",
+        source="wallet",
+        l1_address=address,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            await client._ensure_account_index()
+        assert address not in str(exc_info.value)
+        assert "HTTPStatusError" in str(exc_info.value)
+    finally:
+        await client.close()
 
 
 # ---------------------------------------------------------------------------
