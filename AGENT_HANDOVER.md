@@ -340,9 +340,16 @@ python scripts/reconcile_hl_pnl.py --days 10 --apply
 
 ## Multi-account trade tracker revamp (implemented locally 2026-07-23)
 
-Status: implementation is complete in the local working tree and all 785 tests
-pass. It has **not** been committed, pushed, deployed, migrated on the live DB,
-or restarted on the GCP VM yet.
+Status: deployed to the GCP VM on 2026-07-23 from commit `12b7019`
+(`codex/private-portfolio-app`). The production SQLite database was backed up
+and migrated to schema v2, `lighterbot` was restarted, and local/public health
+reported ready. The complete suite now contains 788 passing tests.
+
+Production backup:
+
+```text
+/home/ADMIN/backups/20260723T100838Z/lighter-trade-bot
+```
 
 ### Supported source model
 
