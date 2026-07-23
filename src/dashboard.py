@@ -3550,22 +3550,23 @@ async def _run() -> None:
                             f"/{command} failed temporarily: {type(exc).__name__}",
                             **feedback_kwargs,
                         )
-                if discussion_id is not None and not discussion_menu_ok:
-                    health.mark_degraded(
-                        "telegram_commands",
-                        error=(
-                            "owner DM active; add bot as linked discussion "
-                            "administrator, then restart"
-                        ),
+                health.mark_up(
+                    "telegram_commands", detail="owner DM long polling"
+                )
+                if discussion_id is None:
+                    health.mark_disabled(
+                        "telegram_discussion_commands",
+                        "linked discussion chat not configured/found",
+                    )
+                elif not discussion_menu_ok:
+                    health.mark_disabled(
+                        "telegram_discussion_commands",
+                        "add bot as linked discussion administrator, then restart",
                     )
                 else:
                     health.mark_up(
-                        "telegram_commands",
-                        detail=(
-                            "owner DM + discussion-to-channel"
-                            if discussion_id is not None
-                            else "owner DM; discussion chat not configured/linked"
-                        ),
+                        "telegram_discussion_commands",
+                        detail="owner discussion commands publish to channel",
                     )
             except asyncio.CancelledError:
                 raise
