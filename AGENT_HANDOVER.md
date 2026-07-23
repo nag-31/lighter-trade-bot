@@ -475,3 +475,5 @@ Deployment definitions live in `deploy/gcp/`, including the systemd units and `c
 ### HIP-3 Hyperliquid tracking fix (2026-07-23)
 
 Hyperliquid builder-deployed perps (for example `xyz:AMD`) use separate DEX metadata universes, asset-ID offsets, and `tid` sequences. The tracker now loads `perpDexs` plus each DEX's `meta(dex=...)`, maps HIP-3 assets with the SDK's `110000 + DEX index * 10000` offsets, keeps per-DEX REST/WS cursors, and deduplicates by `(DEX namespace, tid)`. Mixed-DEX REST results are limited by fill timestamp so default-Dex volume cannot hide recent HIP-3 fills. The dashboard consumer uses the same namespaced dedup key. This preserves the existing snapshot-warm behavior: WS snapshots seed cursors but are not emitted as new trade events.
+
+The position reconciler also queries `user_state(address, dex=...)` for the default DEX and every discovered HIP-3 DEX, with independent 5-second caches. This is required for open positions such as `xyz:TSM`, `xyz:MU`, `xyz:SNDK`, `xyz:SKHX`, and `xyz:DRAM`; the default `user_state(address)` response does not include them. Leverage lookup follows the market's DEX namespace as well.

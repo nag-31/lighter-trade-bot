@@ -162,6 +162,65 @@ class TestFetchTradesSinceHip3Cursors:
         assert [(t.market_symbol, t.trade_id) for t in result] == [("XYZ:AMD", 7)]
 
 
+class TestHip3PositionState:
+    @staticmethod
+    def _state(*positions: tuple[str, str, str, str]) -> dict:
+        return {
+            "assetPositions": [
+                {
+                    "position": {
+                        "coin": coin,
+                        "szi": size,
+                        "entryPx": entry,
+                        "unrealizedPnl": pnl,
+                    }
+                }
+                for coin, size, entry, pnl in positions
+            ]
+        }
+
+    def test_current_positions_queries_default_and_hip3_dexes(self):
+        c = make_client()
+        c._perp_dexes = ["", "xyz"]
+        c._coin_to_id["XYZ:TSM"] = 110000
+        c._id_to_coin[110000] = "XYZ:TSM"
+        states = {
+            "": self._state(("BTC", "0.5", "60000", "10")),
+            "xyz": self._state(("xyz:TSM", "-3.1", "450", "-2")),
+        }
+
+        def fake_user_state(address, dex=""):
+            return states[dex]
+
+        c._info.user_state.side_effect = fake_user_state
+        result = _run(c.current_positions())
+        by_symbol = {position.market_symbol: position for position in result.values()}
+
+        assert by_symbol["BTC"].side == "long"
+        assert by_symbol["XYZ:TSM"].side == "short"
+        assert by_symbol["XYZ:TSM"].size == Decimal("3.1")
+        assert {call.args[1] for call in c._info.user_state.call_args_list} == {"", "xyz"}
+
+    def test_fetch_leverage_uses_market_dex_state(self):
+        c = make_client()
+        c._coin_to_id["XYZ:TSM"] = 110000
+        c._id_to_coin[110000] = "XYZ:TSM"
+
+        def fake_user_state(address, dex=""):
+            if dex == "xyz":
+                return {
+                    "assetPositions": [
+                        {"position": {"coin": "xyz:TSM", "leverage": {"value": 10}}}
+                    ]
+                }
+            return {"assetPositions": []}
+
+        c._info.user_state.side_effect = fake_user_state
+
+        assert _run(c.fetch_leverage(110000)) == 10.0
+        assert c._info.user_state.call_args.args[1] == "xyz"
+
+
 # ---------------------------------------------------------------------------
 # fetch_realizing_fills — market_id filtering
 # ---------------------------------------------------------------------------

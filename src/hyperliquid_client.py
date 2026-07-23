@@ -14,7 +14,8 @@ Key design decisions (see research file for rationale):
   - All numeric fields use decimal.Decimal (HL API returns strings).
   - Side: "B" -> "long", "A" -> "short".
   - Exponential-backoff reconnect (1s -> 2s -> 4s, cap 30s); REST gap-fill on reconnect.
-  - `clearinghouseState` cached for 5 s (shared between current_positions + fetch_leverage).
+  - `clearinghouseState` cached for 5 s per Hyperliquid DEX (shared between
+    current_positions + fetch_leverage).
   - WebsocketManager runs on its own thread (sync); asyncio bridge via call_soon_threadsafe.
 
 SDK note: WebsocketManager.__init__ expects an HTTP base URL (e.g. https://api.hyperliquid.xyz);
@@ -103,9 +104,15 @@ class HyperliquidClient:
         # cannot corrupt the filter (the cascade bug).
         self._perp_universe: set[str] = set()
 
-        # Clearinghouse state cache
-        self._ch_cache: Optional[dict] = None
+        # Hyperliquid returns separate clearinghouseState payloads for the
+        # default DEX and each HIP-3 DEX. Keep an independent short-lived
+        # cache per namespace so position reconciliation does not lose HIP-3
+        # positions after reading the default DEX state.
+        self._ch_cache: Optional[dict] = None  # compatibility alias for default DEX
         self._ch_cache_ts: float = 0.0
+        self._ch_cache_by_dex: dict[str, dict] = {}
+        self._ch_cache_ts_by_dex: dict[str, float] = {}
+        self._perp_dexes: list[str] = [""]
 
         # Tracks the highest tid seen for compatibility/logging. HIP-3 DEXes
         # have independent tid sequences, so filtering must use the per-DEX map.
@@ -161,6 +168,7 @@ class HyperliquidClient:
                     for row in (dex_rows or [])
                     if isinstance(row, dict) and str(row.get("name", "")).strip()
                 ]
+                self._perp_dexes = [""] + dex_names
                 for dex_index, dex_name in enumerate(dex_names):
                     dex_meta = await loop.run_in_executor(
                         None, lambda d=dex_name: self._info.meta(dex=d)
@@ -211,72 +219,87 @@ class HyperliquidClient:
     # Clearinghouse state cache                                            #
     # ------------------------------------------------------------------ #
 
-    async def _fetch_clearinghouse(self) -> Optional[dict]:
+    async def _fetch_clearinghouse(self, dex: str = "") -> Optional[dict]:
         """Return clearinghouseState with a 5-second TTL cache.
 
-        Both current_positions() and fetch_leverage() share this, so
-        back-to-back calls within the same event handler hit the API only once.
+        Both current_positions() and fetch_leverage() share this per-Dex cache,
+        so back-to-back calls within the same event handler hit each API only
+        once. HIP-3 DEXes have independent clearinghouseState responses.
         """
+        dex = str(dex or "").strip().lower()
         now = time.monotonic()
-        if self._ch_cache is not None and now - self._ch_cache_ts < _CH_TTL:
-            return self._ch_cache
+        cached = self._ch_cache_by_dex.get(dex)
+        cached_ts = self._ch_cache_ts_by_dex.get(dex, 0.0)
+        if cached is not None and now - cached_ts < _CH_TTL:
+            return cached
 
         loop = asyncio.get_event_loop()
         try:
             data = await loop.run_in_executor(
-                None, self._info.user_state, self.address
+                None, self._info.user_state, self.address, dex
             )
         except Exception:
-            log.exception("[%s] HL user_state() failed", self.source)
-            return self._ch_cache  # return stale cache rather than None
+            log.exception("[%s] HL user_state(dex=%s) failed", self.source, dex or "default")
+            return cached  # return stale cache rather than None
 
         if isinstance(data, dict):
-            self._ch_cache = data
-            self._ch_cache_ts = now
+            self._ch_cache_by_dex[dex] = data
+            self._ch_cache_ts_by_dex[dex] = now
+            if dex == "":
+                self._ch_cache = data
+                self._ch_cache_ts = now
             return data
-        return self._ch_cache
+        return cached
 
     # ------------------------------------------------------------------ #
     # Protocol: current_positions                                          #
     # ------------------------------------------------------------------ #
 
     async def current_positions(self) -> dict[int, Position]:
-        """Snapshot open perp positions from clearinghouseState."""
-        data = await self._fetch_clearinghouse()
-        if not data:
-            return {}
+        """Snapshot open perp positions across the default and HIP-3 DEXes."""
+        dexes = tuple(dict.fromkeys(self._perp_dexes or [""]))
+        states = await asyncio.gather(
+            *(self._fetch_clearinghouse(dex) for dex in dexes),
+            return_exceptions=True,
+        )
 
         out: dict[int, Position] = {}
-        for ap in data.get("assetPositions") or []:
-            try:
-                pos = ap.get("position") if isinstance(ap, dict) else None
-                if not pos:
-                    continue
-                coin = str(pos.get("coin", ""))
-                szi = _to_decimal(pos.get("szi", "0")) or Decimal(0)
-                if szi == 0:
-                    continue
+        for dex, data in zip(dexes, states):
+            if isinstance(data, Exception) or not isinstance(data, dict):
+                continue
+            for ap in data.get("assetPositions") or []:
+                try:
+                    pos = ap.get("position") if isinstance(ap, dict) else None
+                    if not pos:
+                        continue
+                    coin = str(pos.get("coin", ""))
+                    szi = _to_decimal(pos.get("szi", "0")) or Decimal(0)
+                    if szi == 0:
+                        continue
 
-                mid = self._market_id(coin)
-                side = "long" if szi > 0 else "short"
-                avg = _to_decimal(pos.get("entryPx") or "0") or Decimal(0)
-                unrealized_pnl = _to_decimal(pos.get("unrealizedPnl"))
-                liquidation_px = _to_decimal(pos.get("liquidationPx"))
+                    mid = self._market_id(coin)
+                    side = "long" if szi > 0 else "short"
+                    avg = _to_decimal(pos.get("entryPx") or "0") or Decimal(0)
+                    unrealized_pnl = _to_decimal(pos.get("unrealizedPnl"))
+                    liquidation_px = _to_decimal(pos.get("liquidationPx"))
 
-                out[mid] = Position(
-                    market_id=mid,
-                    market_symbol=coin.upper(),
-                    side=side,
-                    size=abs(szi),
-                    avg_entry_price=avg,
-                    source=self.source,
-                    unrealized_pnl=unrealized_pnl,
-                    liquidation_px=liquidation_px,
-                )
-            except Exception:
-                log.exception("[%s] could not parse HL position %r", self.source, ap)
+                    out[mid] = Position(
+                        market_id=mid,
+                        market_symbol=coin.upper(),
+                        side=side,
+                        size=abs(szi),
+                        avg_entry_price=avg,
+                        source=self.source,
+                        unrealized_pnl=unrealized_pnl,
+                        liquidation_px=liquidation_px,
+                    )
+                except Exception:
+                    log.exception(
+                        "[%s] could not parse HL position from dex=%s: %r",
+                        self.source, dex or "default", ap,
+                    )
 
-        log.debug("[%s] %d open HL positions loaded", self.source, len(out))
+        log.info("[%s] %d open HL positions loaded across DEXs %s", self.source, len(out), list(dexes))
         return out
 
     # ------------------------------------------------------------------ #
@@ -284,11 +307,11 @@ class HyperliquidClient:
     # ------------------------------------------------------------------ #
 
     async def fetch_leverage(self, market_id: int) -> Optional[float]:
-        """Return leverage for the given market from cached clearinghouseState."""
-        data = await self._fetch_clearinghouse()
+        """Return leverage for the given market from its DEX state."""
+        coin = self._market_symbol(market_id)
+        data = await self._fetch_clearinghouse(self._dex_key(coin))
         if not data:
             return None
-        coin = self._market_symbol(market_id)
         for ap in data.get("assetPositions") or []:
             pos = ap.get("position") if isinstance(ap, dict) else None
             if not pos or str(pos.get("coin", "")).upper() != coin:
@@ -826,6 +849,8 @@ class HyperliquidClient:
         if isinstance(ch_state, dict):
             self._ch_cache = ch_state
             self._ch_cache_ts = time.monotonic()
+            self._ch_cache_by_dex[""] = ch_state
+            self._ch_cache_ts_by_dex[""] = self._ch_cache_ts
             log.debug("[%s] HL clearinghouseState refreshed from webData2", self.source)
 
     # ------------------------------------------------------------------ #
