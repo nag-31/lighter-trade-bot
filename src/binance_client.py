@@ -39,6 +39,7 @@ from typing import AsyncIterator, Optional
 import httpx
 import websockets
 
+from .result import FetchResult
 from .types import OpenOrder, Position, Trade
 
 # Imported here (not TYPE_CHECKING) so proxy_pool instances can be passed
@@ -115,6 +116,8 @@ class BinanceClient:
         self._sym_to_id:  dict[str, int] = {}
         self._id_to_disp: dict[int, str] = {}
         self._id_to_full: dict[int, str] = {}
+        self._position_ids: dict[tuple[str, str], int] = {}
+        self._recent_symbols: set[str] = set()
 
         # positionRisk cache
         self._pos_cache:    Optional[list] = None
@@ -122,6 +125,10 @@ class BinanceClient:
 
         # Set True in bootstrap if dualSidePosition=true; disables source
         self._hedge_mode: bool = False
+        self._pos_last_authoritative: bool = False
+        self._time_offset_ms: int = 0
+        self._auth_disabled: bool = False
+        self._rate_limited_until: float = 0.0
 
         # WS / shutdown
         self._closed:     bool = False
@@ -271,7 +278,8 @@ class BinanceClient:
 
     def _sign(self, params: dict) -> dict:
         """Append timestamp + HMAC-SHA256 signature to *params* (mutates copy)."""
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+        params.setdefault("recvWindow", 5000)
         qs  = urllib.parse.urlencode(params)
         sig = hmac.new(self._api_secret, qs.encode(), hashlib.sha256).hexdigest()
         params["signature"] = sig
@@ -282,6 +290,10 @@ class BinanceClient:
     # ------------------------------------------------------------------ #
 
     async def _get(self, path: str, params: dict | None = None, signed: bool = True):
+        if signed and self._auth_disabled:
+            return None
+        if time.monotonic() < self._rate_limited_until:
+            return None
         p = dict(params or {})
         if signed:
             p = self._sign(p)
@@ -293,6 +305,27 @@ class BinanceClient:
             log.error("[%s] Binance GET %s — BinanceUnavailable (all proxies exhausted)", self.source, path)
             return None
         except httpx.HTTPStatusError as e:
+            try:
+                body = e.response.json()
+            except Exception:
+                body = {}
+            code = body.get("code") if isinstance(body, dict) else None
+            if code in {-2014, -2015} or e.response.status_code in {401, 403}:
+                self._auth_disabled = True
+                log.error(
+                    "[%s] Binance credentials rejected; automatic authenticated "
+                    "retries paused until process restart/config reload",
+                    self.source,
+                )
+            elif code == -1021:
+                await self._sync_server_time()
+            if e.response.status_code in {418, 429}:
+                retry_after = e.response.headers.get("Retry-After", "60")
+                try:
+                    delay = max(1.0, float(retry_after))
+                except ValueError:
+                    delay = 60.0
+                self._rate_limited_until = time.monotonic() + delay
             log.error(
                 "[%s] Binance GET %s → HTTP %d: %s",
                 self.source, path, e.response.status_code, e.response.text[:200],
@@ -301,6 +334,18 @@ class BinanceClient:
         except Exception:
             log.exception("[%s] Binance GET %s failed", self.source, path)
             return None
+
+    async def _sync_server_time(self) -> None:
+        """Refresh Binance clock offset after error -1021."""
+        try:
+            response = await self._request("GET", "/fapi/v1/time")
+            response.raise_for_status()
+            body = response.json()
+            server_time = int(body["serverTime"])
+            self._time_offset_ms = server_time - int(time.time() * 1000)
+            log.info("[%s] Binance server-time offset refreshed", self.source)
+        except Exception:
+            log.warning("[%s] Binance server-time sync failed", self.source)
 
     async def _post(self, path: str, params: dict | None = None):
         p = self._sign(dict(params or {}))
@@ -345,17 +390,17 @@ class BinanceClient:
     # ------------------------------------------------------------------ #
 
     async def bootstrap_markets(self) -> dict[int, str]:
-        """Load all USDT-M perpetual symbols; detect and block hedge mode."""
+        """Load all USDT-M perpetual symbols and detect position mode."""
         # 1. Detect position mode — must fail-fast before any WS subscription.
         mode_data = await self._get("/fapi/v1/positionSide/dual")
         if isinstance(mode_data, dict):
             if mode_data.get("dualSidePosition", False):
                 self._hedge_mode = True
-                log.error(
+                log.info(
                     "[%s] Binance hedge mode (dualSidePosition=true) is ENABLED on "
-                    "this account.  This bot only supports one-way mode.  "
+                    "this account. LONG and SHORT legs are tracked independently. "
                     "Go to Binance Futures settings → disable hedge mode → restart bot.  "
-                    "The Binance source is DISABLED until then.",
+                    "Hedge-mode support is active.",
                     self.source,
                 )
         else:
@@ -414,6 +459,23 @@ class BinanceClient:
     def _full_symbol(self, market_id: int) -> str:
         return self._id_to_full.get(market_id, f"M{market_id}USDT")
 
+    def _position_market_id(self, symbol: str, position_side: str) -> int:
+        """Return a distinct market id for BOTH/LONG/SHORT position legs."""
+        sym = symbol.upper()
+        base_id = self._market_id(sym)
+        ps = position_side.upper()
+        if ps == "BOTH":
+            return base_id
+        key = (sym, ps)
+        if key in self._position_ids:
+            return self._position_ids[key]
+        side_bit = 0 if ps == "LONG" else 1
+        position_id = 1_000_000_000 + base_id * 2 + side_bit
+        self._position_ids[key] = position_id
+        self._id_to_disp[position_id] = self._id_to_disp[base_id]
+        self._id_to_full[position_id] = sym
+        return position_id
+
     # ------------------------------------------------------------------ #
     # positionRisk cache (shared by current_positions + fetch_leverage)   #
     # ------------------------------------------------------------------ #
@@ -432,8 +494,10 @@ class BinanceClient:
         if isinstance(data, list):
             self._pos_cache    = data
             self._pos_cache_ts = now
+            self._pos_last_authoritative = True
             return data
         log.warning("[%s] Binance positionRisk failed — using stale cache", self.source)
+        self._pos_last_authoritative = False
         return self._pos_cache
 
     # ------------------------------------------------------------------ #
@@ -442,11 +506,8 @@ class BinanceClient:
 
     async def current_positions(self) -> dict[int, Position]:
         """Snapshot all non-zero USDT-M positions from positionRisk."""
-        if self._hedge_mode:
-            return {}
-
         rows = await self._fetch_position_risk()
-        if not rows:
+        if rows is None:
             return {}
 
         out: dict[int, Position] = {}
@@ -459,8 +520,16 @@ class BinanceClient:
                     continue
 
                 sym  = str(row.get("symbol", ""))
-                mid  = self._market_id(sym)
+                position_side = str(row.get("positionSide", "BOTH")).upper()
+                if position_side not in {"BOTH", "LONG", "SHORT"}:
+                    position_side = "BOTH"
+                mid  = self._position_market_id(sym, position_side)
                 side = "long" if amt > 0 else "short"
+                if position_side == "LONG":
+                    side = "long"
+                elif position_side == "SHORT":
+                    side = "short"
+                self._recent_symbols.add(sym)
                 avg  = _to_decimal(row.get("entryPrice") or "0") or Decimal(0)
                 unr  = _to_decimal(row.get("unrealizedProfit"))
                 liq  = _to_decimal(row.get("liquidationPrice"))
@@ -478,6 +547,8 @@ class BinanceClient:
                     source=self.source,
                     unrealized_pnl=unr,
                     liquidation_px=liq,
+                    exchange="binance",
+                    position_side=position_side,
                 )
             except Exception:
                 log.exception(
@@ -487,15 +558,21 @@ class BinanceClient:
         log.debug("[%s] %d open Binance positions", self.source, len(out))
         return out
 
+    async def current_positions_result(self) -> FetchResult[dict[int, Position]]:
+        positions = await self.current_positions()
+        if self._pos_last_authoritative:
+            return FetchResult.success(positions)
+        return FetchResult.stale(
+            positions,
+            error="Binance positionRisk unavailable; using cached snapshot",
+        )
+
     # ------------------------------------------------------------------ #
     # Protocol: fetch_leverage                                             #
     # ------------------------------------------------------------------ #
 
     async def fetch_leverage(self, market_id: int) -> Optional[float]:
         """Leverage for *market_id* from the cached positionRisk."""
-        if self._hedge_mode:
-            return None
-
         rows = await self._fetch_position_risk()
         if not rows:
             return None
@@ -521,9 +598,6 @@ class BinanceClient:
         Looks for STOP_MARKET / STOP (SL) and TAKE_PROFIT_MARKET / TAKE_PROFIT (TP)
         orders on the given symbol. Returns (None, None) on any error.
         """
-        if self._hedge_mode:
-            return None, None
-
         full = self._full_symbol(market_id)
         data = await self._get("/fapi/v1/openOrders", {"symbol": full})
         if not isinstance(data, list):
@@ -554,10 +628,53 @@ class BinanceClient:
     async def fetch_open_orders(self) -> list[OpenOrder]:
         """No-op stub — satisfies ExchangeClient Protocol.
 
-        Binance open-orders are not yet tracked in this bot.  Returns []
-        so the dashboard simply shows no resting orders for Binance sources.
+        Returns every account-level resting order, including hedge-mode legs.
         """
-        return []
+        data = await self._get("/fapi/v1/openOrders")
+        if not isinstance(data, list):
+            return []
+        out: list[OpenOrder] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                symbol = str(row.get("symbol", "")).upper()
+                ps = str(row.get("positionSide", "BOTH")).upper()
+                if ps not in {"BOTH", "LONG", "SHORT"}:
+                    ps = "BOTH"
+                mid = self._position_market_id(symbol, ps)
+                side = "long" if str(row.get("side", "")).upper() == "BUY" else "short"
+                order_type = str(row.get("type", "")).upper()
+                if order_type.startswith("STOP"):
+                    kind = "stop_loss"
+                elif order_type.startswith("TAKE_PROFIT"):
+                    kind = "take_profit"
+                else:
+                    kind = "limit"
+                price = _to_decimal(row.get("price"))
+                trigger = _to_decimal(row.get("stopPrice"))
+                size = _to_decimal(row.get("origQty"))
+                out.append(
+                    OpenOrder(
+                        source=self.source,
+                        market_id=mid,
+                        market_symbol=self._market_symbol(mid),
+                        side=side,
+                        order_kind=kind,
+                        price=price if price and price != 0 else None,
+                        trigger_px=trigger if trigger and trigger != 0 else None,
+                        size=size,
+                        reduce_only=bool(row.get("reduceOnly", False)),
+                        order_id=(
+                            int(row["orderId"])
+                            if row.get("orderId") is not None
+                            else None
+                        ),
+                    )
+                )
+            except Exception:
+                log.exception("[%s] could not parse Binance open order", self.source)
+        return out
 
     # ------------------------------------------------------------------ #
     # Protocol: fetch_trades_since (REST safety net)                      #
@@ -572,49 +689,82 @@ class BinanceClient:
         symbols.  At startup (since_trade_id=None) returns [] — the anchor is
         set by the first WS fill and the reconciler handles silent closes.
         """
-        if self._hedge_mode:
-            return []
-
         if since_trade_id is None:
             # Cannot anchor without a reference timestamp; WS will prime it.
             return []
 
-        # Only query symbols that currently have open positions.
+        # Query current positions, symbols seen during this process, and the
+        # realized-income ledger. The income discovery step recovers symbols
+        # that opened and fully closed while the bot was offline.
         rows = await self._fetch_position_risk()
-        if not rows:
-            return []
-
-        open_syms: set[str] = set()
-        for row in rows:
+        candidate_syms: set[str] = set(self._recent_symbols)
+        for row in rows or []:
             if not isinstance(row, dict):
                 continue
             amt = _to_decimal(row.get("positionAmt", "0")) or Decimal(0)
             if amt != 0:
                 sym = str(row.get("symbol", ""))
                 if sym:
-                    open_syms.add(sym)
+                    candidate_syms.add(sym)
 
-        if not open_syms:
+        income = await self._get(
+            "/fapi/v1/income",
+            {
+                "incomeType": "REALIZED_PNL",
+                "startTime": since_trade_id + 1,
+                "limit": 1000,
+            },
+        )
+        if isinstance(income, list):
+            for row in income:
+                if isinstance(row, dict) and row.get("symbol"):
+                    candidate_syms.add(str(row["symbol"]))
+
+        if not candidate_syms:
             return []
 
         all_trades: list[Trade] = []
-        for sym in open_syms:
-            data = await self._get(
-                "/fapi/v1/userTrades",
-                {"symbol": sym, "startTime": since_trade_id + 1, "limit": 1000},
-            )
-            if not isinstance(data, list):
-                log.debug("[%s] Binance userTrades for %s returned non-list", self.source, sym)
-                continue
-            for raw in data:
-                t = self._parse_rest_trade(raw, sym)
-                if t is not None:
-                    all_trades.append(t)
+        for sym in candidate_syms:
+            page_start = since_trade_id + 1
+            for _page in range(20):
+                data = await self._get(
+                    "/fapi/v1/userTrades",
+                    {"symbol": sym, "startTime": page_start, "limit": 1000},
+                )
+                if not isinstance(data, list):
+                    log.debug(
+                        "[%s] Binance userTrades for %s returned non-list",
+                        self.source,
+                        sym,
+                    )
+                    break
+                page_times: list[int] = []
+                for raw in data:
+                    t = self._parse_rest_trade(raw, sym)
+                    if t is not None:
+                        all_trades.append(t)
+                        page_times.append(int(t.timestamp.timestamp() * 1000))
+                if len(data) < 1000 or not page_times:
+                    break
+                next_start = max(page_times) + 1
+                if next_start <= page_start:
+                    log.warning(
+                        "[%s] Binance pagination stalled for %s", self.source, sym
+                    )
+                    break
+                page_start = next_start
+            else:
+                log.warning(
+                    "[%s] Binance recovery hit 20-page safety limit for %s; "
+                    "history gap may remain",
+                    self.source,
+                    sym,
+                )
 
-        all_trades.sort(key=lambda x: x.trade_id)
+        all_trades.sort(key=lambda x: (x.timestamp, x.market_id, x.trade_id))
         log.info(
             "[%s] Binance REST gap-fill: %d trade(s) since ts=%d across %d symbol(s)",
-            self.source, len(all_trades), since_trade_id, len(open_syms),
+            self.source, len(all_trades), since_trade_id, len(candidate_syms),
         )
         return all_trades[-limit:] if limit else all_trades
 
@@ -632,14 +782,6 @@ class BinanceClient:
           4. Background task PUT /fapi/v1/listenKey every 25 min to extend
           5. On any error: cancel keepalive, exponential-backoff, new listen key
         """
-        if self._hedge_mode:
-            log.error(
-                "[%s] Binance stream_trades is DISABLED (hedge mode active).  "
-                "Disable hedge mode in Binance Futures settings to enable.",
-                self.source,
-            )
-            return
-
         backoff = _BACKOFF_INITIAL
 
         while not self._closed:
@@ -753,8 +895,8 @@ class BinanceClient:
             return None
 
         # One-way mode: position side must be "BOTH"
-        ps = str(order.get("ps", "BOTH"))
-        if ps != "BOTH":
+        ps = str(order.get("ps", "BOTH")).upper()
+        if ps not in {"BOTH", "LONG", "SHORT"}:
             log.warning(
                 "[%s] Binance fill with ps=%r (not BOTH) — hedge mode leak? skipping",
                 self.source, ps,
@@ -763,7 +905,8 @@ class BinanceClient:
 
         try:
             symbol   = str(order.get("s", ""))
-            mid      = self._market_id(symbol)
+            mid      = self._position_market_id(symbol, ps)
+            self._recent_symbols.add(symbol.upper())
             side_raw = str(order.get("S", "")).upper()
             side     = "long" if side_raw == "BUY" else "short"
 
@@ -780,11 +923,12 @@ class BinanceClient:
 
             # T = transaction time in ms — used as synthetic global trade_id
             tx_time  = int(order.get("T", 0))
+            native_id = str(order.get("t", "") or tx_time)
             rp       = _to_decimal(order.get("rp"))  # realized profit (USD)
             ts       = datetime.fromtimestamp(tx_time / 1000, tz=timezone.utc)
 
             return Trade(
-                trade_id=tx_time,
+                trade_id=int(native_id),
                 timestamp=ts,
                 market_id=mid,
                 market_symbol=self._market_symbol(mid),
@@ -794,6 +938,9 @@ class BinanceClient:
                 tx_hash=str(order.get("c", "")),   # client order id as hash proxy
                 source=self.source,
                 realized_pnl=rp if (rp is not None and rp != 0) else None,
+                exchange="binance",
+                native_trade_id=native_id,
+                position_side=ps,
             )
         except Exception:
             log.exception("[%s] Binance WS fill parse error: %r", self.source, order)
@@ -809,7 +956,11 @@ class BinanceClient:
             return None
         try:
             trade_time = int(raw.get("time", 0))
-            mid        = self._market_id(symbol)
+            ps = str(raw.get("positionSide", "BOTH")).upper()
+            if ps not in {"BOTH", "LONG", "SHORT"}:
+                ps = "BOTH"
+            mid = self._position_market_id(symbol, ps)
+            self._recent_symbols.add(symbol.upper())
 
             # In USDT-M one-way mode: buyer=True means BUY side → long
             buyer = bool(raw.get("buyer", False))
@@ -824,8 +975,9 @@ class BinanceClient:
 
             ts = datetime.fromtimestamp(trade_time / 1000, tz=timezone.utc)
 
+            native_id = str(raw.get("id", "") or trade_time)
             return Trade(
-                trade_id=trade_time,   # ms timestamp as synthetic global id
+                trade_id=int(native_id),
                 timestamp=ts,
                 market_id=mid,
                 market_symbol=self._market_symbol(mid),
@@ -835,6 +987,9 @@ class BinanceClient:
                 tx_hash=str(raw.get("id", "")),
                 source=self.source,
                 realized_pnl=rp if (rp is not None and rp != 0) else None,
+                exchange="binance",
+                native_trade_id=native_id,
+                position_side=ps,
             )
         except Exception:
             log.exception(

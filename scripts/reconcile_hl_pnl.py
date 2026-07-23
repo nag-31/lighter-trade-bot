@@ -58,9 +58,9 @@ if str(_REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from src.db import (
-    delete_closed_trades_by_source_since,
+    delete_closed_trades_by_identity_since,
     init_db,
-    query_closed_trades_by_source,
+    query_closed_trades_by_identity,
     save_closed_trade,
 )
 from src.display_transform import PrivacyParams
@@ -305,6 +305,7 @@ async def main(
     days: int,
     no_cards: bool,
     now_ms: int,
+    source_id: str | None = None,
 ) -> None:
     # 1. Load config + find HL source
     load_dotenv()
@@ -317,7 +318,20 @@ async def main(
         log.error("Could not load sources: %s", exc)
         sys.exit(1)
 
-    hl_source = next((s for s in sources if s.is_hyperliquid), None)
+    hl_sources = [s for s in sources if s.is_hyperliquid]
+    if source_id:
+        hl_source = next((s for s in hl_sources if s.id == source_id), None)
+    elif len(hl_sources) == 1:
+        hl_source = hl_sources[0]
+    elif len(hl_sources) > 1:
+        print(
+            "ERROR: Multiple Hyperliquid sources are configured. "
+            "Pass --source-id with one of: "
+            + ", ".join(source.id for source in hl_sources)
+        )
+        sys.exit(2)
+    else:
+        hl_source = None
     if hl_source is None:
         print(
             "ERROR: No Hyperliquid source found in config.yaml, or HL_ADDRESS env var is unset.\n"
@@ -365,6 +379,14 @@ async def main(
 
     # 6. Reconstruct records (pure logic in hl_pnl_logic.py)
     rebuilt_records = reconstruct_all(fills)
+    for record in rebuilt_records:
+        record["source_id"] = hl_source.id
+        record["exchange"] = "hyperliquid"
+        market_key = str(record.get("market_key") or "")
+        record["event_uid"] = (
+            f"{hl_source.id}|{market_key.replace(':', '|', 1)}|"
+            f"{record.get('native_trade_id')}"
+        )
     log.info("Reconstructed %d records", len(rebuilt_records))
 
     # 7. Determine T0 = min timestamp across all fetched fills.
@@ -377,7 +399,13 @@ async def main(
         t0_iso = min(r["ts"] for r in rebuilt_records)
 
     # 8. Query existing HL rows and compute scoped counts for the report.
-    existing_rows = await query_closed_trades_by_source(DB_PATH, hl_source.name)
+    include_legacy = sum(1 for source in hl_sources if source.name == hl_source.name) == 1
+    existing_rows = await query_closed_trades_by_identity(
+        DB_PATH,
+        hl_source.id,
+        hl_source.name,
+        include_legacy=include_legacy,
+    )
     if t0_iso is not None:
         rows_replaced = sum(1 for r in existing_rows if (r.get("ts") or "") >= t0_iso)
         rows_preserved = len(existing_rows) - rows_replaced
@@ -423,8 +451,12 @@ async def main(
     #      Rows older than T0 are outside the fetched window and are preserved.
     #      Blanket delete is intentionally NOT used here.
     if t0_iso is not None:
-        deleted = await delete_closed_trades_by_source_since(
-            DB_PATH, hl_source.name, t0_iso
+        deleted = await delete_closed_trades_by_identity_since(
+            DB_PATH,
+            hl_source.id,
+            hl_source.name,
+            t0_iso,
+            include_legacy=include_legacy,
         )
         log.info(
             "Scoped-deleted %d existing HL rows (source=%r, ts>=%s)",
@@ -535,6 +567,11 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Skip PNG card regeneration (faster; cards remain as-is).",
     )
+    parser.add_argument(
+        "--source-id",
+        default=None,
+        help="Stable Hyperliquid source id (required when multiple HL wallets are configured).",
+    )
     return parser.parse_args()
 
 
@@ -553,5 +590,6 @@ if __name__ == "__main__":
             days=args.days,
             no_cards=args.no_cards,
             now_ms=_now_ms,
+            source_id=args.source_id,
         )
     )

@@ -14,7 +14,7 @@ from typing import Any
 
 
 def _migrate_closed_trades(con: sqlite3.Connection) -> None:
-    """Idempotent migration: add the 3 realization columns to existing DBs.
+    """Idempotently add legacy realization and v2 identity columns.
 
     SQLite has no ADD COLUMN IF NOT EXISTS, so we inspect PRAGMA table_info
     and only issue ALTER TABLE for columns that are actually missing.
@@ -26,12 +26,22 @@ def _migrate_closed_trades(con: sqlite3.Connection) -> None:
         ("trade_id",         "INTEGER"),
         ("fill_ids",         "TEXT"),
         ("realization_kind", "TEXT"),
+        ("source_id",         "TEXT"),
+        ("exchange",          "TEXT"),
+        ("market_key",        "TEXT"),
+        ("position_side",     "TEXT"),
+        ("native_trade_id",   "TEXT"),
+        ("event_uid",         "TEXT"),
     ]
     for col_name, col_type in new_cols:
         if col_name not in existing:
             con.execute(
                 f"ALTER TABLE closed_trades ADD COLUMN {col_name} {col_type}"
             )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_closed_trades_event_uid "
+        "ON closed_trades(event_uid) WHERE event_uid IS NOT NULL"
+    )
     con.commit()
 
 
@@ -39,12 +49,29 @@ def _init_sync(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key    TEXT PRIMARY KEY,
+            value  TEXT NOT NULL
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             ts       TEXT    NOT NULL,
-            payload  TEXT    NOT NULL
+            payload  TEXT    NOT NULL,
+            source_id TEXT,
+            exchange TEXT,
+            event_uid TEXT
         )
     """)
+    event_cols = {row[1] for row in con.execute("PRAGMA table_info(events)")}
+    for col_name in ("source_id", "exchange", "event_uid"):
+        if col_name not in event_cols:
+            con.execute(f"ALTER TABLE events ADD COLUMN {col_name} TEXT")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_events_event_uid "
+        "ON events(event_uid) WHERE event_uid IS NOT NULL"
+    )
     con.execute("""
         CREATE TABLE IF NOT EXISTS closed_trades (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,9 +93,19 @@ def _init_sync(path: Path) -> None:
             trade_id          INTEGER,
             fill_ids          TEXT,
             realization_kind  TEXT
+            ,source_id         TEXT
+            ,exchange          TEXT
+            ,market_key        TEXT
+            ,position_side     TEXT
+            ,native_trade_id   TEXT
+            ,event_uid         TEXT
         )
     """)
     _migrate_closed_trades(con)
+    con.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('schema_version', '2') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
     con.execute("""
         CREATE TABLE IF NOT EXISTS tg_alerts (
             id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,13 +114,48 @@ def _init_sync(path: Path) -> None:
             text TEXT    NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS source_cursors (
+            source_id  TEXT NOT NULL,
+            cursor_key TEXT NOT NULL,
+            cursor     TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, cursor_key)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS notification_outbox (
+            event_uid    TEXT PRIMARY KEY,
+            destination  TEXT NOT NULL,
+            payload      TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            last_error   TEXT
+        )
+    """)
     con.commit()
     con.close()
 
 
-def _save_sync(path: Path, ts: str, payload: str) -> None:
+def _save_sync(
+    path: Path,
+    ts: str,
+    payload: str,
+    source_id: str = "",
+    exchange: str = "",
+    event_uid: str = "",
+) -> None:
     con = sqlite3.connect(path)
-    con.execute("INSERT INTO events (ts, payload) VALUES (?, ?)", (ts, payload))
+    if event_uid:
+        con.execute(
+            "INSERT OR IGNORE INTO events "
+            "(ts, payload, source_id, exchange, event_uid) VALUES (?, ?, ?, ?, ?)",
+            (ts, payload, source_id or None, exchange or None, event_uid),
+        )
+    else:
+        con.execute("INSERT INTO events (ts, payload) VALUES (?, ?)", (ts, payload))
     con.commit()
     con.close()
 
@@ -101,8 +173,18 @@ async def init_db(path: Path) -> None:
     await asyncio.to_thread(_init_sync, path)
 
 
-async def save_event(path: Path, ts: str, payload: str) -> None:
-    await asyncio.to_thread(_save_sync, path, ts, payload)
+async def save_event(
+    path: Path,
+    ts: str,
+    payload: str,
+    *,
+    source_id: str = "",
+    exchange: str = "",
+    event_uid: str = "",
+) -> None:
+    await asyncio.to_thread(
+        _save_sync, path, ts, payload, source_id, exchange, event_uid
+    )
 
 
 async def load_recent_events(path: Path, limit: int) -> list[dict[str, Any]]:
@@ -119,6 +201,8 @@ _CLOSED_TRADE_COLUMNS = (
     "size", "notional", "pnl", "pct", "is_win", "leverage",
     "wins", "total", "card_path",
     "trade_id", "fill_ids", "realization_kind",
+    "source_id", "exchange", "market_key", "position_side",
+    "native_trade_id", "event_uid",
 )
 
 
@@ -127,10 +211,16 @@ def _save_closed_trade_sync(path: Path, record: dict) -> None:
     placeholders = ", ".join("?" for _ in _CLOSED_TRADE_COLUMNS)
     cols = ", ".join(_CLOSED_TRADE_COLUMNS)
     values = tuple(record.get(c) for c in _CLOSED_TRADE_COLUMNS)
-    con.execute(
-        f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
-        values,
-    )
+    if record.get("event_uid"):
+        con.execute(
+            f"INSERT OR IGNORE INTO closed_trades ({cols}) VALUES ({placeholders})",
+            values,
+        )
+    else:
+        con.execute(
+            f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
+            values,
+        )
     con.commit()
     con.close()
 
@@ -242,6 +332,88 @@ async def query_closed_trades_by_source(path: Path, source: str) -> list[dict]:
     return await asyncio.to_thread(_query_closed_trades_by_source_sync, path, source)
 
 
+def _query_closed_trades_by_identity_sync(
+    path: Path, source_id: str, legacy_name: str, include_legacy: bool
+) -> list[dict]:
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        if include_legacy:
+            rows = con.execute(
+                "SELECT * FROM closed_trades WHERE source_id=? "
+                "OR (source_id IS NULL AND source=?) ORDER BY id DESC",
+                (source_id, legacy_name),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM closed_trades WHERE source_id=? ORDER BY id DESC",
+                (source_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+async def query_closed_trades_by_identity(
+    path: Path,
+    source_id: str,
+    legacy_name: str,
+    *,
+    include_legacy: bool = True,
+) -> list[dict]:
+    return await asyncio.to_thread(
+        _query_closed_trades_by_identity_sync,
+        path,
+        source_id,
+        legacy_name,
+        include_legacy,
+    )
+
+
+def _delete_closed_trades_by_identity_since_sync(
+    path: Path,
+    source_id: str,
+    legacy_name: str,
+    ts_iso: str,
+    include_legacy: bool,
+) -> int:
+    con = sqlite3.connect(path)
+    try:
+        if include_legacy:
+            cur = con.execute(
+                "DELETE FROM closed_trades WHERE ts>=? AND "
+                "(source_id=? OR (source_id IS NULL AND source=?))",
+                (ts_iso, source_id, legacy_name),
+            )
+        else:
+            cur = con.execute(
+                "DELETE FROM closed_trades WHERE ts>=? AND source_id=?",
+                (ts_iso, source_id),
+            )
+        con.commit()
+        return cur.rowcount
+    finally:
+        con.close()
+
+
+async def delete_closed_trades_by_identity_since(
+    path: Path,
+    source_id: str,
+    legacy_name: str,
+    ts_iso: str,
+    *,
+    include_legacy: bool = True,
+) -> int:
+    return await asyncio.to_thread(
+        _delete_closed_trades_by_identity_since_sync,
+        path,
+        source_id,
+        legacy_name,
+        ts_iso,
+        include_legacy,
+    )
+
+
 def _load_recorded_fill_ids_sync(path: Path) -> set[int]:
     """Return the union of all trade_id values and all ids inside fill_ids JSON lists.
 
@@ -283,6 +455,143 @@ async def load_recorded_fill_ids(path: Path) -> set[int]:
     Defensive: unparseable rows / values are silently skipped.
     """
     return await asyncio.to_thread(_load_recorded_fill_ids_sync, path)
+
+
+def _load_recorded_event_uids_sync(path: Path) -> set[str]:
+    con = sqlite3.connect(path)
+    try:
+        existing = {r[1] for r in con.execute("PRAGMA table_info(closed_trades)")}
+        if "event_uid" not in existing:
+            return set()
+        rows = con.execute(
+            "SELECT event_uid FROM closed_trades WHERE event_uid IS NOT NULL"
+        ).fetchall()
+        return {str(row[0]) for row in rows if row[0]}
+    finally:
+        con.close()
+
+
+async def load_recorded_event_uids(path: Path) -> set[str]:
+    """Return v2 source-scoped realization idempotency keys."""
+    return await asyncio.to_thread(_load_recorded_event_uids_sync, path)
+
+
+def _save_cursor_sync(
+    path: Path, source_id: str, cursor_key: str, cursor: str, updated_at: str
+) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO source_cursors(source_id, cursor_key, cursor, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(source_id, cursor_key) DO UPDATE SET "
+            "cursor=excluded.cursor, updated_at=excluded.updated_at",
+            (source_id, cursor_key, cursor, updated_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _load_cursor_sync(path: Path, source_id: str, cursor_key: str) -> str | None:
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT cursor FROM source_cursors WHERE source_id=? AND cursor_key=?",
+            (source_id, cursor_key),
+        ).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        con.close()
+
+
+async def save_source_cursor(
+    path: Path, source_id: str, cursor_key: str, cursor: str, updated_at: str
+) -> None:
+    await asyncio.to_thread(
+        _save_cursor_sync, path, source_id, cursor_key, cursor, updated_at
+    )
+
+
+async def load_source_cursor(
+    path: Path, source_id: str, cursor_key: str = "trades"
+) -> str | None:
+    return await asyncio.to_thread(_load_cursor_sync, path, source_id, cursor_key)
+
+
+def _notification_status_sync(path: Path, event_uid: str) -> str | None:
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT status FROM notification_outbox WHERE event_uid=?",
+            (event_uid,),
+        ).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        con.close()
+
+
+def _enqueue_notification_sync(
+    path: Path,
+    event_uid: str,
+    destination: str,
+    payload: str,
+    now_iso: str,
+) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "INSERT INTO notification_outbox"
+            "(event_uid, destination, payload, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?) "
+            "ON CONFLICT(event_uid) DO NOTHING",
+            (event_uid, destination, payload, now_iso, now_iso),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _mark_notification_sync(
+    path: Path, event_uid: str, status: str, now_iso: str, error: str
+) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "UPDATE notification_outbox SET status=?, attempts=attempts+1, "
+            "updated_at=?, last_error=? WHERE event_uid=?",
+            (status, now_iso, error or None, event_uid),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+async def notification_status(path: Path, event_uid: str) -> str | None:
+    return await asyncio.to_thread(_notification_status_sync, path, event_uid)
+
+
+async def enqueue_notification(
+    path: Path, event_uid: str, destination: str, payload: str, now_iso: str
+) -> None:
+    await asyncio.to_thread(
+        _enqueue_notification_sync,
+        path,
+        event_uid,
+        destination,
+        payload,
+        now_iso,
+    )
+
+
+async def mark_notification(
+    path: Path, event_uid: str, status: str, now_iso: str, error: str = ""
+) -> None:
+    if status not in {"pending", "sent", "failed"}:
+        raise ValueError("invalid notification status")
+    await asyncio.to_thread(
+        _mark_notification_sync, path, event_uid, status, now_iso, error
+    )
 
 
 # ---------------------------------------------------------------------------

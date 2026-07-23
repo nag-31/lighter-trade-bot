@@ -239,6 +239,12 @@ def reconstruct_record(
         "trade_id": fill.trade_id,
         "fill_ids": json.dumps([fill.trade_id]),
         "realization_kind": kind,
+        "source_id": fill.source_id,
+        "exchange": fill.exchange or "hyperliquid",
+        "market_key": f"{fill.market_id}:{fill.position_side}",
+        "position_side": fill.position_side,
+        "native_trade_id": fill.native_trade_id or str(fill.trade_id),
+        "event_uid": fill.event_uid(),
     }
 
 

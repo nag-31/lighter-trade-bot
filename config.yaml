@@ -47,6 +47,8 @@ settings:
 
   # How often positions are re-synced from the exchange API to catch silent closes.
   reconciler_interval_seconds: 30
+  stale_position_warning_seconds: 120
+  stale_position_down_seconds: 600
 
   # -- Duplicate suppression ------------------------------------------------
   # Identical Telegram messages within this window are silently dropped.
@@ -124,12 +126,13 @@ settings:
 #
 # Supported types:
 #   lighter     -> pool_id required (public pool URL shown in alerts)
-#   hyperliquid -> wallet address loaded from HL_ADDRESS env var (never put it here)
-#   binance     -> credentials loaded from BINANCE_API_KEY + BINANCE_API_SECRET env vars
-#                  (one-way / BOTH mode only; hedge mode -> source disabled with clear error)
+#   hyperliquid -> wallet address loaded from the configured address_env
+#   binance     -> credentials loaded from api_key_env + api_secret_env
+#                  (both one-way and hedge mode are supported)
 #                  Geo-block bypass: set binance_proxies in settings above.
 #
 # All source types share:
+#   id                -- stable, unique machine id; never rename after deployment
 #   name              -- label shown on dashboard and in Telegram alerts
 #   min_notional_usd  -- per-source override (default: settings.default_min_notional_usd)
 #   footer_url        -- optional public URL appended to alerts (HL/Binance only)
@@ -142,12 +145,14 @@ settings:
 
 sources:
   - type: lighter
+    id: lighter-main
     name: "My NK pool"
     pool_id: 281474976684763
 
   - type: hyperliquid
+    id: hl-main
     name: "HL"
-    # address loaded from HL_ADDRESS env var
+    address_env: HL_ADDRESS
     min_notional_usd: 1000
     exclude_symbols: ["FARTCOIN"]
     footer_url: "https://enkapital.xyz"
@@ -156,6 +161,26 @@ sources:
   # Re-enable (uncomment) once binance_proxies above are configured and working.
   # Credentials go in .env: BINANCE_API_KEY + BINANCE_API_SECRET (read-only).
   # - type: binance
+  #   id: binance-main
   #   name: "Binance"
   #   min_notional_usd: 900
-  #   # credentials in .env: BINANCE_API_KEY + BINANCE_API_SECRET
+  #   api_key_env: BINANCE_API_KEY
+  #   api_secret_env: BINANCE_API_SECRET
+  #
+  # Add more accounts by repeating an entry with a new stable id and different
+  # env-variable references. Missing credentials disable only that account.
+  # - type: hyperliquid
+  #   id: hl-second
+  #   name: "HL 2"
+  #   address_env: HL_ADDRESS_2
+  #
+  # - type: lighter
+  #   id: lighter-second
+  #   name: "Lighter 2"
+  #   pool_id: 123456789
+  #
+  # - type: binance
+  #   id: binance-second
+  #   name: "Binance 2"
+  #   api_key_env: BINANCE_API_KEY_2
+  #   api_secret_env: BINANCE_API_SECRET_2

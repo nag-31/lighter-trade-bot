@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Literal, Optional
 
 Side = Literal["long", "short"]
+PositionSide = Literal["BOTH", "LONG", "SHORT"]
 
 
 @dataclass
@@ -44,10 +45,22 @@ class Trade:
     dir: Optional[str] = None               # HL intent string e.g. "Open Long", "Close Short"; None for Lighter
     closed_pnl: Optional[Decimal] = None    # Alias for realized_pnl from HL fill; None for Lighter
     start_position: Optional[Decimal] = None  # HL startPosition: signed position size BEFORE this fill; None for Lighter
+    # Stable v2 identity fields. Defaults preserve compatibility with legacy
+    # clients/tests while adapters progressively populate native identities.
+    source_id: str = ""
+    exchange: str = ""
+    native_trade_id: str = ""
+    position_side: PositionSide = "BOTH"
 
     @property
     def notional_usd(self) -> Decimal:
         return self.size * self.price
+
+    def event_uid(self, source_id: str = "") -> str:
+        """Return a source- and market-scoped idempotency key for this fill."""
+        sid = source_id or self.source_id or self.source
+        native = self.native_trade_id or str(self.trade_id)
+        return f"{sid}|{self.market_id}|{self.position_side}|{native}"
 
 
 @dataclass
@@ -60,10 +73,19 @@ class Position:
     source: str = ""
     unrealized_pnl: Optional[Decimal] = None   # from clearinghouseState
     liquidation_px: Optional[Decimal] = None    # from clearinghouseState
+    source_id: str = ""
+    exchange: str = ""
+    position_side: PositionSide = "BOTH"
+    stale: bool = False
+    stale_since: Optional[datetime] = None
 
     @property
     def notional_usd(self) -> Decimal:
         return self.size * self.avg_entry_price
+
+    @property
+    def position_key(self) -> str:
+        return f"{self.market_id}:{self.position_side}"
 
 
 class EventKind(str, Enum):

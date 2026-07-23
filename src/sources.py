@@ -11,8 +11,9 @@ config.yaml shape:
         name: "My NK pool"
         pool_id: 281474976684763
       - type: hyperliquid
+        id: hl-whale-a
         name: "Whale A"
-        address: "0x..."
+        address_env: HL_WHALE_A_ADDRESS
         min_notional_usd: 1000   # optional per-source override
 """
 
@@ -21,7 +22,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import AsyncIterator, Optional, Protocol
@@ -62,6 +64,8 @@ class BotSettings:
     rest_poll_seconds:           int = 60
     reconciler_interval_seconds: int = 60
     tg_dedup_window_seconds:     int = 90
+    stale_position_warning_seconds: int = 120
+    stale_position_down_seconds: int = 600
 
     # Cross-coin session digest: add/reduce alerts that flush within this many
     # seconds of each other (per source) are combined into ONE Telegram message
@@ -138,7 +142,18 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
 
     def _bool(key: str, default: bool) -> bool:
         v = raw.get(key, default)
-        return bool(v)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in {"true", "yes", "1", "on"}:
+                return True
+            if normalized in {"false", "no", "0", "off"}:
+                return False
+        if isinstance(v, (int, float)) and v in {0, 1}:
+            return bool(v)
+        log.warning("settings.%s must be a boolean — using default %s", key, default)
+        return default
 
     def _int(key: str, default: int) -> int:
         try:
@@ -211,6 +226,8 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         rest_poll_seconds           = _int("rest_poll_seconds",           60),
         reconciler_interval_seconds = _int("reconciler_interval_seconds", 60),
         tg_dedup_window_seconds     = _int("tg_dedup_window_seconds",     90),
+        stale_position_warning_seconds = _int("stale_position_warning_seconds", 120),
+        stale_position_down_seconds = _int("stale_position_down_seconds", 600),
         digest_window_seconds       = _int("digest_window_seconds",       20),
         daily_recap_enabled         = _bool("daily_recap_enabled",        True),
         daily_self_audit_enabled    = _bool("daily_self_audit_enabled",   True),
@@ -236,6 +253,30 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
             "https://fapi.binance.com/fapi/v1/ping",
         ),
     )
+    if not 1 <= settings.dashboard_port <= 65535:
+        log.warning("settings.dashboard_port is out of range — using 8080")
+        settings = replace(settings, dashboard_port=8080)
+    nonnegative_defaults = {
+        "aggregate_window_seconds": 30,
+        "rest_poll_seconds": 60,
+        "reconciler_interval_seconds": 60,
+        "tg_dedup_window_seconds": 90,
+        "stale_position_warning_seconds": 120,
+        "stale_position_down_seconds": 600,
+    }
+    for field_name, default in nonnegative_defaults.items():
+        if getattr(settings, field_name) < 0:
+            log.warning("settings.%s must be non-negative — using %d", field_name, default)
+            settings = replace(settings, **{field_name: default})
+    if settings.stale_position_down_seconds < settings.stale_position_warning_seconds:
+        log.warning(
+            "settings.stale_position_down_seconds is below warning threshold — "
+            "using warning threshold"
+        )
+        settings = replace(
+            settings,
+            stale_position_down_seconds=settings.stale_position_warning_seconds,
+        )
     log.info(
         "settings loaded — min_notional=$%s  window=%ds  poll=%ds  dedup=%ds  port=%d",
         settings.default_min_notional_usd,
@@ -275,10 +316,14 @@ class Source:
     tracker: PositionTracker
     url: str
     min_notional: Decimal
+    exchange: str = ""
+    enabled: bool = True
+    config_error: str = ""
+    account_fingerprint: str = ""
     last_trade_id: Optional[int] = None
     # Set-based dedup: protects against WS replay and REST/WS overlap.
     # Using a set catches duplicates with any tid, not just the last one.
-    seen_tids: set[tuple[str, int]] = field(default_factory=set)
+    seen_tids: set[str] = field(default_factory=set)
     # Normalized ticker symbols to hide entirely: no dashboard row, no TG
     # alert, no reconciler notification. Populated from config.yaml
     # `exclude_symbols`. Compared via _normalize_symbol (case-insensitive,
@@ -291,6 +336,12 @@ class Source:
             return False
         return _normalize_symbol(market_symbol) in self.exclude_symbols
 
+    def cursor_for_trade(self, trade: Trade) -> int:
+        """Return the protocol cursor represented by a normalized fill."""
+        if self.exchange == "binance":
+            return int(trade.timestamp.timestamp() * 1000)
+        return int(trade.trade_id)
+
     @property
     def is_hyperliquid(self) -> bool:
         """Canonical HL predicate — the privacy transform is gated on this.
@@ -298,7 +349,134 @@ class Source:
         The exchange type lives only in Source.id (built with a 'hyperliquid:'
         prefix); Trade.source / Position.source carry only the human name.
         """
-        return self.id.startswith("hyperliquid:")
+        return self.exchange == "hyperliquid" or self.id.startswith("hyperliquid:")
+
+
+@dataclass(frozen=True)
+class SourceConfigIssue:
+    """Redacted validation status for a disabled or invalid source."""
+
+    source_id: str
+    name: str
+    exchange: str
+    status: str
+    detail: str
+
+
+@dataclass
+class SourceLoadReport:
+    """Active sources plus disabled/invalid entries for health reporting."""
+
+    sources: list[Source] = field(default_factory=list)
+    issues: list[SourceConfigIssue] = field(default_factory=list)
+
+    @property
+    def active(self) -> list[Source]:
+        return self.sources
+
+    @property
+    def ok(self) -> bool:
+        return not any(i.status == "config_error" for i in self.issues)
+
+
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,63}$")
+_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def _configured_id(raw: dict, exchange: str, legacy_suffix: str) -> str:
+    explicit = str(raw.get("id", "")).strip().lower()
+    if explicit:
+        if not _ID_RE.fullmatch(explicit):
+            raise ValueError(
+                "id must be 2-64 lowercase letters, numbers, '.', '_' or '-'"
+            )
+        return explicit
+    return f"{exchange}:{legacy_suffix}"
+
+
+def _secret_env(raw: dict, key: str, legacy: str) -> tuple[str, str]:
+    env_name = str(raw.get(key, legacy)).strip()
+    if not _ENV_RE.fullmatch(env_name):
+        raise ValueError(f"{key} must name an uppercase environment variable")
+    return env_name, os.getenv(env_name, "").strip()
+
+
+def _source_issue_detail(raw: dict) -> str:
+    """Return a redacted validation error, or an empty string when usable."""
+    stype = str(raw.get("type", "")).lower().strip()
+    name = str(raw.get("name", "")).strip()
+    if not name:
+        return "missing name"
+    if stype not in {"lighter", "hyperliquid", "binance"}:
+        return "unsupported source type"
+    try:
+        _configured_id(raw, stype, "legacy")
+    except ValueError as exc:
+        return str(exc)
+    if raw.get("min_notional_usd") is not None:
+        try:
+            value = Decimal(str(raw["min_notional_usd"]))
+            if not value.is_finite() or value < 0:
+                raise ValueError
+        except Exception:
+            return "min_notional_usd must be a finite non-negative number"
+    if stype == "lighter":
+        try:
+            if int(raw.get("pool_id")) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return "pool_id must be a non-negative integer"
+    elif stype == "hyperliquid":
+        try:
+            env_name, address = _secret_env(raw, "address_env", "HL_ADDRESS")
+        except ValueError as exc:
+            return str(exc)
+        if not address:
+            return f"missing environment variable {env_name}"
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            return f"{env_name} does not contain a valid address"
+    elif stype == "binance":
+        try:
+            key_env, key = _secret_env(raw, "api_key_env", "BINANCE_API_KEY")
+            secret_env, secret = _secret_env(
+                raw, "api_secret_env", "BINANCE_API_SECRET"
+            )
+        except ValueError as exc:
+            return str(exc)
+        missing = [env for env, value in ((key_env, key), (secret_env, secret)) if not value]
+        if missing:
+            return "missing environment variable(s): " + ", ".join(missing)
+    return ""
+
+
+def _preview_source_identity(raw: dict) -> tuple[str, str]:
+    """Compute stable source/account identities without constructing a client."""
+    stype = str(raw.get("type", "")).lower().strip()
+    if stype == "lighter":
+        pool_id = int(raw["pool_id"])
+        return (
+            _configured_id(raw, stype, str(pool_id)),
+            f"lighter:{pool_id}",
+        )
+    if stype == "hyperliquid":
+        _env_name, address = _secret_env(raw, "address_env", "HL_ADDRESS")
+        address_hash = hashlib.sha256(address.lower().encode()).hexdigest()[:12]
+        return (
+            _configured_id(raw, stype, address_hash),
+            f"hyperliquid:{address_hash}",
+        )
+    key_env, _key = _secret_env(raw, "api_key_env", "BINANCE_API_KEY")
+    secret_env, _secret = _secret_env(
+        raw, "api_secret_env", "BINANCE_API_SECRET"
+    )
+    env_hash = hashlib.sha256(key_env.encode()).hexdigest()[:12]
+    account_hash = hashlib.sha256(
+        f"{key_env}|{secret_env}".encode()
+    ).hexdigest()[:12]
+    return (
+        _configured_id(raw, stype, env_hash),
+        f"binance:{account_hash}",
+    )
 
 
 def _proxy_url() -> Optional[str]:
@@ -331,12 +509,22 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         log.warning("source entry missing 'name' — skipping: %r", raw)
         return None
 
+    if raw.get("enabled") is False:
+        log.info("source '%s' is disabled by configuration", name)
+        return None
+
     global_min = (settings.default_min_notional_usd if settings else DEFAULT_MIN_NOTIONAL)
-    min_notional = (
-        Decimal(str(raw["min_notional_usd"]))
-        if raw.get("min_notional_usd") is not None
-        else global_min
-    )
+    try:
+        min_notional = (
+            Decimal(str(raw["min_notional_usd"]))
+            if raw.get("min_notional_usd") is not None
+            else global_min
+        )
+        if not min_notional.is_finite() or min_notional < 0:
+            raise ValueError("must be a finite non-negative number")
+    except Exception:
+        log.warning("source '%s' has invalid min_notional_usd", name)
+        return None
 
     # Per-source ticker exclusions (hidden from dashboard + all alerts).
     raw_excludes = raw.get("exclude_symbols") or []
@@ -353,7 +541,14 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         if pool_id is None:
             log.warning("lighter source '%s' missing 'pool_id' — skipping", name)
             return None
-        pool_id = int(pool_id)
+        try:
+            pool_id = int(pool_id)
+            if pool_id < 0:
+                raise ValueError("pool_id must be non-negative")
+            source_id = _configured_id(raw, "lighter", str(pool_id))
+        except (TypeError, ValueError) as exc:
+            log.warning("lighter source '%s' has invalid configuration: %s", name, exc)
+            return None
         # WS-only proxy: Lighter geo-blocks the /stream endpoint from some
         # regions while REST stays open. Set LIGHTER_WS_PROXY in .env (e.g.
         # socks5h://host:1080) to route ONLY the real-time WS through an
@@ -364,24 +559,37 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             source=name, proxy_url=_proxy_url(), ws_proxy_url=ws_proxy,
         )
         return Source(
-            id=f"lighter:{pool_id}",
+            id=source_id,
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
             url=f"https://app.lighter.xyz/public-pools/{pool_id}",
             min_notional=min_notional,
+            exchange="lighter",
+            account_fingerprint=f"lighter:{pool_id}",
             exclude_symbols=exclude_symbols,
         )
 
     if stype == "hyperliquid":
         # Address is loaded from the HL_ADDRESS env var, not from config.yaml,
         # to keep the wallet address out of version control.
-        address = os.getenv("HL_ADDRESS", "").strip()
+        try:
+            address_env, address = _secret_env(raw, "address_env", "HL_ADDRESS")
+        except ValueError as exc:
+            log.warning("hyperliquid source '%s': %s", name, exc)
+            return None
         if not address:
             log.warning(
-                "hyperliquid source '%s': HL_ADDRESS env var is missing or empty — "
+                "hyperliquid source '%s': configured address env var is missing or empty — "
                 "skipping HL source (Lighter continues unaffected)",
                 name,
+            )
+            return None
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            log.warning(
+                "hyperliquid source '%s': %s contains an invalid address",
+                name,
+                address_env,
             )
             return None
         # footer_url is an optional public website to append to HL alerts.
@@ -392,20 +600,33 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
         # logs (e.g. the duplicate-source warning). Use a non-reversible hash so
         # the id is stable and unique without exposing the address anywhere.
         addr_hash = hashlib.sha256(address.lower().encode()).hexdigest()[:12]
+        try:
+            source_id = _configured_id(raw, "hyperliquid", addr_hash)
+        except ValueError as exc:
+            log.warning("hyperliquid source '%s': %s", name, exc)
+            return None
         return Source(
-            id=f"hyperliquid:{addr_hash}",
+            id=source_id,
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
             url=footer_url,   # wallet address is NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
+            exchange="hyperliquid",
+            account_fingerprint=f"hyperliquid:{addr_hash}",
             exclude_symbols=exclude_symbols,
         )
 
     if stype == "binance":
         # API key + secret loaded from env vars — never put credentials in config.yaml.
-        api_key    = os.getenv("BINANCE_API_KEY", "").strip()
-        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        try:
+            key_env, api_key = _secret_env(raw, "api_key_env", "BINANCE_API_KEY")
+            secret_env, api_secret = _secret_env(
+                raw, "api_secret_env", "BINANCE_API_SECRET"
+            )
+        except ValueError as exc:
+            log.warning("binance source '%s': %s", name, exc)
+            return None
         if not api_key or not api_secret:
             log.warning(
                 "binance source '%s': BINANCE_API_KEY and/or BINANCE_API_SECRET "
@@ -413,6 +634,15 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
                 "(other sources continue unaffected)",
                 name,
             )
+            return None
+        try:
+            source_id = _configured_id(
+                raw,
+                "binance",
+                hashlib.sha256(key_env.encode()).hexdigest()[:12],
+            )
+        except ValueError as exc:
+            log.warning("binance source '%s': %s", name, exc)
             return None
         footer_url = str(raw.get("footer_url", "")).strip()
 
@@ -434,12 +664,17 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
             client = BinanceClient(api_key, api_secret, source=name, proxy_url=_proxy_url())
 
         return Source(
-            id=f"binance:{name.lower().replace(' ', '_')}",
+            id=source_id,
             name=name,
             client=client,
             tracker=PositionTracker(source=name),
             url=footer_url,  # API keys/account info are NEVER put here; only an explicit public footer_url
             min_notional=min_notional,
+            exchange="binance",
+            account_fingerprint=(
+                "binance:"
+                + hashlib.sha256(f"{key_env}|{secret_env}".encode()).hexdigest()[:12]
+            ),
             exclude_symbols=exclude_symbols,
         )
 
@@ -447,11 +682,11 @@ def _build_source(raw: dict, settings: "BotSettings | None" = None) -> Optional[
     return None
 
 
-def load_sources(
+def _load_sources_legacy(
     path: str | Path = "config.yaml",
     settings: "BotSettings | None" = None,
 ) -> list[Source]:
-    """Parse config.yaml and build a Source per entry. Raises if no valid source."""
+    """Retired pre-v2 parser retained only for historical compatibility tests."""
     p = Path(path)
     if not p.exists():
         raise RuntimeError(f"config file not found: {p}")
@@ -480,3 +715,120 @@ def load_sources(
         raise RuntimeError(f"no valid sources in {p}")
     log.info("loaded %d source(s): %s", len(sources), ", ".join(s.name for s in sources))
     return sources
+
+
+def load_source_report(
+    path: str | Path = "config.yaml",
+    settings: "BotSettings | None" = None,
+) -> SourceLoadReport:
+    """Load active sources while retaining redacted disabled/error entries.
+
+    A missing file, empty list, or entirely invalid configuration is reported
+    instead of raised so the dashboard can stay online in configuration-only
+    mode.
+    """
+    p = Path(path)
+    if not p.exists():
+        return SourceLoadReport(
+            issues=[
+                SourceConfigIssue("", "", "", "config_error", "config file not found")
+            ]
+        )
+    with open(p, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    raw_sources = cfg.get("sources")
+    if raw_sources is None:
+        raw_sources = []
+    if not isinstance(raw_sources, list):
+        return SourceLoadReport(
+            issues=[
+                SourceConfigIssue("", "", "", "config_error", "sources must be a list")
+            ]
+        )
+
+    report = SourceLoadReport()
+    seen_ids: set[str] = set()
+    seen_accounts: set[str] = set()
+    for index, raw in enumerate(raw_sources):
+        if not isinstance(raw, dict):
+            report.issues.append(
+                SourceConfigIssue(
+                    f"entry-{index}", "", "", "config_error", "source must be a mapping"
+                )
+            )
+            continue
+        stype = str(raw.get("type", "")).lower().strip()
+        name = str(raw.get("name", "")).strip()
+        display_id = str(raw.get("id", "")).strip().lower() or f"entry-{index}"
+        if raw.get("enabled") is False:
+            report.issues.append(
+                SourceConfigIssue(
+                    display_id, name, stype, "disabled", "disabled by configuration"
+                )
+            )
+            continue
+        issue_detail = _source_issue_detail(raw)
+        if issue_detail:
+            issue_status = (
+                "disabled"
+                if issue_detail.startswith("missing environment variable")
+                else "config_error"
+            )
+            report.issues.append(
+                SourceConfigIssue(
+                    display_id, name, stype, issue_status, issue_detail
+                )
+            )
+            continue
+        preview_id, preview_account = _preview_source_identity(raw)
+        if preview_id in seen_ids:
+            report.issues.append(
+                SourceConfigIssue(
+                    preview_id, name, stype, "config_error", "duplicate source id"
+                )
+            )
+            continue
+        if preview_account in seen_accounts:
+            report.issues.append(
+                SourceConfigIssue(
+                    preview_id,
+                    name,
+                    stype,
+                    "config_error",
+                    "duplicate account/pool configuration",
+                )
+            )
+            continue
+        src = _build_source(raw, settings=settings)
+        if src is None:
+            report.issues.append(
+                SourceConfigIssue(
+                    display_id,
+                    name,
+                    stype,
+                    "config_error",
+                    "missing or invalid required configuration",
+                )
+            )
+            continue
+        seen_ids.add(src.id)
+        if src.account_fingerprint:
+            seen_accounts.add(src.account_fingerprint)
+        report.sources.append(src)
+
+    log.info(
+        "loaded %d active source(s), %d disabled/invalid",
+        len(report.sources),
+        len(report.issues),
+    )
+    return report
+
+
+# Deliberately redefine the compatibility entry point after the legacy parser:
+# callers still receive list[Source], but zero usable sources no longer aborts.
+def load_sources(
+    path: str | Path = "config.yaml",
+    settings: "BotSettings | None" = None,
+) -> list[Source]:
+    return load_source_report(path, settings=settings).sources

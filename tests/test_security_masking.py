@@ -122,4 +122,5 @@ class TestSourceFilesDoNotLogRawAddress:
         text = src.read_text(encoding="utf-8")
         # The old leaky form must be gone.
         assert 'id=f"hyperliquid:{address.lower()}"' not in text
-        assert 'id=f"hyperliquid:{addr_hash}"' in text
+        assert 'addr_hash = hashlib.sha256(address.lower().encode())' in text
+        assert '_configured_id(raw, "hyperliquid", addr_hash)' in text

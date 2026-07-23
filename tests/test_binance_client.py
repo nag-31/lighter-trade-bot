@@ -133,10 +133,12 @@ class TestParseWsMessage:
         c = make_client()
         assert c._parse_ws_message(_ws_msg(x="NEW")) is None
 
-    def test_ps_not_both_returns_none(self):
+    def test_hedge_position_side_is_supported(self):
         c = make_client()
-        # Hedge mode fill
-        assert c._parse_ws_message(_ws_msg(ps="LONG")) is None
+        trade = c._parse_ws_message(_ws_msg(ps="LONG"))
+        assert trade is not None
+        assert trade.position_side == "LONG"
+        assert trade.exchange == "binance"
 
     def test_zero_price_returns_none(self):
         c = make_client()

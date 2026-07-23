@@ -105,6 +105,10 @@ class HealthRegistry:
         """Mark a component as intentionally off, e.g. not configured (status="disabled")."""
         self.set(component, "disabled", detail=detail)
 
+    def remove(self, component: str) -> None:
+        """Remove a component that no longer exists after config reload."""
+        self._components.pop(component, None)
+
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
@@ -133,6 +137,8 @@ class HealthRegistry:
             "started_at": self._started_at,
             "now": datetime.now(timezone.utc).isoformat(),
             "ok": ok,
+            "live": True,
+            "ready": ok,
             "components": sorted(
                 list(self._components.values()),
                 key=lambda r: r["component"],

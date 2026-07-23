@@ -128,6 +128,11 @@ def filter_trades(
 _LEGACY_DEDUP_WINDOW_SEC = 3600.0
 
 
+def _source_key(row: dict) -> str:
+    """Stable account identity with a legacy display-name fallback."""
+    return str(row.get("source_id") or row.get("source") or "")
+
+
 def _is_legacy_kind(r: dict) -> bool:
     """A legacy migration row: realization_kind is NULL/blank (not PARTIAL/FULL)."""
     return not (r.get("realization_kind") or "").strip()
@@ -161,7 +166,7 @@ def _drop_legacy_duplicate_rows(trades: list[dict]) -> list[dict]:
     fill_ts: dict[tuple[str, str], list[datetime]] = {}
     for r in trades:
         if not _is_legacy_kind(r):
-            key = (r.get("source") or "", r.get("market_symbol") or "")
+            key = (_source_key(r), r.get("market_symbol") or "")
             dt = _parse_ts(r.get("ts"))
             if dt is not None:
                 fill_ts.setdefault(key, []).append(dt)
@@ -169,7 +174,7 @@ def _drop_legacy_duplicate_rows(trades: list[dict]) -> list[dict]:
     out: list[dict] = []
     for r in trades:
         if _is_legacy_kind(r) and not _has_fill_ids(r):
-            key = (r.get("source") or "", r.get("market_symbol") or "")
+            key = (_source_key(r), r.get("market_symbol") or "")
             dt = _parse_ts(r.get("ts"))
             near = fill_ts.get(key)
             if dt is not None and near and any(
@@ -209,13 +214,17 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
     trades = _drop_legacy_duplicate_rows(trades)
 
     # Group by (source, market_symbol), preserving deterministic ordering.
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple[str, str, str], list[dict]] = {}
     for t in trades:
-        key = (t.get("source") or "", t.get("market_symbol") or "")
+        key = (
+            _source_key(t),
+            t.get("market_symbol") or "",
+            t.get("position_side") or "BOTH",
+        )
         groups.setdefault(key, []).append(t)
 
     aggregated: list[dict] = []
-    for (source, symbol), rows in groups.items():
+    for (_source_id, symbol, _position_side), rows in groups.items():
         # Tiebreaker for fills sharing the SAME timestamp (burst close): the
         # close row goes LAST — the position physically flattens at the end of
         # the burst. Without this, an arbitrarily-ordered same-ms burst split
@@ -277,7 +286,10 @@ def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
     return {
         "ts": last.get("ts"),
         "source": last.get("source"),
+        "source_id": last.get("source_id"),
+        "exchange": last.get("exchange"),
         "market_symbol": last.get("market_symbol"),
+        "position_side": last.get("position_side") or "BOTH",
         "side": last.get("side"),
         "entry": entry,
         "exit": exit_,
@@ -428,16 +440,25 @@ def compute_stats(trades: list[dict]) -> dict:
     # By source
     src_map: dict[str, dict] = {}
     for rec, v in pnl_records:
-        src = rec.get("source") or "?"
-        if src not in src_map:
-            src_map[src] = {"n": 0, "pnl": 0.0}
-        src_map[src]["n"] += 1
-        src_map[src]["pnl"] += v
+        source_id = _source_key(rec) or "?"
+        if source_id not in src_map:
+            src_map[source_id] = {
+                "source": rec.get("source") or source_id,
+                "n": 0,
+                "pnl": 0.0,
+            }
+        src_map[source_id]["n"] += 1
+        src_map[source_id]["pnl"] += v
 
     by_source = sorted(
         [
-            {"source": src, "n": d["n"], "pnl": round(d["pnl"], 8)}
-            for src, d in src_map.items()
+            {
+                "source": d["source"],
+                "source_id": source_id,
+                "n": d["n"],
+                "pnl": round(d["pnl"], 8),
+            }
+            for source_id, d in src_map.items()
         ],
         key=lambda x: x["pnl"],
         reverse=True,

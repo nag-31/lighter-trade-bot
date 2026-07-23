@@ -338,6 +338,104 @@ python scripts/reconcile_hl_pnl.py --days 10 --apply
 
 ---
 
+## Multi-account trade tracker revamp (implemented locally 2026-07-23)
+
+Status: implementation is complete in the local working tree and all 785 tests
+pass. It has **not** been committed, pushed, deployed, migrated on the live DB,
+or restarted on the GCP VM yet.
+
+### Supported source model
+
+- Any number of Hyperliquid wallets, each using a stable `id` and its own
+  `address_env`.
+- Any number of Lighter pools, each using a stable `id` and public `pool_id`.
+- Any number of Binance accounts, each using a stable `id` and separate
+  `api_key_env` / `api_secret_env`.
+- Any protocol may be absent. The dashboard starts with zero active sources.
+- Missing credentials disable only the affected source and appear in health.
+- Duplicate source IDs and duplicate account/pool configurations are rejected.
+
+Example:
+
+```yaml
+sources:
+  - type: hyperliquid
+    id: hl-main
+    name: "HL"
+    address_env: HL_ADDRESS
+
+  - type: hyperliquid
+    id: hl-second
+    name: "HL 2"
+    address_env: HL_ADDRESS_2
+
+  - type: lighter
+    id: lighter-main
+    name: "Lighter"
+    pool_id: 281474976684763
+
+  - type: binance
+    id: binance-main
+    name: "Binance"
+    api_key_env: BINANCE_API_KEY
+    api_secret_env: BINANCE_API_SECRET
+```
+
+Put the corresponding values in `.env`; never put wallet addresses or Binance
+credentials in `config.yaml`.
+
+### Safety and recovery changes
+
+- Position fetches now distinguish authoritative empty snapshots from stale or
+  failed requests. A failed API request cannot create a false position close.
+- Last-good positions remain visible with a `STALE` badge during an outage.
+- Each source's WebSocket, REST recovery, and position reconciler are supervised
+  independently with bounded restart backoff.
+- Source, market, position-side, and native trade IDs form the v2 event identity.
+- SQLite schema v2 adds source-scoped IDs, persisted cursors, unique event IDs,
+  and a persistent Telegram outbox.
+- Binance supports one-way and hedge mode, uses native trade IDs, discovers
+  fully closed downtime symbols through realized-income history, paginates
+  user trades, loads open orders, syncs clock drift, and pauses auth/rate-limit
+  retry storms.
+- Hyperliquid partial DEX failures and Lighter account failures are
+  non-authoritative, so existing positions are retained instead of closed.
+- Dashboard filters support exchange and account selection.
+- Reconciliation requires `--source-id` when multiple HL wallets exist.
+
+### Validation, migration, and reload
+
+Redacted validation:
+
+```bash
+python -B scripts/validate_tracker_config.py --config config.yaml
+```
+
+Check DB migration status without writing:
+
+```bash
+python -B scripts/migrate_tracker_db_v2.py --db data/events.db
+```
+
+Apply migration (backs up the DB first):
+
+```bash
+python -B scripts/migrate_tracker_db_v2.py --db data/events.db --apply
+```
+
+After editing `.env` and `config.yaml` on Linux, validate first, then atomically
+reload source configuration without restarting the service:
+
+```bash
+sudo systemctl kill -s HUP lighterbot
+```
+
+An invalid candidate config is rejected and the currently running source
+registry stays active. The bot re-reads `.env` with the candidate YAML before
+applying a SIGHUP reload.
+
+---
+
 ## Files NOT to touch
 
 - `data/events.db` — live database; never edit directly without backup

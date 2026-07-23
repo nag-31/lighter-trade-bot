@@ -34,6 +34,7 @@ from typing import AsyncIterator, Optional
 from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
+from .result import FetchResult
 from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
@@ -262,6 +263,9 @@ class HyperliquidClient:
             *(self._fetch_clearinghouse(dex) for dex in dexes),
             return_exceptions=True,
         )
+        self._positions_last_authoritative = all(
+            isinstance(state, dict) for state in states
+        )
 
         out: dict[int, Position] = {}
         for dex, data in zip(dexes, states):
@@ -301,6 +305,15 @@ class HyperliquidClient:
 
         log.info("[%s] %d open HL positions loaded across DEXs %s", self.source, len(out), list(dexes))
         return out
+
+    async def current_positions_result(self) -> FetchResult[dict[int, Position]]:
+        positions = await self.current_positions()
+        if getattr(self, "_positions_last_authoritative", False):
+            return FetchResult.success(positions)
+        return FetchResult.stale(
+            positions,
+            error="one or more Hyperliquid DEX position snapshots failed",
+        )
 
     # ------------------------------------------------------------------ #
     # Protocol: fetch_leverage                                             #

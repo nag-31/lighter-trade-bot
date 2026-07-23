@@ -18,7 +18,7 @@ import os
 import re
 import signal
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -31,13 +31,18 @@ from pathlib import Path
 
 from .db import (
     backfill_closed_trades_from_events,
+    enqueue_notification,
     init_db,
     load_closed_trades,
     load_recent_events,
-    load_recorded_fill_ids,
+    load_recorded_event_uids,
+    load_source_cursor,
     load_tg_alerts,
+    mark_notification,
+    notification_status,
     save_closed_trade,
     save_event,
+    save_source_cursor,
     save_tg_alert,
 )
 from .display_transform import PrivacyParams, disp_notional, disp_price, disp_size, disp_time, disp_view, footnote, price_factor
@@ -45,9 +50,11 @@ from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .health import HealthRegistry
 from .pnl_card import calculate_pnl, generate_pnl_card, peek_result, record_result
-from .sources import BotSettings, Source, load_settings, load_sources
+from .source_runtime import SourceRuntime
+from .sources import BotSettings, Source, load_settings, load_source_report
 from .stats import aggregate_round_trips, compute_stats, filter_trades, format_stats_summary
 from .stats_card import render_stats_card
+from .supervisor import supervise
 from .types import Event, EventKind, OpenOrder, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -95,11 +102,9 @@ def _to_jsonable(obj: Any) -> Any:
     return obj
 
 
-def _trade_dedup_key(trade: Trade) -> tuple[str, int]:
-    """Identify a fill without conflating independent Hyperliquid DEX tids."""
-    symbol = str(trade.market_symbol).upper()
-    dex = symbol.split(":", 1)[0] if ":" in symbol else ""
-    return dex, trade.trade_id
+def _trade_dedup_key(trade: Trade, source_id: str = "") -> str:
+    """Source/market/position/native fill identity used across WS and REST."""
+    return trade.event_uid(source_id)
 
 
 INDEX_HTML = """<!doctype html>
@@ -208,6 +213,8 @@ INDEX_HTML = """<!doctype html>
   .oo-flash { animation: ooFlash 1.2s ease-out; }
   @keyframes ooPulse { 0%,100% { box-shadow: none; } 40% { box-shadow: 0 0 0 3px rgba(34,197,94,0.35); } }
   .oo-pulse { animation: ooPulse 0.6s ease-out; }
+  .filters { display:flex; gap:8px; margin:0 0 16px; }
+  .filters select { background:#13161b; color:#d8dbe0; border:1px solid #374151; border-radius:5px; padding:6px 8px; font:inherit; font-size:11px; }
 </style>
 </head>
 <body>
@@ -217,6 +224,10 @@ INDEX_HTML = """<!doctype html>
   <div class="hb-issues" id="hb-issues"></div>
 </div>
 <div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="sources">no sources</span> &middot; <span id="last">no events yet</span></div>
+<div class="filters">
+  <select id="exchange-filter"><option value="">All exchanges</option></select>
+  <select id="source-filter"><option value="">All accounts</option></select>
+</div>
 <div class="grid">
   <div class="col-left">
     <section>
@@ -317,6 +328,14 @@ const setStatus = (ok, label) => {
     `<span class="dot ${ok ? 'on' : 'off'}"></span>${label}`;
 };
 const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+let _latestPayload = null;
+const _exchangeFilter = document.getElementById("exchange-filter");
+const _sourceFilter = document.getElementById("source-filter");
+const filterRows = rows => (rows || []).filter(row => {
+  const identity = row && row.trade ? row.trade : row;
+  return (!_exchangeFilter.value || identity.exchange === _exchangeFilter.value) &&
+    (!_sourceFilter.value || identity.source_id === _sourceFilter.value);
+});
 const fmtPnl = v => {
   if (v == null || v === "") return "—";
   const n = Number(v); if (!isFinite(n)) return "—";
@@ -324,16 +343,19 @@ const fmtPnl = v => {
   return `<span style="color:${n >= 0 ? '#22c55e' : '#ef4444'}">${sign}$${Math.abs(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}</span>`;
 };
 function renderPositions(positions) {
+  positions = filterRows(positions);
   const tb = document.getElementById("positions");
   if (!positions.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">no open positions</td></tr>'; return; }
   tb.innerHTML = positions.map(p => {
     const entry = p.avg_entry_price;
     const size  = p.size;
     const fn    = p.footnote ? `<br><span style="font-size:10px;color:#6b7280">${esc(p.footnote)}</span>` : "";
+    const stale = p.stale ? ' <span class="badge" style="color:#f59e0b">STALE</span>' : "";
+    const leg = p.position_side && p.position_side !== "BOTH" ? ` ${esc(p.position_side)}` : "";
     return `<tr>
-      <td>${esc(p.source)}</td>
+      <td>${esc(p.source)}${stale}</td>
       <td>${esc(p.market_symbol)}</td>
-      <td class="${p.side}">${p.side.toUpperCase()}</td>
+      <td class="${p.side}">${p.side.toUpperCase()}${leg}</td>
       <td class="num">${fmtPrice(entry)}${fn}</td>
       <td class="num">${fmtUsd(Number(size) * Number(entry))}</td>
       <td class="num">${fmtPnl(p.unrealized_pnl)}</td>
@@ -382,9 +404,36 @@ function renderSources(sources) {
   document.getElementById("sources").textContent =
     s.length ? s.length + " source" + (s.length > 1 ? "s" : "") + ": " + s.join(", ") : "no sources";
 }
+function renderSourceFilters(details) {
+  const rows = details || [];
+  const currentSource = _sourceFilter.value;
+  const currentExchange = _exchangeFilter.value;
+  const exchanges = [...new Set(rows.map(x => x.exchange).filter(Boolean))].sort();
+  _exchangeFilter.innerHTML = '<option value="">All exchanges</option>' +
+    exchanges.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
+  _sourceFilter.innerHTML = '<option value="">All accounts</option>' +
+    rows.map(x => `<option value="${esc(x.id)}">${esc(x.name)} (${esc(x.exchange)})</option>`).join("");
+  if (exchanges.includes(currentExchange)) _exchangeFilter.value = currentExchange;
+  if (rows.some(x => x.id === currentSource)) _sourceFilter.value = currentSource;
+}
+function renderPayload(data) {
+  _latestPayload = data;
+  renderSources(data.sources);
+  renderSourceFilters(data.source_details);
+  renderPositions(data.positions);
+  renderOpenOrders(data.open_orders || []);
+  renderEvents(filterRows(data.recent_events));
+  renderAlerts(data.tg_alerts);
+  renderClosedTrades(data.closed_trades);
+  if (data.stats) renderStats(data.stats);
+  if (data.health) renderHealth(data.health);
+}
+[_exchangeFilter, _sourceFilter].forEach(el => el.addEventListener("change", () => {
+  if (_latestPayload) renderPayload(_latestPayload);
+}));
 function renderClosedTrades(trades) {
   const grid = document.getElementById("history-grid");
-  const arr = trades || [];
+  const arr = filterRows(trades);
   if (!arr.length) {
     grid.innerHTML = '<span style="color:#4b5563;font-style:italic;font-size:12px">no closed trades yet</span>';
     return;
@@ -718,7 +767,7 @@ _ooToggle.addEventListener("change", function() {
 function renderOpenOrders(orders) {
   const tb = document.getElementById("open-orders");
   const fnEl = document.getElementById("oo-footnote");
-  const arr = orders || [];
+  const arr = filterRows(orders);
   if (!arr.length) {
     tb.innerHTML = '<tr><td colspan="7" class="empty">no resting orders</td></tr>';
     fnEl.textContent = "";
@@ -793,26 +842,12 @@ function connect() {
   ws.onmessage = (msg) => {
     const data = JSON.parse(msg.data);
     if (data.type === "snapshot") {
-      renderSources(data.sources);
-      renderPositions(data.positions);
-      renderOpenOrders(data.open_orders || []);
-      renderEvents(data.recent_events);
-      renderAlerts(data.tg_alerts);
-      renderClosedTrades(data.closed_trades);
-      if (data.stats) renderStats(data.stats);
-      if (data.health) renderHealth(data.health);
+      renderPayload(data);
       if (data.recent_events.length) {
         document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
       }
     } else if (data.type === "event") {
-      renderSources(data.sources);
-      renderPositions(data.positions);
-      renderOpenOrders(data.open_orders || []);
-      renderEvents(data.recent_events);
-      renderAlerts(data.tg_alerts);
-      renderClosedTrades(data.closed_trades);
-      if (data.stats) renderStats(data.stats);
-      if (data.health) renderHealth(data.health);
+      renderPayload(data);
       document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
     }
   };
@@ -887,8 +922,20 @@ async def _run() -> None:
     # ── Health / status registry ──────────────────────────────────────────────
     health = HealthRegistry(started_at_iso=datetime.now(timezone.utc).isoformat())
 
-    sources: list[Source] = load_sources(settings=cfg)
+    source_report = load_source_report(settings=cfg)
+    sources: list[Source] = source_report.sources
     by_id: dict[str, Source] = {s.id: s for s in sources}
+    runtimes: dict[str, SourceRuntime] = {
+        s.id: SourceRuntime(s) for s in sources
+    }
+    for issue in source_report.issues:
+        component = f"source:{issue.source_id or issue.name or 'configuration'}"
+        if issue.status == "disabled":
+            health.mark_disabled(component, issue.detail)
+        else:
+            health.mark_down(component, issue.detail)
+    if not sources:
+        health.mark_disabled("sources", "no active sources configured")
 
     # ── Privacy transform params (built once; ValueError on bad mag fails loudly) ──
     privacy = PrivacyParams(
@@ -927,7 +974,7 @@ async def _run() -> None:
 
     # Boot dedup set: union of all fill ids ever recorded — prevents re-recording
     # the same fill after a restart (e.g. reduce batch flushed before crash).
-    _recorded_realizations: set[int] = set(await load_recorded_fill_ids(DB_PATH))
+    _recorded_realizations: set[str] = set(await load_recorded_event_uids(DB_PATH))
 
     # ── Re-derive privacy display fields for DB-loaded closed trades ──────────
     # Display fields (entry_disp, …) are in-memory only; after a restart the
@@ -939,6 +986,25 @@ async def _run() -> None:
     # touched (no disp keys → JS keeps real values, which are intentionally
     # public for Lighter).
     _hl_name_to_id = {s.name: s.id for s in sources if s.is_hyperliquid}
+    _sources_by_name: dict[str, list[Source]] = {}
+    for _source in sources:
+        _sources_by_name.setdefault(_source.name, []).append(_source)
+    for _row in closed_trades:
+        if not _row.get("source_id"):
+            _matches = _sources_by_name.get(str(_row.get("source") or ""), [])
+            if len(_matches) == 1:
+                _row["source_id"] = _matches[0].id
+                _row["exchange"] = _matches[0].exchange
+    for _event_row in recent_events:
+        if not isinstance(_event_row, dict):
+            continue
+        _trade_row = _event_row.get("trade")
+        if not isinstance(_trade_row, dict) or _trade_row.get("source_id"):
+            continue
+        _matches = _sources_by_name.get(str(_trade_row.get("source") or ""), [])
+        if len(_matches) == 1:
+            _trade_row["source_id"] = _matches[0].id
+            _trade_row["exchange"] = _matches[0].exchange
 
     def _derive_hl_disp_fields(row: dict) -> None:
         """Populate HL privacy ``*_disp`` fields on a closed-trade row in place.
@@ -1080,6 +1146,12 @@ async def _run() -> None:
     _active_sources: list[Source] = []
     for s in sources:
         try:
+            persisted_cursor = await load_source_cursor(DB_PATH, s.id)
+            if persisted_cursor is not None:
+                try:
+                    s.last_trade_id = int(persisted_cursor)
+                except ValueError:
+                    log.warning("[%s] ignoring invalid persisted trade cursor", s.name)
             # Binance: quick ping through the proxy pool before full bootstrap.
             # If the pool has no working proxy we skip the source immediately
             # rather than letting every subsequent REST call time out.
@@ -1117,8 +1189,7 @@ async def _run() -> None:
                         continue
 
             log.info("[%s] bootstrapping markets…", s.name)
-            await s.client.bootstrap_markets()
-            init_pos = await s.client.current_positions()
+            init_pos = await runtimes[s.id].bootstrap()
             init_pos = {mid: p for mid, p in init_pos.items() if not s.is_excluded(p.market_symbol)}
             s.tracker.seed(init_pos)
             _dash_positions[s.id] = init_pos
@@ -1133,14 +1204,24 @@ async def _run() -> None:
                 for mid, pos in init_pos.items():
                     if mid not in _privacy_anchor[s.id]:
                         _privacy_anchor[s.id][mid] = pos.avg_entry_price
-            latest = await s.client.fetch_trades_since(since_trade_id=None, limit=1)
-            if latest:
-                s.last_trade_id = latest[-1].trade_id
-                log.info("[%s] anchored last_trade_id=%d", s.name, s.last_trade_id)
+            if s.last_trade_id is None:
+                latest = await s.client.fetch_trades_since(
+                    since_trade_id=None, limit=1
+                )
+                if latest:
+                    s.last_trade_id = s.cursor_for_trade(latest[-1])
+                    await save_source_cursor(
+                        DB_PATH,
+                        s.id,
+                        "trades",
+                        str(s.last_trade_id),
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    log.info("[%s] anchored trade cursor=%d", s.name, s.last_trade_id)
             # Tell HL client the anchor so WS snapshot is filtered correctly
             if hasattr(s.client, "set_anchor"):
                 s.client.set_anchor(s.last_trade_id)
-            health.mark_up(f"source:{s.name}")
+            health.mark_up(f"source:{s.id}", detail=s.name)
             _active_sources.append(s)
 
         except Exception as _bootstrap_exc:
@@ -1151,12 +1232,31 @@ async def _run() -> None:
                 _bootstrap_exc,
                 exc_info=True,
             )
-            health.mark_down(f"source:{s.name}", str(_bootstrap_exc))
+            health.mark_down(f"source:{s.id}", str(_bootstrap_exc), detail=s.name)
+            # Keep the configured source in the runtime registry. Its supervised
+            # producers/reconciler can recover after transient bootstrap errors.
+            _dash_positions.setdefault(s.id, {})
+            _active_sources.append(s)
 
     # Replace the sources list with only those that bootstrapped successfully.
     # HL/Lighter sources that already appended to _active_sources are unaffected.
     sources = _active_sources
     by_id   = {s.id: s for s in sources}
+
+    async def _ensure_source_ready(src: Source) -> None:
+        """Retry transient bootstrap failures inside supervised source tasks."""
+        if runtimes[src.id].bootstrapped:
+            return
+        init_pos = await runtimes[src.id].bootstrap()
+        init_pos = {
+            mid: p
+            for mid, p in init_pos.items()
+            if not src.is_excluded(p.market_symbol)
+        }
+        src.tracker.seed(init_pos)
+        _dash_positions[src.id] = init_pos
+        health.mark_up(f"source:{src.id}", detail=src.name)
+        await hub.broadcast(snapshot_payload("snapshot"))
 
     def _anchor(src: "Source", market_id: int, fallback_entry: Decimal) -> Decimal:
         """Return the frozen open-time anchor entry for (src, market_id).
@@ -1217,7 +1317,7 @@ async def _run() -> None:
         except Exception:
             log.exception("failed to persist tg alert")
 
-    async def tg_send(text: str) -> None:
+    async def tg_send(text: str, event_uid: str = "") -> None:
         h = hashlib.md5(text.encode()).hexdigest()
         now = time.monotonic()
         dedup_window = cfg.tg_dedup_window_seconds
@@ -1229,8 +1329,18 @@ async def _run() -> None:
             log.warning("tg_send: suppressed duplicate alert (%.0fs since last send, window=%ds)",
                         now - _tg_sent[h], dedup_window)
             return
+        outbox_uid = event_uid or (
+            "tg:text:"
+            + hashlib.sha256(f"{tg_channel}|{text}".encode()).hexdigest()
+        )
+        if await notification_status(DB_PATH, outbox_uid) == "sent":
+            log.info("tg_send: persistent outbox suppressed already-sent alert")
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await enqueue_notification(
+            DB_PATH, outbox_uid, f"telegram:{tg_channel}", text, now_iso
+        )
         _tg_sent[h] = now
-        await _record_tg_alert("text", text)
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -1239,22 +1349,62 @@ async def _run() -> None:
             if not r.json().get("ok"):
                 log.warning("tg sendMessage failed: %s", r.text[:200])
                 health.mark_down("telegram", error=f"sendMessage API error: {r.text[:120]}")
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "failed",
+                    datetime.now(timezone.utc).isoformat(),
+                    "Telegram API rejected sendMessage",
+                )
             else:
                 health.mark_up("telegram")
+                await _record_tg_alert("text", text)
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "sent",
+                    datetime.now(timezone.utc).isoformat(),
+                )
         except Exception as _tg_exc:
             log.exception("tg_send failed")
             health.mark_down("telegram", error=str(_tg_exc))
+            await mark_notification(
+                DB_PATH,
+                outbox_uid,
+                "failed",
+                datetime.now(timezone.utc).isoformat(),
+                f"{type(_tg_exc).__name__}: {_tg_exc}",
+            )
         # Push the new alert to dashboard clients live (alerts can fire from the
         # aggregate flush / reconciler at times with no other broadcast).
         await hub.broadcast(snapshot_payload("snapshot"))
 
-    async def tg_send_photo(image_bytes: bytes, caption: str = "", log_text: str = "") -> None:
+    async def tg_send_photo(
+        image_bytes: bytes,
+        caption: str = "",
+        log_text: str = "",
+        event_uid: str = "",
+    ) -> None:
         """Send a PNG image to Telegram. Falls back to plain text on error.
 
         log_text is the human-readable line recorded in the dashboard alert log
         (the image itself can't be shown there); falls back to the caption.
         """
-        await _record_tg_alert("card", log_text or caption or "PnL card")
+        outbox_uid = event_uid or (
+            "tg:photo:"
+            + hashlib.sha256(
+                f"{tg_channel}|{caption}|".encode() + image_bytes
+            ).hexdigest()
+        )
+        if await notification_status(DB_PATH, outbox_uid) == "sent":
+            return
+        await enqueue_notification(
+            DB_PATH,
+            outbox_uid,
+            f"telegram:{tg_channel}",
+            log_text or caption or "PnL card",
+            datetime.now(timezone.utc).isoformat(),
+        )
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendPhoto",
@@ -1263,12 +1413,34 @@ async def _run() -> None:
             )
             if not r.json().get("ok"):
                 log.warning("tg sendPhoto failed: %s", r.text[:200])
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "failed",
+                    datetime.now(timezone.utc).isoformat(),
+                    "Telegram API rejected sendPhoto",
+                )
                 if caption:
-                    await tg_send(caption)
-        except Exception:
+                    await tg_send(caption, event_uid=f"{outbox_uid}:fallback")
+            else:
+                await _record_tg_alert("card", log_text or caption or "PnL card")
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "sent",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception as exc:
             log.exception("tg_send_photo failed")
+            await mark_notification(
+                DB_PATH,
+                outbox_uid,
+                "failed",
+                datetime.now(timezone.utc).isoformat(),
+                f"{type(exc).__name__}: {exc}",
+            )
             if caption:
-                await tg_send(caption)
+                await tg_send(caption, event_uid=f"{outbox_uid}:fallback")
         await hub.broadcast(snapshot_payload("snapshot"))
 
     async def tg_dm_owner(text: str) -> None:
@@ -1307,7 +1479,13 @@ async def _run() -> None:
             return
         msgs = buf["msgs"]
         if len(msgs) == 1:
-            await tg_send(msgs[0])
+            await tg_send(
+                msgs[0],
+                event_uid=(
+                    f"tg:digest:{source_id}:"
+                    + hashlib.sha256(msgs[0].encode()).hexdigest()
+                ),
+            )
             return
         src = by_id.get(source_id)
         header = f"📦 {src.name if src else source_id} — {len(msgs)} updates"
@@ -1363,7 +1541,16 @@ async def _run() -> None:
             return (fill_price - avg_entry) * reduced_size
         return (avg_entry - fill_price) * reduced_size
 
-    def _roundtrip_partial_pnl(source_name: str, market_symbol: str) -> Decimal:
+    def _row_belongs_to_source(row: dict, source_id: str, source_name: str) -> bool:
+        return (
+            row.get("source_id") == source_id
+            if row.get("source_id")
+            else row.get("source") == source_name
+        )
+
+    def _roundtrip_partial_pnl(
+        source_id: str, source_name: str, market_symbol: str
+    ) -> Decimal:
         """Sum the realized PnL of the CURRENT (not-yet-closed) round-trip's
         PARTIAL rows for this (source, coin).
 
@@ -1374,7 +1561,10 @@ async def _run() -> None:
         """
         total = Decimal(0)
         for row in closed_trades:
-            if row.get("source") != source_name or row.get("market_symbol") != market_symbol:
+            if (
+                not _row_belongs_to_source(row, source_id, source_name)
+                or row.get("market_symbol") != market_symbol
+            ):
                 continue
             # ANY non-PARTIAL row (FULL, legacy NULL, unknown) closes a round-trip
             # — same rule as stats.aggregate_round_trips. Breaking only on FULL
@@ -1390,13 +1580,18 @@ async def _run() -> None:
                     pass
         return total
 
-    def _roundtrip_start_ts(source_name: str, market_symbol: str) -> "str | None":
+    def _roundtrip_start_ts(
+        source_id: str, source_name: str, market_symbol: str
+    ) -> "str | None":
         """ISO ts of the OLDEST recorded PARTIAL in the current (not-yet-closed)
         round-trip for this (source, coin), or None if it has no partials.
         Same walk/boundary rule as _roundtrip_partial_pnl."""
         oldest: "str | None" = None
         for row in closed_trades:
-            if row.get("source") != source_name or row.get("market_symbol") != market_symbol:
+            if (
+                not _row_belongs_to_source(row, source_id, source_name)
+                or row.get("market_symbol") != market_symbol
+            ):
                 continue
             if (row.get("realization_kind") or "").upper() != "PARTIAL":
                 break
@@ -1435,18 +1630,17 @@ async def _run() -> None:
         double counting.
         """
         # ── Dedup guard ────────────────────────────────────────────────────────
-        if fill_ids:
-            if all(fid in _recorded_realizations for fid in fill_ids):
+        realization_keys = [
+            f"{src.id}|{trade.market_id}|{trade.position_side}|{fid}"
+            for fid in (fill_ids or [trade.trade_id])
+        ]
+        if realization_keys:
+            if all(key in _recorded_realizations for key in realization_keys):
                 log.info(
                     "[%s] record_realization: all fill_ids already recorded, skipping %s %s",
                     src.name, kind, trade.market_symbol,
                 )
                 return
-            # Register all ids (and the trade's own id) so future calls are no-ops
-            for fid in fill_ids:
-                _recorded_realizations.add(fid)
-        if trade.trade_id is not None:
-            _recorded_realizations.add(trade.trade_id)
 
         # ── Build a synthetic Event-like for generate_pnl_card ────────────────
         # We need an Event whose position_before is the pre-reduce/pre-close
@@ -1560,8 +1754,15 @@ async def _run() -> None:
             "trade_id": trade.trade_id,
             "fill_ids": json.dumps(fill_ids),
             "realization_kind": kind,
+            "source_id": src.id,
+            "exchange": src.exchange,
+            "market_key": f"{trade.market_id}:{trade.position_side}",
+            "position_side": trade.position_side,
+            "native_trade_id": trade.native_trade_id or str(trade.trade_id),
+            "event_uid": realization_keys[-1],
         }
         await save_closed_trade(DB_PATH, record)
+        _recorded_realizations.update(realization_keys)
 
         # ── Add in-memory display fields (HL only, never persisted) ───────────
         if src.is_hyperliquid:
@@ -1894,6 +2095,8 @@ async def _run() -> None:
         for s in sources:
             for o in _open_orders.get(s.id, []):
                 row = dict(o)  # shallow copy so we don't mutate the cache
+                row["source_id"] = s.id
+                row["exchange"] = s.exchange
                 out.append(_transform_open_order_row(s, row))
         return out
 
@@ -1901,6 +2104,14 @@ async def _run() -> None:
         payload = {
             "type": type_,
             "sources": [s.name for s in sources],
+            "source_details": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "exchange": s.exchange,
+                }
+                for s in sources
+            ],
             "positions": all_positions(),
             "open_orders": all_open_orders(),
             "recent_events": recent_events[:cfg.max_recent_events],
@@ -1932,10 +2143,34 @@ async def _run() -> None:
         position → fill arrives → tracker classifies as SIZE_CHANGE (not OPEN)
         → alert is cancelled on close → user never sees an open notification.
         """
+        await _ensure_source_ready(src)
         while True:
             await asyncio.sleep(cfg.reconciler_interval_seconds)
             try:
-                actual = await src.client.current_positions()
+                position_result = await runtimes[src.id].fetch_positions()
+                if not position_result.authoritative:
+                    _dash_positions[src.id] = position_result.value
+                    runtime = runtimes[src.id]
+                    stale_from = runtime.last_success_at or runtime.created_at
+                    stale_age = (
+                        datetime.now(timezone.utc) - stale_from
+                    ).total_seconds()
+                    detail = (
+                        f"{src.name}; positions stale {int(stale_age)}s; "
+                        "authoritative close detection paused"
+                    )
+                    error = position_result.error or "position snapshot is stale"
+                    if stale_age >= cfg.stale_position_down_seconds:
+                        health.mark_down(
+                            f"source:{src.id}", error=error, detail=detail
+                        )
+                    else:
+                        health.mark_degraded(
+                            f"source:{src.id}", error=error, detail=detail
+                        )
+                    await hub.broadcast(snapshot_payload("snapshot"))
+                    continue
+                actual = position_result.value
                 actual = {mid: p for mid, p in actual.items() if not src.is_excluded(p.market_symbol)}
                 prev_dash = _dash_positions.get(src.id, {})
                 tracked    = src.tracker.snapshot()
@@ -2003,7 +2238,13 @@ async def _run() -> None:
                                     f"Notional: ${disp_not_val:,.0f}"
                                     f"{lev_str}{sl_tp_str}{fn_line}{footer}"
                                 )
-                                await tg_send(msg)
+                                await tg_send(
+                                    msg,
+                                    event_uid=(
+                                        f"tg:reconcile-open:{src.id}:{market_id}:"
+                                        f"{pos.position_side}:{pos.avg_entry_price}"
+                                    ),
+                                )
                                 # If OPEN alert already showed SL/TP, pre-arm so the
                                 # reconciler's SL/TP section doesn't double-alert.
                                 if sl is not None or tp is not None:
@@ -2052,12 +2293,17 @@ async def _run() -> None:
                                 # Only the fills we haven't booked yet (oldest-first).
                                 _sc_new = [
                                     f for f in _sc_fills
-                                    if f.trade_id not in _recorded_realizations
+                                    if (
+                                        f"{src.id}|{f.market_id}|{f.position_side}|{f.trade_id}"
+                                        not in _recorded_realizations
+                                    )
                                 ]
                                 # Partials already booked for this round-trip BEFORE
                                 # this loop inserts any rows (capture once to avoid
                                 # double-counting the rows we add below).
-                                _sc_prior = _roundtrip_partial_pnl(src.name, pos.market_symbol)
+                                _sc_prior = _roundtrip_partial_pnl(
+                                    src.id, src.name, pos.market_symbol
+                                )
                                 # This unobserved close may span several fills. Mark
                                 # all but the last as PARTIAL and the last as FULL so
                                 # round-trip aggregation collapses them into ONE trade
@@ -2130,7 +2376,13 @@ async def _run() -> None:
                                 f"Entry: ${disp_entry_val:,.2f}  |  Notional: ${disp_not_val:,.0f}  (close price unavailable)"
                                 f"{fn_line}{footer}"
                             )
-                            await tg_send(msg)
+                            await tg_send(
+                                msg,
+                                event_uid=(
+                                    f"tg:reconcile-close:{src.id}:{market_id}:"
+                                    f"{pos.position_side}:{pos.avg_entry_price}"
+                                ),
+                            )
 
                 # ── 3. Sync fill-based tracker with API truth ────────────────────────
                 # Exclude positions awaiting their OPEN fill so the tracker classifies
@@ -2162,7 +2414,13 @@ async def _run() -> None:
                             source_id=src.id,
                         )
                         if alert_text and tg_token and tg_channel:
-                            await tg_send(alert_text)
+                            await tg_send(
+                                alert_text,
+                                event_uid=(
+                                    f"tg:sltp:{src.id}:{market_id}:"
+                                    f"{sl or ''}:{tp or ''}"
+                                ),
+                            )
                         _sl_tp_alerted.add(key)
                 for cache_key in list(_sl_tp_cache.keys()):
                     c_src_id, c_market_id = cache_key
@@ -2187,28 +2445,42 @@ async def _run() -> None:
 
                 # ── 6. Advance dashboard snapshot ────────────────────────────────────
                 _dash_positions[src.id] = actual
-                health.mark_up(f"source:{src.name}", ok_ts=datetime.now(timezone.utc).isoformat())
+                health.mark_up(
+                    f"source:{src.id}",
+                    detail=src.name,
+                    ok_ts=datetime.now(timezone.utc).isoformat(),
+                )
                 await hub.broadcast(snapshot_payload("snapshot"))
 
             except Exception as _rec_exc:
                 log.exception("[%s] position reconciler failed", src.name)
-                health.mark_degraded(f"source:{src.name}", error=str(_rec_exc))
+                health.mark_degraded(
+                    f"source:{src.id}", error=str(_rec_exc), detail=src.name
+                )
 
     async def ws_producer(src: Source) -> None:
+        await _ensure_source_ready(src)
         async for trade in src.client.stream_trades():
             await queue.put((src.id, trade))
 
     async def rest_safety_producer(src: Source) -> None:
+        await _ensure_source_ready(src)
         while True:
             await asyncio.sleep(cfg.rest_poll_seconds)
             try:
                 trades = await src.client.fetch_trades_since(src.last_trade_id)
                 for t in trades:
                     await queue.put((src.id, t))
-                health.mark_up(f"source:{src.name}", ok_ts=datetime.now(timezone.utc).isoformat())
+                health.mark_up(
+                    f"source:{src.id}",
+                    detail=src.name,
+                    ok_ts=datetime.now(timezone.utc).isoformat(),
+                )
             except Exception as _poll_exc:
                 log.exception("[%s] safety poll failed", src.name)
-                health.mark_degraded(f"source:{src.name}", error=str(_poll_exc))
+                health.mark_degraded(
+                    f"source:{src.id}", error=str(_poll_exc), detail=src.name
+                )
 
     async def consumer() -> None:
         while True:
@@ -2216,12 +2488,26 @@ async def _run() -> None:
             src = by_id.get(source_id)
             if src is None:
                 continue
+            if not trade.source_id or not trade.exchange:
+                trade = replace(
+                    trade,
+                    source_id=trade.source_id or src.id,
+                    exchange=trade.exchange or src.exchange,
+                )
             # Set-based dedup catches WS replay and REST/WS overlap regardless of order.
-            trade_key = _trade_dedup_key(trade)
+            trade_key = _trade_dedup_key(trade, source_id)
             if trade_key in src.seen_tids:
                 continue
             src.seen_tids.add(trade_key)
-            src.last_trade_id = max(src.last_trade_id or 0, trade.trade_id)
+            trade_cursor = src.cursor_for_trade(trade)
+            src.last_trade_id = max(src.last_trade_id or 0, trade_cursor)
+            await save_source_cursor(
+                DB_PATH,
+                src.id,
+                "trades",
+                str(src.last_trade_id),
+                datetime.now(timezone.utc).isoformat(),
+            )
             events = src.tracker.apply(trade)
             for ev in events:
                 if src.is_excluded(ev.trade.market_symbol):
@@ -2259,6 +2545,9 @@ async def _run() -> None:
                     DB_PATH,
                     ev.trade.timestamp.isoformat(),
                     json.dumps(_to_jsonable(ev)),
+                    source_id=src.id,
+                    exchange=src.exchange,
+                    event_uid=f"{ev.trade.event_uid(src.id)}|{ev.kind.value}",
                 )
                 log.info("[%s] event %s %s %s @ %s size=%s", src.name, ev.kind,
                          ev.trade.side, ev.trade.market_symbol, ev.trade.price,
@@ -2298,11 +2587,14 @@ async def _run() -> None:
                         # Suppressing this alert based on a possibly-stale snapshot
                         # caused legitimate OPENs to be silently dropped.
                         ae = _anchor(src, ev.trade.market_id, ev.trade.price)
-                        await tg_send(format_event(
-                            ev, src.url, src.name, sl=sl, tp=tp,
-                            privacy=privacy, is_hl=src.is_hyperliquid, anchor_entry=ae,
-                            source_id=src.id,
-                        ))
+                        await tg_send(
+                            format_event(
+                                ev, src.url, src.name, sl=sl, tp=tp,
+                                privacy=privacy, is_hl=src.is_hyperliquid,
+                                anchor_entry=ae, source_id=src.id,
+                            ),
+                            event_uid=f"tg:{ev.trade.event_uid(src.id)}:{ev.kind.value}",
+                        )
                         # Pre-arm so the reconciler doesn't double-alert SL/TP when
                         # the OPEN alert already showed them.
                         if sl is not None or tp is not None:
@@ -2353,7 +2645,9 @@ async def _run() -> None:
                     # booked on this trade's scale-outs + this close fill. The
                     # pending reduce batch was flushed just above, so those PARTIAL
                     # rows are already in closed_trades.
-                    _rt_partials = _roundtrip_partial_pnl(src.name, ev.trade.market_symbol)
+                    _rt_partials = _roundtrip_partial_pnl(
+                        src.id, src.name, ev.trade.market_symbol
+                    )
                     _card_total = (
                         (_rt_partials + realized)
                         if (realized is not None and _rt_partials != 0)
@@ -2369,7 +2663,9 @@ async def _run() -> None:
                     # HL closedPnl is ground truth. Falls back to the local
                     # total on any API hiccup.
                     if src.is_hyperliquid and realized is not None:
-                        _rt_start = _roundtrip_start_ts(src.name, ev.trade.market_symbol)
+                        _rt_start = _roundtrip_start_ts(
+                            src.id, src.name, ev.trade.market_symbol
+                        )
                         if _rt_start is not None:
                             try:
                                 _rt_start_dt = datetime.fromisoformat(
@@ -2459,14 +2755,25 @@ async def _run() -> None:
                             _caption = f"{ev.trade.market_symbol} {side_txt} · {pnl_txt}"
                             if src.url:
                                 _caption += f"\n{src.url}"
-                            await tg_send_photo(card_bytes, caption=_caption, log_text=log_text)
+                            await tg_send_photo(
+                                card_bytes,
+                                caption=_caption,
+                                log_text=log_text,
+                                event_uid=(
+                                    f"tg:card:{ev.trade.event_uid(src.id)}:"
+                                    f"{ev.kind.value}"
+                                ),
+                            )
                         else:
                             ae = _close_anchor
-                            await tg_send(format_event(
-                                ev, src.url, src.name,
-                                privacy=privacy, is_hl=src.is_hyperliquid, anchor_entry=ae,
-                                source_id=src.id,
-                            ))
+                            await tg_send(
+                                format_event(
+                                    ev, src.url, src.name,
+                                    privacy=privacy, is_hl=src.is_hyperliquid,
+                                    anchor_entry=ae, source_id=src.id,
+                                ),
+                                event_uid=f"tg:{ev.trade.event_uid(src.id)}:{ev.kind.value}",
+                            )
 
                 elif ev.kind == EventKind.REDUCE:
                     # Batch partial-close fills — avoids spam on incremental closes.
@@ -2709,7 +3016,7 @@ async def _run() -> None:
                     )
             db_by_coin: dict[str, Decimal] = {}
             for row in closed_trades:
-                if row.get("source") != s.name:
+                if not _row_belongs_to_source(row, s.id, s.name):
                     continue
                 ts = row.get("ts") or ""
                 if not (day_iso <= ts[:10] < day_end.date().isoformat()):
@@ -2764,12 +3071,166 @@ async def _run() -> None:
                 except Exception:
                     log.exception("daily self-audit failed")
 
-    tasks = [consumer(), daily_jobs()]
-    for s in sources:
-        tasks.append(ws_producer(s))
-        tasks.append(rest_safety_producer(s))
-        tasks.append(position_reconciler(s))
-    await asyncio.gather(*tasks)
+    _source_tasks: dict[str, list[asyncio.Task]] = {}
+
+    def _start_source_tasks(src: Source) -> None:
+        _source_tasks[src.id] = [
+            asyncio.create_task(
+                supervise(
+                    f"source:{src.id}:ws",
+                    lambda src=src: ws_producer(src),
+                    health,
+                )
+            ),
+            asyncio.create_task(
+                supervise(
+                    f"source:{src.id}:rest",
+                    lambda src=src: rest_safety_producer(src),
+                    health,
+                )
+            ),
+            asyncio.create_task(
+                supervise(
+                    f"source:{src.id}:positions",
+                    lambda src=src: position_reconciler(src),
+                    health,
+                )
+            ),
+        ]
+
+    async def _stop_source(src: Source) -> None:
+        stopped_tasks = _source_tasks.pop(src.id, [])
+        for task in stopped_tasks:
+            task.cancel()
+        if stopped_tasks:
+            await asyncio.gather(*stopped_tasks, return_exceptions=True)
+        await src.client.close()
+        by_id.pop(src.id, None)
+        runtimes.pop(src.id, None)
+        _dash_positions.pop(src.id, None)
+        _open_orders.pop(src.id, None)
+        for suffix in ("", ":ws", ":rest", ":positions"):
+            health.remove(f"source:{src.id}{suffix}")
+
+    def _source_signature(src: Source) -> tuple:
+        return (
+            src.id,
+            src.exchange,
+            src.account_fingerprint,
+            src.name,
+            src.url,
+            src.min_notional,
+            src.exclude_symbols,
+        )
+
+    reload_event = asyncio.Event()
+
+    async def config_reload_loop() -> None:
+        """Atomically diff/apply a validated config after SIGHUP."""
+        nonlocal cfg, privacy
+        while True:
+            await reload_event.wait()
+            reload_event.clear()
+            # Re-read secret references atomically with the candidate YAML so
+            # newly added wallet/API env variables do not require a restart.
+            load_dotenv(override=True)
+            candidate_cfg = load_settings()
+            candidate = load_source_report(settings=candidate_cfg)
+            invalid = [issue for issue in candidate.issues if issue.status == "config_error"]
+            if invalid:
+                log.error(
+                    "config reload rejected: %d invalid source entr%s",
+                    len(invalid),
+                    "y" if len(invalid) == 1 else "ies",
+                )
+                for source in candidate.sources:
+                    await source.client.close()
+                health.mark_degraded(
+                    "configuration",
+                    error="candidate config rejected",
+                    detail=f"{len(invalid)} invalid source entries",
+                )
+                continue
+            try:
+                candidate_privacy = PrivacyParams(
+                    enabled=candidate_cfg.privacy_enabled,
+                    secret=candidate_cfg.privacy_secret_key,
+                    mag=candidate_cfg.privacy_mag,
+                    entry_quantum_pct=candidate_cfg.privacy_entry_quantum_pct,
+                    size_sigfigs=candidate_cfg.privacy_size_sigfigs,
+                    notional_sigfigs=candidate_cfg.privacy_notional_sigfigs,
+                    time_bucket=candidate_cfg.privacy_time_bucket,
+                    disclose_footnote=candidate_cfg.privacy_disclose_footnote,
+                )
+            except ValueError as exc:
+                for source in candidate.sources:
+                    await source.client.close()
+                health.mark_degraded(
+                    "configuration",
+                    error=f"candidate config rejected: {exc}",
+                )
+                continue
+
+            current_by_id = dict(by_id)
+            candidate_by_id = {source.id: source for source in candidate.sources}
+            changed_ids = {
+                sid
+                for sid in current_by_id.keys() & candidate_by_id.keys()
+                if _source_signature(current_by_id[sid])
+                != _source_signature(candidate_by_id[sid])
+            }
+            removed_ids = (current_by_id.keys() - candidate_by_id.keys()) | changed_ids
+            added_ids = (candidate_by_id.keys() - current_by_id.keys()) | changed_ids
+
+            for sid in removed_ids:
+                old = current_by_id[sid]
+                await _stop_source(old)
+                if old in sources:
+                    sources.remove(old)
+
+            for sid, candidate_source in candidate_by_id.items():
+                if sid not in added_ids:
+                    # Candidate clients were only used for validation.
+                    await candidate_source.client.close()
+
+            for sid in added_ids:
+                new_source = candidate_by_id[sid]
+                sources.append(new_source)
+                by_id[sid] = new_source
+                runtimes[sid] = SourceRuntime(new_source)
+                _dash_positions[sid] = {}
+                _start_source_tasks(new_source)
+
+            cfg = candidate_cfg
+            privacy = candidate_privacy
+            for issue in candidate.issues:
+                if issue.status == "disabled":
+                    health.mark_disabled(
+                        f"source:{issue.source_id or issue.name}", issue.detail
+                    )
+            health.mark_up(
+                "configuration",
+                detail=(
+                    f"reload applied: +{len(added_ids)} "
+                    f"-{len(removed_ids)} active={len(sources)}"
+                ),
+            )
+            await hub.broadcast(snapshot_payload("snapshot"))
+
+    loop = asyncio.get_running_loop()
+    if hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, reload_event.set)
+            health.mark_up("configuration", detail="SIGHUP reload enabled")
+        except (NotImplementedError, RuntimeError):
+            health.mark_disabled(
+                "configuration_reload", "SIGHUP not supported on this platform"
+            )
+
+    for source in sources:
+        _start_source_tasks(source)
+
+    await asyncio.gather(consumer(), daily_jobs(), config_reload_loop())
 
 
 if __name__ == "__main__":

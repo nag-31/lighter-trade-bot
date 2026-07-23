@@ -26,6 +26,7 @@ from typing import AsyncIterator, Optional
 import httpx
 import websockets
 
+from .result import FetchResult
 from .types import OpenOrder, Position, Trade
 
 log = logging.getLogger(__name__)
@@ -121,8 +122,10 @@ class LighterClient:
         try:
             data = await self.fetch_account()
         except Exception:
+            self._positions_last_authoritative = False
             log.exception("fetch_account failed")
             return {}
+        self._positions_last_authoritative = True
 
         positions_raw = (
             (data.get("accounts") or [{}])[0].get("positions")
@@ -170,6 +173,15 @@ class LighterClient:
             except Exception:
                 log.exception("could not parse position %r", p)
         return out
+
+    async def current_positions_result(self) -> FetchResult[dict[int, Position]]:
+        positions = await self.current_positions()
+        if getattr(self, "_positions_last_authoritative", False):
+            return FetchResult.success(positions)
+        return FetchResult.stale(
+            positions,
+            error="Lighter account snapshot unavailable",
+        )
 
     async def fetch_leverage(self, market_id: int) -> Optional[float]:
         """Return current leverage on the given market, or None if unknown."""
