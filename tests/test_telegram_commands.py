@@ -1,6 +1,6 @@
 import logging
 
-from src.dashboard import _SecretRedactionFilter
+from src.dashboard import _SecretRedactionFilter, _safe_telegram_error
 from src.telegram_commands import (
     command_output_chat,
     format_fills,
@@ -74,6 +74,17 @@ def test_telegram_token_is_redacted_from_http_logs():
     assert _SecretRedactionFilter(secret).filter(record)
     assert secret not in record.getMessage()
     assert "<telegram-token>" in record.getMessage()
+
+
+def test_telegram_exception_description_never_renders_request_url():
+    secret = "123456:ABC-secret"
+    exc = RuntimeError(
+        f"403 for https://api.telegram.org/bot{secret}/setMyCommands"
+    )
+    result = _safe_telegram_error(exc)
+    assert result == "RuntimeError: Telegram request failed"
+    assert secret not in result
+    assert "api.telegram.org" not in result
 
 
 def test_parse_command_supports_bot_suffix_and_args():

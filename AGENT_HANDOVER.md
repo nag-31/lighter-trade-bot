@@ -421,6 +421,9 @@ key. If one L1 address has subaccounts, repeat the source with the same
   channel's linked discussion group, the result is published to
   `TELEGRAM_CHANNEL_ID`. The linked group is discovered with Telegram
   `getChat`; `TELEGRAM_DISCUSSION_CHAT_ID` is the explicit fallback/override.
+- The bot must be an administrator in the linked discussion supergroup so it
+  can receive commands and register the owner-specific command menu. If not,
+  private commands stay active and `telegram_commands` reports degraded.
 - Command replies are read-only, owner-only, rate-limited, privacy transformed,
   split below Telegram limits, and excluded from the alert outbox. Commands
   from other users, other groups, and anonymous administrators are ignored.

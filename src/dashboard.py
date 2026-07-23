@@ -110,6 +110,11 @@ class _SecretRedactionFilter(logging.Filter):
         return True
 
 
+def _safe_telegram_error(exc: BaseException) -> str:
+    """Describe a Telegram failure without rendering token-bearing request URLs."""
+    return f"{type(exc).__name__}: Telegram request failed"
+
+
 def _acquire_pid_lock() -> bool:
     """Return True if we successfully claimed the singleton lock, False if another instance is running."""
     if PIDFILE.exists():
@@ -1411,14 +1416,15 @@ async def _run() -> None:
                     datetime.now(timezone.utc).isoformat(),
                 )
         except Exception as _tg_exc:
-            log.exception("tg_send failed")
-            health.mark_down("telegram", error=str(_tg_exc))
+            safe_error = _safe_telegram_error(_tg_exc)
+            log.error("tg_send failed (%s)", type(_tg_exc).__name__)
+            health.mark_down("telegram", error=safe_error)
             await mark_notification(
                 DB_PATH,
                 outbox_uid,
                 "failed",
                 datetime.now(timezone.utc).isoformat(),
-                f"{type(_tg_exc).__name__}: {_tg_exc}",
+                safe_error,
             )
         # Push the new alert to dashboard clients live (alerts can fire from the
         # aggregate flush / reconciler at times with no other broadcast).
@@ -1476,13 +1482,13 @@ async def _run() -> None:
                     datetime.now(timezone.utc).isoformat(),
                 )
         except Exception as exc:
-            log.exception("tg_send_photo failed")
+            log.error("tg_send_photo failed (%s)", type(exc).__name__)
             await mark_notification(
                 DB_PATH,
                 outbox_uid,
                 "failed",
                 datetime.now(timezone.utc).isoformat(),
-                f"{type(exc).__name__}: {exc}",
+                _safe_telegram_error(exc),
             )
             if caption:
                 await tg_send(caption, event_uid=f"{outbox_uid}:fallback")
@@ -1505,8 +1511,8 @@ async def _run() -> None:
             )
             if not r.json().get("ok"):
                 log.warning("tg_dm_owner failed: %s", r.text[:200])
-        except Exception:
-            log.exception("tg_dm_owner failed")
+        except Exception as exc:
+            log.error("tg_dm_owner failed (%s)", type(exc).__name__)
 
     # ── Cross-coin session digest ──────────────────────────────────────────────
     # flush_aggregate / flush_reduce_aggregate produce one message per coin; in a
@@ -2982,8 +2988,10 @@ async def _run() -> None:
                 await tg_send_photo(card, log_text="\U0001f4ca Trade stats")
             return web.json_response({"ok": True})
         except Exception as exc:
-            log.exception("send_stats failed")
-            return web.json_response({"ok": False, "error": str(exc)})
+            log.error("send_stats failed (%s)", type(exc).__name__)
+            return web.json_response(
+                {"ok": False, "error": _safe_telegram_error(exc)}
+            )
 
     # Card PNGs keep the same filename when regenerated (rebuilds overwrite in
     # place), so browsers must revalidate instead of serving a cached image —
@@ -3398,20 +3406,24 @@ async def _run() -> None:
                     linked_id = (body.get("result") or {}).get("linked_chat_id")
                     if linked_id is not None:
                         discussion_id = int(linked_id)
-            except Exception:
-                log.exception("could not resolve linked Telegram discussion chat")
-
-        try:
-            scopes = [{"type": "chat", "chat_id": owner_id}]
-            if discussion_id is not None:
-                scopes.append(
-                    {
-                        "type": "chat_member",
-                        "chat_id": discussion_id,
-                        "user_id": owner_id,
-                    }
+            except Exception as exc:
+                log.error(
+                    "could not resolve linked Telegram discussion chat (%s)",
+                    type(exc).__name__,
                 )
-            for scope in scopes:
+
+        discussion_menu_ok = discussion_id is not None
+        scopes = [{"type": "chat", "chat_id": owner_id}]
+        if discussion_id is not None:
+            scopes.append(
+                {
+                    "type": "chat_member",
+                    "chat_id": discussion_id,
+                    "user_id": owner_id,
+                }
+            )
+        for scope in scopes:
+            try:
                 response = await tg_client.post(
                     f"https://api.telegram.org/bot{tg_token}/setMyCommands",
                     data={
@@ -3422,8 +3434,19 @@ async def _run() -> None:
                 response.raise_for_status()
                 if not response.json().get("ok"):
                     raise RuntimeError("Telegram rejected command menu")
-        except Exception:
-            log.exception("could not register Telegram command menu")
+            except Exception as exc:
+                if scope.get("type") == "chat_member":
+                    discussion_menu_ok = False
+                    log.warning(
+                        "Telegram discussion command menu unavailable (%s); "
+                        "add the bot as an administrator in the linked discussion",
+                        type(exc).__name__,
+                    )
+                else:
+                    log.error(
+                        "could not register private Telegram command menu (%s)",
+                        type(exc).__name__,
+                    )
 
         cursor = await load_source_cursor(
             DB_PATH, "__telegram_commands__", "updates"
@@ -3517,24 +3540,40 @@ async def _run() -> None:
                             command, args, output_chat
                         )
                     except Exception as exc:
-                        log.exception("Telegram command /%s failed", command)
+                        log.error(
+                            "Telegram command /%s failed (%s)",
+                            command,
+                            type(exc).__name__,
+                        )
                         await _tg_reply(
                             origin_chat,
                             f"/{command} failed temporarily: {type(exc).__name__}",
                             **feedback_kwargs,
                         )
-                health.mark_up(
-                    "telegram_commands",
-                    detail=(
-                        "owner DM + discussion-to-channel"
-                        if discussion_id is not None
-                        else "owner DM; discussion chat not configured/linked"
-                    ),
-                )
+                if discussion_id is not None and not discussion_menu_ok:
+                    health.mark_degraded(
+                        "telegram_commands",
+                        error=(
+                            "owner DM active; add bot as linked discussion "
+                            "administrator, then restart"
+                        ),
+                    )
+                else:
+                    health.mark_up(
+                        "telegram_commands",
+                        detail=(
+                            "owner DM + discussion-to-channel"
+                            if discussion_id is not None
+                            else "owner DM; discussion chat not configured/linked"
+                        ),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.exception("Telegram command polling failed")
+                log.error(
+                    "Telegram command polling failed (%s)",
+                    type(exc).__name__,
+                )
                 health.mark_degraded(
                     "telegram_commands",
                     error=f"{type(exc).__name__}: command polling unavailable",
