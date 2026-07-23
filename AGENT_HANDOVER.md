@@ -343,8 +343,9 @@ python scripts/reconcile_hl_pnl.py --days 10 --apply
 Status: deployed to the GCP VM on 2026-07-23 from commit `12b7019`
 (`codex/private-portfolio-app`). The production SQLite database was backed up
 and migrated to schema v2, `lighterbot` was restarted, and local/public health
-reported ready. Lighter wallet-address source support was added on 2026-07-23.
-The complete suite now contains 793 passing tests.
+reported ready. Lighter wallet-address source support and owner-only Telegram
+commands were added on 2026-07-23. The complete suite now contains 804 passing
+tests.
 
 Production backup:
 
@@ -413,6 +414,14 @@ key. If one L1 address has subaccounts, repeat the source with the same
 - Source, market, position-side, and native trade IDs form the v2 event identity.
 - SQLite schema v2 adds source-scoped IDs, persisted cursors, unique event IDs,
   and a persistent Telegram outbox.
+- The production dashboard long-polls Telegram for owner-DM commands:
+  `/positions`, `/orders`, `/trades`, `/fills`, `/pnl`, `/stats`, `/risk`,
+  `/sources`, `/health`, `/dashboard`, `/version`, and `/help`.
+- Command replies are read-only, owner-only, rate-limited, privacy transformed,
+  split below Telegram limits, and excluded from the public alert log.
+- The Telegram update cursor is persisted under source id
+  `__telegram_commands__`; old commands are not replayed after a restart.
+- HTTP log records redact the Telegram bot token.
 - Binance supports one-way and hedge mode, uses native trade IDs, discovers
   fully closed downtime symbols through realized-income history, paginates
   user trades, loads open orders, syncs clock drift, and pauses auth/rate-limit

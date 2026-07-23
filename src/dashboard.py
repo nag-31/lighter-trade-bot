@@ -22,6 +22,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from aiohttp import WSMsgType, web
@@ -55,6 +56,20 @@ from .sources import BotSettings, Source, load_settings, load_source_report
 from .stats import aggregate_round_trips, compute_stats, filter_trades, format_stats_summary
 from .stats_card import render_stats_card
 from .supervisor import supervise
+from .telegram_commands import (
+    filter_rows_by_source,
+    format_fills,
+    format_health,
+    format_help,
+    format_orders,
+    format_positions,
+    format_risk,
+    format_sources,
+    format_trades,
+    parse_command,
+    parse_count_and_source,
+    split_message,
+)
 from .types import Event, EventKind, OpenOrder, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -65,6 +80,33 @@ DB_PATH = DATA_DIR / "events.db"
 PIDFILE = Path(os.environ.get("LIGHTERBOT_PIDFILE") or (
     DATA_DIR / "lighterbot.pid" if os.name == "nt" else "/tmp/lighterbot.pid"
 ))
+
+
+class _SecretRedactionFilter(logging.Filter):
+    """Prevent Telegram bot tokens embedded in HTTP URLs from reaching logs."""
+
+    def __init__(self, secret: str):
+        super().__init__()
+        self._secret = secret
+
+    def _mask(self, value: Any) -> Any:
+        if isinstance(value, tuple):
+            return tuple(self._mask(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._mask(item) for key, item in value.items()}
+        if not self._secret:
+            return value
+        rendered = str(value)
+        return (
+            rendered.replace(self._secret, "<telegram-token>")
+            if self._secret in rendered
+            else value
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._mask(record.msg)
+        record.args = self._mask(record.args)
+        return True
 
 
 def _acquire_pid_lock() -> bool:
@@ -1272,6 +1314,8 @@ async def _run() -> None:
     tg_channel = os.environ.get("TELEGRAM_CHANNEL_ID", "")
     # Owner's PRIVATE chat for self-audit warnings — never the public channel.
     tg_owner = os.environ.get("TELEGRAM_OWNER_USER_ID", "").strip()
+    if tg_token:
+        logging.getLogger("httpx").addFilter(_SecretRedactionFilter(tg_token))
     tg_client = httpx.AsyncClient(timeout=15.0)
     AGGREGATE_WINDOW = cfg.aggregate_window_seconds
 
@@ -2012,6 +2056,7 @@ async def _run() -> None:
         for s in sources:
             for market_id, pos in _dash_positions.get(s.id, {}).items():
                 d = asdict(pos)
+                d["notional_usd"] = pos.notional_usd
                 sl, tp = _sl_tp_cache.get((s.id, market_id), (None, None))
                 d["sl_price"] = sl
                 d["tp_price"] = tp
@@ -3071,6 +3116,362 @@ async def _run() -> None:
                 except Exception:
                     log.exception("daily self-audit failed")
 
+    # ── Owner-only Telegram commands ─────────────────────────────────────────
+    _telegram_commands = [
+        {"command": "positions", "description": "Live open positions"},
+        {"command": "orders", "description": "Cached open orders"},
+        {"command": "trades", "description": "Recent completed trades"},
+        {"command": "fills", "description": "Recent executions and events"},
+        {"command": "pnl", "description": "PnL for today, 7d, 30d or all"},
+        {"command": "stats", "description": "Performance summary and card"},
+        {"command": "risk", "description": "Exposure and concentration"},
+        {"command": "sources", "description": "Configured source status"},
+        {"command": "health", "description": "Bot component health"},
+        {"command": "dashboard", "description": "Open the web dashboard"},
+        {"command": "version", "description": "Version and process start time"},
+        {"command": "help", "description": "Show command help"},
+    ]
+    _command_rate_last = 0.0
+    _command_rate_seconds = 2.0
+
+    async def _tg_reply(chat_id: str, text: str) -> None:
+        """Reply privately without entering the public alert log/outbox."""
+        for chunk in split_message(text):
+            response = await tg_client.post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": "true",
+                },
+            )
+            response.raise_for_status()
+            if not response.json().get("ok"):
+                raise RuntimeError("Telegram rejected command reply")
+
+    async def _tg_reply_photo(
+        chat_id: str, image_bytes: bytes, caption: str
+    ) -> None:
+        response = await tg_client.post(
+            f"https://api.telegram.org/bot{tg_token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"photo": ("stats.png", image_bytes, "image/png")},
+        )
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise RuntimeError("Telegram rejected command photo")
+
+    def _safe_recent_fills() -> list[dict]:
+        """Build privacy-safe command rows from persisted/live event objects."""
+        rows: list[dict] = []
+        for item in recent_events:
+            event = _to_jsonable(item)
+            if not isinstance(event, dict):
+                continue
+            trade = event.get("trade")
+            if not isinstance(trade, dict):
+                continue
+            source_id = str(trade.get("source_id") or "")
+            source = by_id.get(source_id)
+            if source is None:
+                matches = [
+                    candidate
+                    for candidate in sources
+                    if candidate.name == str(trade.get("source") or "")
+                ]
+                source = matches[0] if len(matches) == 1 else None
+
+            price = trade.get("price")
+            size = trade.get("size")
+            notional: Any = None
+            try:
+                notional = Decimal(str(price)) * Decimal(str(size))
+            except Exception:
+                pass
+            timestamp = trade.get("timestamp")
+            if source is not None and source.is_hyperliquid:
+                try:
+                    market_id = int(trade.get("market_id"))
+                    raw_price = Decimal(str(price))
+                    anchor = _anchor(source, market_id, raw_price)
+                    view = disp_view(
+                        privacy,
+                        True,
+                        source.id,
+                        str(trade.get("market_symbol") or ""),
+                        str(trade.get("side") or ""),
+                        anchor,
+                        entry=raw_price,
+                        size=Decimal(str(size)),
+                        notional=notional,
+                        ts=str(timestamp or ""),
+                        now=datetime.now(timezone.utc),
+                    )
+                    price = view.get("entry", price)
+                    size = view.get("size", size)
+                    notional = view.get("notional", notional)
+                    timestamp = view.get("ts", timestamp)
+                except Exception:
+                    # Fail closed for HL: omit sensitive numeric fields.
+                    price = size = notional = None
+
+            kind = event.get("kind")
+            if hasattr(kind, "value"):
+                kind = kind.value
+            rows.append(
+                {
+                    "kind": kind,
+                    "source": trade.get("source"),
+                    "source_id": source_id,
+                    "exchange": trade.get("exchange"),
+                    "market_symbol": trade.get("market_symbol"),
+                    "side": trade.get("side"),
+                    "price": price,
+                    "size": size,
+                    "notional": notional,
+                    "ts": timestamp,
+                }
+            )
+        return rows
+
+    def _command_ts(value: Any) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def _pnl_rows(window: str, source_query: str) -> list[dict]:
+        rows = filter_rows_by_source(
+            display_trades(include_open=False), source_query
+        )
+        now = datetime.now(timezone.utc)
+        if window == "today":
+            local_now = now.astimezone(ZoneInfo("Asia/Kolkata"))
+            start = local_now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(timezone.utc)
+        elif window == "7d":
+            start = now - timedelta(days=7)
+        elif window == "30d":
+            start = now - timedelta(days=30)
+        else:
+            return rows
+        return [
+            row
+            for row in rows
+            if (_command_ts(row.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
+            >= start
+        ]
+
+    async def _handle_tg_command(
+        command: str, args: list[str], chat_id: str
+    ) -> None:
+        if command in {"start", "help"}:
+            await _tg_reply(chat_id, format_help())
+            return
+        if command == "positions":
+            await _tg_reply(chat_id, format_positions(all_positions(), " ".join(args)))
+            return
+        if command == "orders":
+            await _tg_reply(chat_id, format_orders(all_open_orders(), " ".join(args)))
+            return
+        if command == "trades":
+            count, source_query = parse_count_and_source(args)
+            await _tg_reply(
+                chat_id,
+                format_trades(
+                    display_trades(include_open=False), count, source_query
+                ),
+            )
+            return
+        if command == "fills":
+            count, source_query = parse_count_and_source(args)
+            await _tg_reply(
+                chat_id,
+                format_fills(_safe_recent_fills(), count, source_query),
+            )
+            return
+        if command == "pnl":
+            window = "all"
+            source_args = list(args)
+            if source_args and source_args[0].lower() in {
+                "today", "7d", "30d", "all"
+            }:
+                window = source_args.pop(0).lower()
+            source_query = " ".join(source_args)
+            summary = compute_stats(_pnl_rows(window, source_query))
+            title = f"PnL — {window}{f' · {source_query}' if source_query else ''}"
+            await _tg_reply(chat_id, format_stats_summary(summary, title=title))
+            return
+        if command == "stats":
+            text = format_stats_summary(stats_state)
+            try:
+                await _tg_reply_photo(chat_id, render_stats_card(stats_state), text)
+            except Exception:
+                log.exception("Telegram /stats card failed; sending text")
+                await _tg_reply(chat_id, text)
+            return
+        if command == "risk":
+            await _tg_reply(chat_id, format_risk(all_positions(), " ".join(args)))
+            return
+        if command == "sources":
+            details = [
+                {"id": source.id, "name": source.name, "exchange": source.exchange}
+                for source in sources
+            ]
+            await _tg_reply(chat_id, format_sources(details, health.snapshot()))
+            return
+        if command == "health":
+            await _tg_reply(chat_id, format_health(health.snapshot()))
+            return
+        if command == "dashboard":
+            url = os.getenv(
+                "DASHBOARD_PUBLIC_URL",
+                "https://dashboard.8-231-102-153.sslip.io/",
+            ).strip()
+            await _tg_reply(chat_id, f"Trade tracker dashboard\n{url}")
+            return
+        if command == "version":
+            marker = Path(".deployed_commit")
+            commit = marker.read_text(encoding="utf-8").strip() if marker.exists() else "local"
+            snap = health.snapshot()
+            await _tg_reply(
+                chat_id,
+                f"Trade tracker version\nCommit: {commit}\n"
+                f"Started: {snap.get('started_at') or 'unknown'}",
+            )
+            return
+        await _tg_reply(chat_id, f"Unknown command: /{command}\n\n{format_help()}")
+
+    async def telegram_command_listener() -> None:
+        """Long-poll Telegram and serve read-only commands to the owner DM."""
+        nonlocal _command_rate_last
+        if not (tg_token and tg_owner):
+            health.mark_disabled(
+                "telegram_commands", "bot token or owner user id is missing"
+            )
+            return
+        try:
+            owner_id = int(tg_owner)
+        except ValueError:
+            health.mark_down("telegram_commands", "invalid owner user id")
+            return
+
+        try:
+            await tg_client.post(
+                f"https://api.telegram.org/bot{tg_token}/setMyCommands",
+                data={
+                    "commands": json.dumps(_telegram_commands),
+                    "scope": json.dumps({"type": "chat", "chat_id": owner_id}),
+                },
+            )
+        except Exception:
+            log.exception("could not register Telegram command menu")
+
+        cursor = await load_source_cursor(
+            DB_PATH, "__telegram_commands__", "updates"
+        )
+        offset = int(cursor) if cursor and cursor.isdigit() else None
+        if offset is None:
+            # Skip historical updates on first enablement so old commands are
+            # never replayed after deployment.
+            try:
+                response = await tg_client.get(
+                    f"https://api.telegram.org/bot{tg_token}/getUpdates",
+                    params={
+                        "offset": -1,
+                        "timeout": 0,
+                        "allowed_updates": json.dumps(["message"]),
+                    },
+                )
+                response.raise_for_status()
+                initial = response.json().get("result", [])
+                offset = (
+                    int(initial[-1]["update_id"]) + 1 if initial else 0
+                )
+                await save_source_cursor(
+                    DB_PATH,
+                    "__telegram_commands__",
+                    "updates",
+                    str(offset),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                health.mark_degraded(
+                    "telegram_commands",
+                    error=f"initialization failed: {type(exc).__name__}",
+                )
+                offset = 0
+
+        while True:
+            try:
+                response = await tg_client.get(
+                    f"https://api.telegram.org/bot{tg_token}/getUpdates",
+                    params={
+                        "offset": offset,
+                        "timeout": 25,
+                        "allowed_updates": json.dumps(["message"]),
+                    },
+                    timeout=35.0,
+                )
+                response.raise_for_status()
+                body = response.json()
+                if not body.get("ok"):
+                    raise RuntimeError("Telegram getUpdates rejected")
+                for update in body.get("result", []):
+                    offset = max(offset, int(update["update_id"]) + 1)
+                    await save_source_cursor(
+                        DB_PATH,
+                        "__telegram_commands__",
+                        "updates",
+                        str(offset),
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    message = update.get("message") or {}
+                    sender_id = message.get("from", {}).get("id")
+                    chat = message.get("chat") or {}
+                    if sender_id != owner_id:
+                        continue
+                    if chat.get("type") != "private" or chat.get("id") != owner_id:
+                        continue
+                    parsed = parse_command(message.get("text") or "")
+                    if parsed is None:
+                        continue
+                    now_mono = time.monotonic()
+                    if now_mono - _command_rate_last < _command_rate_seconds:
+                        await _tg_reply(
+                            str(owner_id),
+                            "Please wait a moment before sending another command.",
+                        )
+                        continue
+                    _command_rate_last = now_mono
+                    command, args = parsed
+                    try:
+                        await _handle_tg_command(
+                            command, args, str(owner_id)
+                        )
+                    except Exception as exc:
+                        log.exception("Telegram command /%s failed", command)
+                        await _tg_reply(
+                            str(owner_id),
+                            f"/{command} failed temporarily: {type(exc).__name__}",
+                        )
+                health.mark_up(
+                    "telegram_commands", detail="owner-only long polling"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("Telegram command polling failed")
+                health.mark_degraded(
+                    "telegram_commands",
+                    error=f"{type(exc).__name__}: command polling unavailable",
+                )
+                await asyncio.sleep(10)
+
     _source_tasks: dict[str, list[asyncio.Task]] = {}
 
     def _start_source_tasks(src: Source) -> None:
@@ -3230,7 +3631,12 @@ async def _run() -> None:
     for source in sources:
         _start_source_tasks(source)
 
-    await asyncio.gather(consumer(), daily_jobs(), config_reload_loop())
+    await asyncio.gather(
+        consumer(),
+        daily_jobs(),
+        config_reload_loop(),
+        telegram_command_listener(),
+    )
 
 
 if __name__ == "__main__":

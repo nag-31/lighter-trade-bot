@@ -150,12 +150,25 @@ sources:
     name: "My NK pool"
     pool_id: 281474976684763
 
+  - type: lighter
+    id: lighter-wallet
+    name: "Lighter Wallet"
+    address_env: LIGHTER_ADDRESS
+    account_slot: 0
+
   - type: hyperliquid
     id: hl-main
     name: "HL"
     address_env: HL_ADDRESS
     min_notional_usd: 1000
     exclude_symbols: ["FARTCOIN"]
+    footer_url: "https://enkapital.xyz"
+
+  - type: hyperliquid
+    id: hl-second
+    name: "HL 2"
+    address_env: HL_ADDRESS_2
+    min_notional_usd: 1000
     footer_url: "https://enkapital.xyz"
 
   # Binance disabled -- source is HTTP 451 geo-blocked from the current region.

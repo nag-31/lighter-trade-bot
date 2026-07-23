@@ -1,18 +1,29 @@
-# Future Features — Telegram Group Command Bot
+# Telegram Command Bot
+
+Status: owner-only read-only commands implemented on 2026-07-23 in the
+production `src.dashboard` entry point. Group/multi-user access remains a
+future option and is intentionally disabled for privacy.
 
 ## Vision
 
 A Telegram bot that any member of a designated group or channel can command.
 It fetches live data from the dashboard backend and relays insights back to the chat.
 
-Planned commands:
+Implemented commands:
 
 | Command | Response |
 |---------|----------|
-| `/stats` | Full stats summary card (text + PNG image via `/api/send_stats` relay) |
-| `/pnl` | Net P&L and win-rate summary for the configured window |
-| `/positions` | Current open positions with entry price and notional |
-| `/trades [n]` | Last *n* closed trades (default 10) |
+| `/stats` | Full stats summary card |
+| `/pnl [today\|7d\|30d\|all] [source]` | P&L and win-rate summary |
+| `/positions [source]` | Current cached open positions |
+| `/orders [source]` | Current cached open orders |
+| `/trades [n] [source]` | Last completed round trips (default 10) |
+| `/fills [n] [source]` | Last executions/events (default 10) |
+| `/risk [source]` | Exposure and concentration summary |
+| `/sources` | Active/disabled source status |
+| `/health` | Component health summary |
+| `/dashboard` | Public dashboard link |
+| `/version` | Deployed commit and process start time |
 | `/help` | Command list with short descriptions |
 
 ---
@@ -31,18 +42,15 @@ The existing `tg_send` / `tg_send_photo` helpers accept any `chat_id` if adapted
 
 ---
 
-## What to Add Later
+## Implementation
 
 ### 1. Command listener (asyncio task)
 
-Add a new coroutine `telegram_command_listener()` inside `_run()`, launched alongside the existing tasks in `asyncio.gather()`.
+`telegram_command_listener()` runs inside `_run()` alongside the existing
+dashboard tasks.
 
-Two options:
-
-- **Long-poll `getUpdates`** — simpler to deploy; no public URL required. Poll `https://api.telegram.org/bot{token}/getUpdates?offset=...&timeout=30` in a loop, dispatch commands from `message.text`.
-- **Webhook** — lower latency; requires a public HTTPS endpoint. `aiohttp` can serve it on a dedicated path (e.g. `/tg/webhook`).
-
-The long-poll approach fits the existing deployment model (single process, no reverse proxy needed).
+It uses long-poll `getUpdates`; the last processed update cursor is persisted in
+SQLite so restarts cannot replay old commands.
 
 ### 2. Command dispatch table
 
