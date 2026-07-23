@@ -57,6 +57,7 @@ from .stats import aggregate_round_trips, compute_stats, filter_trades, format_s
 from .stats_card import render_stats_card
 from .supervisor import supervise
 from .telegram_commands import (
+    command_output_chat,
     filter_rows_by_source,
     format_fills,
     format_health,
@@ -3134,16 +3135,29 @@ async def _run() -> None:
     _command_rate_last = 0.0
     _command_rate_seconds = 2.0
 
-    async def _tg_reply(chat_id: str, text: str) -> None:
-        """Reply privately without entering the public alert log/outbox."""
+    async def _tg_reply(
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> None:
+        """Send a command result directly, outside the alert log/outbox."""
         for chunk in split_message(text):
+            data: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": "true",
+            }
+            if reply_to_message_id is not None:
+                data["reply_parameters"] = json.dumps(
+                    {"message_id": reply_to_message_id}
+                )
+            if message_thread_id is not None:
+                data["message_thread_id"] = message_thread_id
             response = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                data={
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "disable_web_page_preview": "true",
-                },
+                data=data,
             )
             response.raise_for_status()
             if not response.json().get("ok"):
@@ -3347,7 +3361,7 @@ async def _run() -> None:
         await _tg_reply(chat_id, f"Unknown command: /{command}\n\n{format_help()}")
 
     async def telegram_command_listener() -> None:
-        """Long-poll Telegram and serve read-only commands to the owner DM."""
+        """Serve owner commands from DM or the linked discussion group."""
         nonlocal _command_rate_last
         if not (tg_token and tg_owner):
             health.mark_disabled(
@@ -3360,14 +3374,54 @@ async def _run() -> None:
             health.mark_down("telegram_commands", "invalid owner user id")
             return
 
+        discussion_id: int | None = None
+        configured_discussion = os.getenv(
+            "TELEGRAM_DISCUSSION_CHAT_ID", ""
+        ).strip()
+        if configured_discussion:
+            try:
+                discussion_id = int(configured_discussion)
+            except ValueError:
+                health.mark_degraded(
+                    "telegram_commands",
+                    error="invalid TELEGRAM_DISCUSSION_CHAT_ID",
+                )
+        elif tg_channel:
+            try:
+                response = await tg_client.get(
+                    f"https://api.telegram.org/bot{tg_token}/getChat",
+                    params={"chat_id": tg_channel},
+                )
+                response.raise_for_status()
+                body = response.json()
+                if body.get("ok"):
+                    linked_id = (body.get("result") or {}).get("linked_chat_id")
+                    if linked_id is not None:
+                        discussion_id = int(linked_id)
+            except Exception:
+                log.exception("could not resolve linked Telegram discussion chat")
+
         try:
-            await tg_client.post(
-                f"https://api.telegram.org/bot{tg_token}/setMyCommands",
-                data={
-                    "commands": json.dumps(_telegram_commands),
-                    "scope": json.dumps({"type": "chat", "chat_id": owner_id}),
-                },
-            )
+            scopes = [{"type": "chat", "chat_id": owner_id}]
+            if discussion_id is not None:
+                scopes.append(
+                    {
+                        "type": "chat_member",
+                        "chat_id": discussion_id,
+                        "user_id": owner_id,
+                    }
+                )
+            for scope in scopes:
+                response = await tg_client.post(
+                    f"https://api.telegram.org/bot{tg_token}/setMyCommands",
+                    data={
+                        "commands": json.dumps(_telegram_commands),
+                        "scope": json.dumps(scope),
+                    },
+                )
+                response.raise_for_status()
+                if not response.json().get("ok"):
+                    raise RuntimeError("Telegram rejected command menu")
         except Exception:
             log.exception("could not register Telegram command menu")
 
@@ -3431,36 +3485,51 @@ async def _run() -> None:
                         datetime.now(timezone.utc).isoformat(),
                     )
                     message = update.get("message") or {}
-                    sender_id = message.get("from", {}).get("id")
-                    chat = message.get("chat") or {}
-                    if sender_id != owner_id:
-                        continue
-                    if chat.get("type") != "private" or chat.get("id") != owner_id:
-                        continue
                     parsed = parse_command(message.get("text") or "")
                     if parsed is None:
                         continue
+                    output_chat = command_output_chat(
+                        message,
+                        owner_id=owner_id,
+                        discussion_chat_id=discussion_id,
+                        channel_id=tg_channel,
+                    )
+                    if output_chat is None:
+                        continue
+                    origin_chat = str((message.get("chat") or {}).get("id"))
+                    in_discussion = output_chat != origin_chat
+                    feedback_kwargs = {
+                        "reply_to_message_id": message.get("message_id"),
+                        "message_thread_id": message.get("message_thread_id"),
+                    } if in_discussion else {}
                     now_mono = time.monotonic()
                     if now_mono - _command_rate_last < _command_rate_seconds:
                         await _tg_reply(
-                            str(owner_id),
+                            origin_chat,
                             "Please wait a moment before sending another command.",
+                            **feedback_kwargs,
                         )
                         continue
                     _command_rate_last = now_mono
                     command, args = parsed
                     try:
                         await _handle_tg_command(
-                            command, args, str(owner_id)
+                            command, args, output_chat
                         )
                     except Exception as exc:
                         log.exception("Telegram command /%s failed", command)
                         await _tg_reply(
-                            str(owner_id),
+                            origin_chat,
                             f"/{command} failed temporarily: {type(exc).__name__}",
+                            **feedback_kwargs,
                         )
                 health.mark_up(
-                    "telegram_commands", detail="owner-only long polling"
+                    "telegram_commands",
+                    detail=(
+                        "owner DM + discussion-to-channel"
+                        if discussion_id is not None
+                        else "owner DM; discussion chat not configured/linked"
+                    ),
                 )
             except asyncio.CancelledError:
                 raise

@@ -2,6 +2,7 @@ import logging
 
 from src.dashboard import _SecretRedactionFilter
 from src.telegram_commands import (
+    command_output_chat,
     format_fills,
     format_health,
     format_orders,
@@ -13,6 +14,50 @@ from src.telegram_commands import (
     parse_count_and_source,
     split_message,
 )
+
+
+def test_command_output_chat_routes_owner_dm_privately():
+    message = {
+        "from": {"id": 42},
+        "chat": {"id": 42, "type": "private"},
+    }
+    assert command_output_chat(
+        message,
+        owner_id=42,
+        discussion_chat_id=-200,
+        channel_id="-100",
+    ) == "42"
+
+
+def test_command_output_chat_routes_owner_discussion_to_channel():
+    message = {
+        "from": {"id": 42},
+        "chat": {"id": -200, "type": "supergroup"},
+    }
+    assert command_output_chat(
+        message,
+        owner_id=42,
+        discussion_chat_id=-200,
+        channel_id="-100",
+    ) == "-100"
+
+
+def test_command_output_chat_rejects_other_users_chats_and_anonymous_admins():
+    cases = [
+        {"from": {"id": 99}, "chat": {"id": -200, "type": "supergroup"}},
+        {"from": {"id": 42}, "chat": {"id": -201, "type": "supergroup"}},
+        {
+            "sender_chat": {"id": -100},
+            "chat": {"id": -200, "type": "supergroup"},
+        },
+    ]
+    for message in cases:
+        assert command_output_chat(
+            message,
+            owner_id=42,
+            discussion_chat_id=-200,
+            channel_id="-100",
+        ) is None
 
 
 def test_telegram_token_is_redacted_from_http_logs():

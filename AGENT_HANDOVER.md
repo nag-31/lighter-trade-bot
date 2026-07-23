@@ -414,11 +414,16 @@ key. If one L1 address has subaccounts, repeat the source with the same
 - Source, market, position-side, and native trade IDs form the v2 event identity.
 - SQLite schema v2 adds source-scoped IDs, persisted cursors, unique event IDs,
   and a persistent Telegram outbox.
-- The production dashboard long-polls Telegram for owner-DM commands:
+- The production dashboard long-polls Telegram for owner commands:
   `/positions`, `/orders`, `/trades`, `/fills`, `/pnl`, `/stats`, `/risk`,
   `/sources`, `/health`, `/dashboard`, `/version`, and `/help`.
+- Owner DMs receive private replies. When the owner issues a command in the
+  channel's linked discussion group, the result is published to
+  `TELEGRAM_CHANNEL_ID`. The linked group is discovered with Telegram
+  `getChat`; `TELEGRAM_DISCUSSION_CHAT_ID` is the explicit fallback/override.
 - Command replies are read-only, owner-only, rate-limited, privacy transformed,
-  split below Telegram limits, and excluded from the public alert log.
+  split below Telegram limits, and excluded from the alert outbox. Commands
+  from other users, other groups, and anonymous administrators are ignored.
 - The Telegram update cursor is persisted under source id
   `__telegram_commands__`; old commands are not replayed after a restart.
 - HTTP log records redact the Telegram bot token.

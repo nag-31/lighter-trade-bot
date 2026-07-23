@@ -10,6 +10,36 @@ MAX_TELEGRAM_TEXT = 3900
 MAX_LIST_ROWS = 25
 
 
+def command_output_chat(
+    message: dict,
+    *,
+    owner_id: int,
+    discussion_chat_id: int | None,
+    channel_id: str,
+) -> str | None:
+    """Return the safe output chat for an authorized command message.
+
+    Owner DMs are answered privately. Commands sent by the owner in the one
+    configured discussion group are published to the alert channel. Everything
+    else is ignored, including commands from anonymous administrators.
+    """
+    sender_id = (message.get("from") or {}).get("id")
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    chat_type = str(chat.get("type") or "")
+    if sender_id != owner_id:
+        return None
+    if chat_type == "private" and chat_id == owner_id:
+        return str(owner_id)
+    if (
+        discussion_chat_id is not None
+        and chat_type in {"group", "supergroup"}
+        and chat_id == discussion_chat_id
+    ):
+        return str(channel_id)
+    return None
+
+
 def parse_command(text: str) -> tuple[str, list[str]] | None:
     """Parse `/command args` and tolerate Telegram's `/command@bot` form."""
     value = str(text or "").strip()
@@ -323,4 +353,3 @@ def format_health(health: dict) -> str:
 
 def filter_rows_by_source(rows: list[dict], source: str) -> list[dict]:
     return [row for row in rows if _source_matches(row, source)]
-
