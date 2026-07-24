@@ -499,6 +499,11 @@ key. If one L1 address has subaccounts, repeat the source with the same
   existing rows were all older than the fetched window. No reconciliation
   `--apply`, deployment, or service restart was performed during this audit.
 
+Fresh read-only check on 2026-07-25: `lighterbot` remained active, the VM still
+did not contain the local rate-limit/PnL markers, and the outbox still had the
+same 9 historical failed rows plus 136 sent rows. There were no exact duplicate
+alert texts in the latest 24 hours; the 7-day window had one duplicate pair.
+
 ### Validation, migration, and reload
 
 Redacted validation:
