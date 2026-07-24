@@ -471,7 +471,11 @@ key. If one L1 address has subaccounts, repeat the source with the same
   changes are tested locally but have not been deployed to the VM yet. Missing
   per-fill PnL is also kept as unknown during round-trip aggregation instead of
   being converted to a zero-dollar loss; reduce batches preserve that unknown
-  state even when a later fill has a known PnL.
+  state even when a later fill has a known PnL. Telegram channel delivery now
+  serializes sends, spaces requests, honors bounded 429 `retry_after` delays,
+  and re-checks identical-text deduplication after queueing. The production
+  failures audited on 2026-07-23 were Telegram 429 responses, so this is the
+  direct fix for that alert-loss path.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 

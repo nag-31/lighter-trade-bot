@@ -21,9 +21,25 @@ from typing import Optional
 import pytest
 
 from src.position_tracker import PositionTracker
+from src.dashboard import _telegram_retry_after
 from src.filters import passes_min_notional
 from src.types import Event, EventKind, Position
 from tests.conftest import make_position, make_trade
+
+
+class TestTelegramRateLimitParsing:
+    def test_retry_after_is_read_from_429_response(self):
+        assert _telegram_retry_after({
+            "ok": False,
+            "error_code": 429,
+            "parameters": {"retry_after": 33},
+        }) == 33.0
+
+    def test_non_429_response_has_no_retry_delay(self):
+        assert _telegram_retry_after({"ok": False, "error_code": 400}) is None
+
+    def test_malformed_429_defaults_to_one_second(self):
+        assert _telegram_retry_after({"ok": False, "error_code": 429}) == 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

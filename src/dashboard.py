@@ -116,6 +116,16 @@ def _safe_telegram_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: Telegram request failed"
 
 
+def _telegram_retry_after(body: Any) -> float | None:
+    """Return Telegram's 429 retry delay, or None for non-rate-limit errors."""
+    if not isinstance(body, dict) or body.get("error_code") != 429:
+        return None
+    try:
+        return max(0.0, float((body.get("parameters") or {}).get("retry_after", 1)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _acquire_pid_lock() -> bool:
     """Return True if we successfully claimed the singleton lock, False if another instance is running."""
     if PIDFILE.exists():
@@ -1432,6 +1442,71 @@ async def _run() -> None:
         except Exception:
             log.exception("failed to persist tg alert")
 
+    # Telegram applies per-chat and per-bot rate limits. Serialize channel
+    # sends, leave a small gap between requests, and honor 429 retry_after
+    # responses so alerts are delayed and delivered instead of being dropped.
+    _tg_channel_lock = asyncio.Lock()
+    _tg_next_send_at = 0.0
+    _TG_MIN_INTERVAL = 1.1
+    _TG_MAX_RETRIES = 2
+    _TG_MAX_RETRY_AFTER = 120.0
+
+    async def _tg_channel_post(
+        endpoint: str,
+        *,
+        dedup_hash: str | None = None,
+        **kwargs,
+    ):
+        nonlocal _tg_next_send_at
+        async with _tg_channel_lock:
+            # Re-check after waiting for the lock. A concurrent sender may
+            # have delivered identical text while this call was queued.
+            if dedup_hash and dedup_hash in _tg_sent:
+                return None, {"ok": True, "_dedup": True}
+
+            for attempt in range(_TG_MAX_RETRIES + 1):
+                wait_for = _tg_next_send_at - time.monotonic()
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+                response = await tg_client.post(
+                    f"https://api.telegram.org/bot{tg_token}/{endpoint}",
+                    **kwargs,
+                )
+                try:
+                    body = response.json()
+                except Exception:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                _tg_next_send_at = time.monotonic() + _TG_MIN_INTERVAL
+                if body.get("ok"):
+                    return response, body
+
+                error_code = body.get("error_code")
+                if error_code != 429 or attempt >= _TG_MAX_RETRIES:
+                    return response, body
+                retry_after = _telegram_retry_after(body) or 1.0
+                if retry_after > _TG_MAX_RETRY_AFTER:
+                    log.warning(
+                        "Telegram %s rate limit retry_after=%ss exceeds cap; "
+                        "leaving alert retryable in outbox",
+                        endpoint,
+                        retry_after,
+                    )
+                    return response, body
+                log.warning(
+                    "Telegram %s rate limited; retrying in %.0fs (%d/%d)",
+                    endpoint,
+                    retry_after,
+                    attempt + 1,
+                    _TG_MAX_RETRIES,
+                )
+                _tg_next_send_at = max(
+                    _tg_next_send_at, time.monotonic() + retry_after
+                )
+
+        return None, {"ok": False, "error_code": "retry_exhausted"}
+
     async def tg_send(text: str, event_uid: str = "") -> None:
         h = hashlib.md5(text.encode()).hexdigest()
         now = time.monotonic()
@@ -1459,19 +1534,33 @@ async def _run() -> None:
             log.info("tg_send: another sender owns pending alert %s", outbox_uid)
             return
         try:
-            r = await tg_client.post(
-                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+            r, body = await _tg_channel_post(
+                "sendMessage",
+                dedup_hash=h,
                 data={"chat_id": tg_channel, "text": text},
             )
-            if not r.json().get("ok"):
-                log.warning("tg sendMessage failed: %s", r.text[:200])
-                health.mark_down("telegram", error=f"sendMessage API error: {r.text[:120]}")
+            if body.get("_dedup"):
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "sent",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+            elif not body.get("ok"):
+                log.warning(
+                    "tg sendMessage failed: error_code=%s",
+                    body.get("error_code", "unknown"),
+                )
+                health.mark_down(
+                    "telegram",
+                    error=f"sendMessage API error: {body.get('error_code', 'unknown')}",
+                )
                 await mark_notification(
                     DB_PATH,
                     outbox_uid,
                     "failed",
                     datetime.now(timezone.utc).isoformat(),
-                    "Telegram API rejected sendMessage",
+                    f"Telegram API rejected sendMessage ({body.get('error_code', 'unknown')})",
                 )
             else:
                 health.mark_up("telegram")
@@ -1528,19 +1617,22 @@ async def _run() -> None:
             log.info("tg_send_photo: another sender owns pending alert %s", outbox_uid)
             return
         try:
-            r = await tg_client.post(
-                f"https://api.telegram.org/bot{tg_token}/sendPhoto",
+            r, body = await _tg_channel_post(
+                "sendPhoto",
                 data={"chat_id": tg_channel, "caption": caption},
                 files={"photo": ("card.png", image_bytes, "image/png")},
             )
-            if not r.json().get("ok"):
-                log.warning("tg sendPhoto failed: %s", r.text[:200])
+            if not body.get("ok"):
+                log.warning(
+                    "tg sendPhoto failed: error_code=%s",
+                    body.get("error_code", "unknown"),
+                )
                 await mark_notification(
                     DB_PATH,
                     outbox_uid,
                     "failed",
                     datetime.now(timezone.utc).isoformat(),
-                    "Telegram API rejected sendPhoto",
+                    f"Telegram API rejected sendPhoto ({body.get('error_code', 'unknown')})",
                 )
                 if caption:
                     await tg_send(caption, event_uid=f"{outbox_uid}:fallback")
