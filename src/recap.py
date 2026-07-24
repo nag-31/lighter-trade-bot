@@ -32,10 +32,11 @@ async def compute(lighter: LighterClient, window: str) -> Recap:
 
 def format_recap(r: Recap, pool_url: str) -> str:
     label = "Daily" if r.window == "day" else "Weekly"
-    sign = "+" if r.pnl_usd >= 0 else ""
+    usd_sign = "+" if r.pnl_usd >= 0 else "-"
+    pct_sign = "+" if r.pnl_pct >= 0 else "-"
     return (
         f"{label} recap\n"
-        f"P&L: {sign}${r.pnl_usd:,.0f} ({sign}{r.pnl_pct:.2f}%)\n"
+        f"P&L: {usd_sign}${abs(r.pnl_usd):,.0f} ({pct_sign}{abs(r.pnl_pct):.2f}%)\n"
         f"Trades: {r.trades}  W/L: {r.wins}/{r.losses}\n"
         f"{pool_url}"
     )

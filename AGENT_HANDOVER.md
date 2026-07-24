@@ -277,11 +277,23 @@ are genuine standalone trades — kept.
 
 ```bash
 cd "D:\content\crypto scientist\lighter-trade-bot"
-python -m pytest tests/ -v
+python -B -m pytest tests/ -v
 ```
 
 Test files cover: round-trip aggregation, reconcile logic, Binance client,
-HL client, display transforms, privacy, stats, PnL cards, filters, health.
+HL client, display transforms, privacy, stats, PnL cards, filters, health,
+source validation, authoritative/stale snapshots, restart supervision, config
+defaults, SQLite cursors/outbox idempotency, dashboard payload serialization,
+and frontend/API contract smoke checks. The full suite currently contains
+842 passing tests. Coverage is generated with:
+
+```bash
+python -B -m pytest --cov=src --cov-report=term-missing --cov-report=json -q
+```
+
+The test pass also protects two operational fixes: string values such as
+`chart.enabled: "false"` are parsed as false, and negative recap P&L is
+formatted as `-$1,234` rather than `$-1,234`.
 
 ---
 
@@ -441,6 +453,9 @@ key. If one L1 address has subaccounts, repeat the source with the same
   startup restores processed fill identities from `events.event_uid` and primes
   each DEX's independent trade cursor from the current API window. A single
   global cursor must never be used to classify HIP-3 fills.
+- The expanded regression suite treats a failed/stale position response as
+  non-authoritative, so it cannot trigger a false close or alert storm; an
+  authoritative empty response still clears the source normally.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 
