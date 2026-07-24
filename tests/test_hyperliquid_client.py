@@ -398,6 +398,21 @@ class TestFetchRealizingFillsLimit:
         assert len(result) == 3
         assert result[-1].trade_id == 9
 
+    def test_cross_dex_order_and_limit_use_timestamp_not_global_tid(self):
+        c = make_client()
+        fills = [
+            _raw_fill(tid=900, coin="BTC", closed_pnl="9", dir_="Close Long", time_ms=1700000003000),
+            _raw_fill(tid=2, coin="xyz:XYZ100", closed_pnl="2", dir_="Close Long", time_ms=1700000001000),
+            _raw_fill(tid=3, coin="xyz:XYZ100", closed_pnl="3", dir_="Close Long", time_ms=1700000002000),
+        ]
+        with patch.object(c._info, "user_fills", return_value=fills):
+            result = _run(c.fetch_realizing_fills(limit=2))
+
+        assert [(t.market_symbol, t.trade_id) for t in result] == [
+            ("XYZ:XYZ100", 3),
+            ("BTC", 900),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Regression test: multi-coin cascade bug

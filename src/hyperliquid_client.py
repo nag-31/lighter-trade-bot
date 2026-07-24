@@ -658,8 +658,10 @@ class HyperliquidClient:
 
             trades.append(t)
 
-        # Oldest-first (convenient for sequential recording)
-        trades.sort(key=lambda x: x.trade_id)
+        # TIDs are only monotonic within one DEX namespace. Sorting globally by
+        # tid can reorder a HIP-3 close and evict newer HIP-3 fills from a
+        # cross-DEX limit window. Use timestamp for the global order.
+        trades.sort(key=lambda x: (x.timestamp, x.trade_id, x.market_symbol))
 
         # Cap to limit
         if limit:

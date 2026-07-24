@@ -570,10 +570,10 @@ def _enqueue_notification_sync(
     destination: str,
     payload: str,
     now_iso: str,
-) -> None:
+) -> bool:
     con = sqlite3.connect(path)
     try:
-        con.execute(
+        cursor = con.execute(
             "INSERT INTO notification_outbox"
             "(event_uid, destination, payload, status, created_at, updated_at) "
             "VALUES (?, ?, ?, 'pending', ?, ?) "
@@ -581,6 +581,7 @@ def _enqueue_notification_sync(
             (event_uid, destination, payload, now_iso, now_iso),
         )
         con.commit()
+        return cursor.rowcount == 1
     finally:
         con.close()
 
@@ -606,8 +607,8 @@ async def notification_status(path: Path, event_uid: str) -> str | None:
 
 async def enqueue_notification(
     path: Path, event_uid: str, destination: str, payload: str, now_iso: str
-) -> None:
-    await asyncio.to_thread(
+) -> bool:
+    return await asyncio.to_thread(
         _enqueue_notification_sync,
         path,
         event_uid,

@@ -7,12 +7,14 @@ from src.stats import aggregate_round_trips, compute_stats, filter_trades
 
 
 def _row(ts, sym, pnl, kind, *, source="HL", side="long",
-         entry="100", exit="110", size="1", notional="110", card=None):
+         entry="100", exit="110", size="1", notional="110", card=None,
+         position_side="BOTH"):
     return {
         "ts": ts, "source": source, "market_symbol": sym, "side": side,
         "entry": entry, "exit": exit, "size": size, "notional": notional,
         "pnl": str(pnl), "realization_kind": kind,
         "card_path": card or f"/cards/{sym}_{kind}_{ts[-8:]}.png",
+        "position_side": position_side,
     }
 
 
@@ -93,6 +95,21 @@ def test_multi_coin_independent_grouping():
     agg = _by_sym(aggregate_round_trips(rows))
     assert agg["ETH"]["pnl"] == 50.0 and agg["ETH"]["n_fills"] == 2
     assert agg["BTC"]["pnl"] == 5.0 and agg["BTC"]["n_fills"] == 1
+
+
+def test_hedge_position_sides_are_independent_round_trips():
+    rows = [
+        _row("2026-01-01T00:00:00Z", "BTC", 10, "FULL", position_side="LONG"),
+        _row("2026-01-01T00:00:01Z", "BTC", -7, "FULL", position_side="SHORT"),
+    ]
+
+    agg = aggregate_round_trips(rows)
+
+    assert len(agg) == 2
+    assert {(r["position_side"], r["pnl"]) for r in agg} == {
+        ("LONG", 10.0),
+        ("SHORT", -7.0),
+    }
 
 
 def test_unsorted_input_is_segmented_by_time():

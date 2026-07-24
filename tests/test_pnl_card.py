@@ -6,7 +6,7 @@ from typing import Optional
 
 import pytest
 
-from src.pnl_card import calculate_pnl
+from src.pnl_card import _score_window, calculate_pnl, peek_result, record_result
 from src.types import Event, EventKind, Position, Trade
 from tests.conftest import make_position, make_trade
 
@@ -53,6 +53,14 @@ def make_close_event(
 # ---------------------------------------------------------------------------
 
 class TestCalculatePnlExchangeReported:
+    def test_unknown_full_close_does_not_count_as_a_loss(self):
+        _score_window.clear()
+        record_result(True)
+
+        assert record_result(None) == (1, 1)
+        assert peek_result() == (1, 1)
+        _score_window.clear()
+
     def test_uses_realized_pnl_when_set(self):
         """HL fill carries closedPnl — use it directly, don't recalculate."""
         ev = make_close_event(

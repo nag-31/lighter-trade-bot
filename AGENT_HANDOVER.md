@@ -285,7 +285,7 @@ HL client, display transforms, privacy, stats, PnL cards, filters, health,
 source validation, authoritative/stale snapshots, restart supervision, config
 defaults, SQLite cursors/outbox idempotency, dashboard payload serialization,
 and frontend/API contract smoke checks. The full suite currently contains
-842 passing tests. Coverage is generated with:
+847 passing tests. Coverage is generated with:
 
 ```bash
 python -B -m pytest --cov=src --cov-report=term-missing --cov-report=json -q
@@ -456,6 +456,15 @@ key. If one L1 address has subaccounts, repeat the source with the same
 - The expanded regression suite treats a failed/stale position response as
   non-authoritative, so it cannot trigger a false close or alert storm; an
   authoritative empty response still clears the source normally.
+- Correctness hardening added locally on 2026-07-24: HIP-3 realizing fills are
+  ordered/limited by timestamp across DEX namespaces; same-millisecond close
+  bursts use descending `startPosition` to restore the flattening sequence;
+  exchange-truth fills missed by WS are persisted as PARTIAL rows before the
+  live FULL close so cards, DB history, and stats agree; hedge LONG/SHORT
+  round-trips stay isolated; unknown PnL does not become a card loss; and the
+  Telegram outbox atomically claims pending sends and only applies in-memory
+  dedup after confirmed delivery. These changes are tested locally but have
+  not been deployed to the VM yet.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 

@@ -156,6 +156,44 @@ def _trade_dedup_key(trade: Trade, source_id: str = "") -> str:
     return trade.event_uid(source_id)
 
 
+def _realization_sequence_key(trade: Trade) -> tuple:
+    """Order close fills chronologically, restoring same-ms flattening order."""
+    start_position = trade.start_position
+    return (
+        trade.timestamp,
+        -abs(start_position) if start_position is not None else Decimal(0),
+        trade.trade_id,
+        trade.market_symbol,
+    )
+
+
+def _unrecorded_realizing_fills(
+    fills: list[Trade],
+    recorded: set[str],
+    source_id: str,
+    current_trade: Trade,
+) -> list[Trade]:
+    """Return exchange fills missing from local realization persistence.
+
+    A live close can arrive before REST history catches up, while REST can
+    reveal scale-outs missed by the WebSocket. Keep the repair set scoped by
+    source/market/position identity and leave the live close to the normal
+    close-recording path.
+    """
+    current_key = current_trade.event_uid(source_id)
+    out: list[Trade] = []
+    seen: set[str] = set()
+    for fill in sorted(fills, key=_realization_sequence_key):
+        if fill.timestamp > current_trade.timestamp:
+            continue
+        key = fill.event_uid(source_id)
+        if key == current_key or key in recorded or key in seen:
+            continue
+        seen.add(key)
+        out.append(fill)
+    return out
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -1403,10 +1441,12 @@ async def _run() -> None:
             log.info("tg_send: persistent outbox suppressed already-sent alert")
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        await enqueue_notification(
+        claimed = await enqueue_notification(
             DB_PATH, outbox_uid, f"telegram:{tg_channel}", text, now_iso
         )
-        _tg_sent[h] = now
+        if not claimed and await notification_status(DB_PATH, outbox_uid) == "pending":
+            log.info("tg_send: another sender owns pending alert %s", outbox_uid)
+            return
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -1425,6 +1465,7 @@ async def _run() -> None:
             else:
                 health.mark_up("telegram")
                 await _record_tg_alert("text", text)
+                _tg_sent[h] = time.monotonic()
                 await mark_notification(
                     DB_PATH,
                     outbox_uid,
@@ -1465,13 +1506,16 @@ async def _run() -> None:
         )
         if await notification_status(DB_PATH, outbox_uid) == "sent":
             return
-        await enqueue_notification(
+        claimed = await enqueue_notification(
             DB_PATH,
             outbox_uid,
             f"telegram:{tg_channel}",
             log_text or caption or "PnL card",
             datetime.now(timezone.utc).isoformat(),
         )
+        if not claimed and await notification_status(DB_PATH, outbox_uid) == "pending":
+            log.info("tg_send_photo: another sender owns pending alert %s", outbox_uid)
+            return
         try:
             r = await tg_client.post(
                 f"https://api.telegram.org/bot{tg_token}/sendPhoto",
@@ -1616,7 +1660,10 @@ async def _run() -> None:
         )
 
     def _roundtrip_partial_pnl(
-        source_id: str, source_name: str, market_symbol: str
+        source_id: str,
+        source_name: str,
+        market_symbol: str,
+        position_side: str = "BOTH",
     ) -> Decimal:
         """Sum the realized PnL of the CURRENT (not-yet-closed) round-trip's
         PARTIAL rows for this (source, coin).
@@ -1631,6 +1678,7 @@ async def _run() -> None:
             if (
                 not _row_belongs_to_source(row, source_id, source_name)
                 or row.get("market_symbol") != market_symbol
+                or (row.get("position_side") or "BOTH") != position_side
             ):
                 continue
             # ANY non-PARTIAL row (FULL, legacy NULL, unknown) closes a round-trip
@@ -1648,7 +1696,10 @@ async def _run() -> None:
         return total
 
     def _roundtrip_start_ts(
-        source_id: str, source_name: str, market_symbol: str
+        source_id: str,
+        source_name: str,
+        market_symbol: str,
+        position_side: str = "BOTH",
     ) -> "str | None":
         """ISO ts of the OLDEST recorded PARTIAL in the current (not-yet-closed)
         round-trip for this (source, coin), or None if it has no partials.
@@ -1658,6 +1709,7 @@ async def _run() -> None:
             if (
                 not _row_belongs_to_source(row, source_id, source_name)
                 or row.get("market_symbol") != market_symbol
+                or (row.get("position_side") or "BOTH") != position_side
             ):
                 continue
             if (row.get("realization_kind") or "").upper() != "PARTIAL":
@@ -1743,7 +1795,9 @@ async def _run() -> None:
         # Partial cards just display the current record.
         if kind == "FULL":
             _trade_pnl = card_pnl_override if card_pnl_override is not None else realized_pnl
-            wins, total = record_result(_trade_pnl is not None and _trade_pnl > 0)
+            wins, total = record_result(
+                None if _trade_pnl is None else _trade_pnl > 0
+            )
         else:
             wins, total = peek_result()
 
@@ -2366,11 +2420,15 @@ async def _run() -> None:
                                         not in _recorded_realizations
                                     )
                                 ]
+                                _sc_new.sort(key=_realization_sequence_key)
                                 # Partials already booked for this round-trip BEFORE
                                 # this loop inserts any rows (capture once to avoid
                                 # double-counting the rows we add below).
                                 _sc_prior = _roundtrip_partial_pnl(
-                                    src.id, src.name, pos.market_symbol
+                                    src.id,
+                                    src.name,
+                                    pos.market_symbol,
+                                    pos.position_side,
                                 )
                                 # This unobserved close may span several fills. Mark
                                 # all but the last as PARTIAL and the last as FULL so
@@ -2714,7 +2772,10 @@ async def _run() -> None:
                     # pending reduce batch was flushed just above, so those PARTIAL
                     # rows are already in closed_trades.
                     _rt_partials = _roundtrip_partial_pnl(
-                        src.id, src.name, ev.trade.market_symbol
+                        src.id,
+                        src.name,
+                        ev.trade.market_symbol,
+                        ev.trade.position_side,
                     )
                     _card_total = (
                         (_rt_partials + realized)
@@ -2732,7 +2793,10 @@ async def _run() -> None:
                     # total on any API hiccup.
                     if src.is_hyperliquid and realized is not None:
                         _rt_start = _roundtrip_start_ts(
-                            src.id, src.name, ev.trade.market_symbol
+                            src.id,
+                            src.name,
+                            ev.trade.market_symbol,
+                            ev.trade.position_side,
                         )
                         if _rt_start is not None:
                             try:
@@ -2743,6 +2807,40 @@ async def _run() -> None:
                                     market_id=ev.trade.market_id,
                                     start_time_ms=int(_rt_start_dt.timestamp() * 1000) - 2000,
                                 )
+                                # Repair scale-outs missed by WS before writing
+                                # the current FULL close. Adjusting only the card
+                                # would make the image agree with HL while the
+                                # DB, stats, and dashboard history remained low.
+                                _missing_ex_fills = _unrecorded_realizing_fills(
+                                    _ex_fills,
+                                    _recorded_realizations,
+                                    src.id,
+                                    ev.trade,
+                                )
+                                for _missing_fill in _missing_ex_fills:
+                                    if pos_b is None:
+                                        break
+                                    _missing_pnl = _missing_fill.realized_pnl
+                                    if _missing_pnl is None and pos_b is not None:
+                                        _missing_pnl = _lighter_realized(
+                                            pos_b.side,
+                                            pos_b.avg_entry_price,
+                                            _missing_fill.price,
+                                            _missing_fill.size,
+                                        )
+                                    await record_realization(
+                                        src=src,
+                                        kind="PARTIAL",
+                                        trade=_missing_fill,
+                                        position_before=pos_b,
+                                        realized_pnl=_missing_pnl,
+                                        reduced_size=_missing_fill.size,
+                                        fill_price=_missing_fill.price,
+                                        avg_entry=pos_b.avg_entry_price,
+                                        leverage=None,
+                                        fill_ids=[_missing_fill.trade_id],
+                                        anchor_entry=_close_anchor,
+                                    )
                                 _ex_total = Decimal(0)
                                 for _exf in _ex_fills:
                                     if _exf.realized_pnl is not None:

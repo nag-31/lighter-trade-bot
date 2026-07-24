@@ -64,8 +64,8 @@ def test_source_cursor_upsert_is_scoped_by_source_and_key(tmp_path):
 def test_notification_outbox_is_idempotent_and_counts_attempts(tmp_path):
     db = tmp_path / "events.db"
     _run(init_db(db))
-    _run(enqueue_notification(db, "event-1", "telegram", "first", "t1"))
-    _run(enqueue_notification(db, "event-1", "telegram", "second", "t2"))
+    assert _run(enqueue_notification(db, "event-1", "telegram", "first", "t1")) is True
+    assert _run(enqueue_notification(db, "event-1", "telegram", "second", "t2")) is False
 
     _run(mark_notification(db, "event-1", "failed", "t3", "timeout"))
     _run(mark_notification(db, "event-1", "sent", "t4"))
