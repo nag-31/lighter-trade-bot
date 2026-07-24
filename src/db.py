@@ -571,13 +571,23 @@ def _enqueue_notification_sync(
     payload: str,
     now_iso: str,
 ) -> bool:
+    # A failed delivery is retryable, but the retry must be claimed atomically
+    # so two concurrent producers cannot both resend the same alert.  Pending
+    # rows are treated as a short lease: if the process died during delivery,
+    # a later attempt may reclaim the row after five minutes.
     con = sqlite3.connect(path)
     try:
         cursor = con.execute(
             "INSERT INTO notification_outbox"
             "(event_uid, destination, payload, status, created_at, updated_at) "
             "VALUES (?, ?, ?, 'pending', ?, ?) "
-            "ON CONFLICT(event_uid) DO NOTHING",
+            "ON CONFLICT(event_uid) DO UPDATE SET "
+            "destination=excluded.destination, payload=excluded.payload, "
+            "status='pending', updated_at=excluded.updated_at, last_error=NULL "
+            "WHERE notification_outbox.status='failed' "
+            "OR (notification_outbox.status='pending' "
+            "AND (julianday(excluded.updated_at) "
+            "- julianday(notification_outbox.updated_at)) * 86400 >= 300)",
             (event_uid, destination, payload, now_iso, now_iso),
         )
         con.commit()

@@ -81,6 +81,45 @@ def test_notification_outbox_is_idempotent_and_counts_attempts(tmp_path):
     assert _run(notification_status(db, "missing")) is None
 
 
+def test_failed_notification_retry_is_atomically_reclaimed(tmp_path):
+    db = tmp_path / "events.db"
+    _run(init_db(db))
+    assert _run(enqueue_notification(
+        db, "event-1", "telegram", "first", "2026-01-01T00:00:00+00:00"
+    )) is True
+    _run(mark_notification(
+        db, "event-1", "failed", "2026-01-01T00:00:01+00:00", "rejected"
+    ))
+
+    # A retry takes ownership and refreshes the payload/error state. A second
+    # concurrent claimant sees pending and must not send another copy.
+    assert _run(enqueue_notification(
+        db, "event-1", "telegram", "retry", "2026-01-01T00:00:02+00:00"
+    )) is True
+    assert _run(enqueue_notification(
+        db, "event-1", "telegram", "retry-again", "2026-01-01T00:00:03+00:00"
+    )) is False
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT payload, status, attempts, last_error FROM notification_outbox "
+        "WHERE event_uid=?", ("event-1",)
+    ).fetchone()
+    con.close()
+    assert row == ("retry", "pending", 1, None)
+
+
+def test_stale_pending_notification_lease_can_be_reclaimed(tmp_path):
+    db = tmp_path / "events.db"
+    _run(init_db(db))
+    assert _run(enqueue_notification(
+        db, "event-1", "telegram", "first", "2026-01-01T00:00:00+00:00"
+    )) is True
+    assert _run(enqueue_notification(
+        db, "event-1", "telegram", "retry", "2026-01-01T00:06:00+00:00"
+    )) is True
+
+
 def test_notification_status_rejects_unknown_values(tmp_path):
     db = tmp_path / "events.db"
     _run(init_db(db))

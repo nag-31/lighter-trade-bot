@@ -462,8 +462,10 @@ key. If one L1 address has subaccounts, repeat the source with the same
   exchange-truth fills missed by WS are persisted as PARTIAL rows before the
   live FULL close so cards, DB history, and stats agree; hedge LONG/SHORT
   round-trips stay isolated; unknown PnL does not become a card loss; and the
-  Telegram outbox atomically claims pending sends and only applies in-memory
-  dedup after confirmed delivery. These changes are tested locally but have
+  Telegram outbox atomically claims pending/retry sends, reclaims abandoned
+  leases, and only applies in-memory dedup after confirmed delivery. The
+  reconciliation report compares rebuilt PnL with only the replaced time
+  window (not all historical rows). These changes are tested locally but have
   not been deployed to the VM yet.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.

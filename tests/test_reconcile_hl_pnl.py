@@ -28,6 +28,7 @@ from scripts.hl_pnl_logic import (
     reconstruct_record,
 )
 from src.types import Trade
+from scripts.reconcile_hl_pnl import _print_report
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,33 @@ def _make_fill(
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_reconcile_report_compares_only_the_replaced_window(capsys):
+    existing_rows = [
+        {"ts": "2026-01-01T00:00:00+00:00", "pnl": "100"},
+        {"ts": "2026-01-02T00:00:00+00:00", "pnl": "25"},
+    ]
+    existing_window_rows = [existing_rows[1]]
+    rebuilt = [{"pnl": "40", "market_symbol": "BTC"}]
+
+    _print_report(
+        existing_rows,
+        existing_window_rows,
+        rebuilt,
+        "HL",
+        dry_run=True,
+        t0_iso="2026-01-02T00:00:00+00:00",
+        now_iso="2026-01-03T00:00:00+00:00",
+        rows_replaced=1,
+        rows_preserved=1,
+    )
+    output = capsys.readouterr().out
+    assert "Existing net PnL (all rows) : $+125.00" in output
+    assert "Existing net PnL (window)   : $+25.00" in output
+    assert "Rebuilt net PnL (window)    : $+40.00" in output
+    assert "Window delta                : $+15.00  (+0 rows)" in output
+    assert "(-1 rows)" not in output
 
 
 # ---------------------------------------------------------------------------

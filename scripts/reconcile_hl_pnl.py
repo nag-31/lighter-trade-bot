@@ -242,6 +242,7 @@ def _per_coin_table(records: list[dict]) -> list[tuple[str, int, Decimal]]:
 
 def _print_report(
     existing_rows: list[dict],
+    existing_window_rows: list[dict],
     rebuilt_records: list[dict],
     hl_name: str,
     dry_run: bool,
@@ -252,8 +253,11 @@ def _print_report(
 ) -> None:
     """Print the full reconciliation report including a per-coin breakdown."""
     rebuilt_pnl = _net_pnl(rebuilt_records)
-    existing_pnl = _net_pnl(existing_rows)
-    delta = rebuilt_pnl - existing_pnl
+    existing_total_pnl = _net_pnl(existing_rows)
+    existing_window_pnl = _net_pnl(existing_window_rows)
+    # Compare like with like: the rebuilt records cover only the authoritative
+    # fetch window, so the delta must exclude older rows that will be preserved.
+    delta = rebuilt_pnl - existing_window_pnl
 
     mode = "DRY-RUN" if dry_run else "APPLY"
     print(f"\n{'='*64}")
@@ -281,9 +285,10 @@ def _print_report(
     print(f"  Existing HL rows (ts>=T0)  : {rows_replaced:>6}  ← will be replaced")
     print(f"  Existing HL rows (ts<T0)   : {rows_preserved:>6}  ← preserved untouched")
     print()
-    print(f"  Existing net PnL           : ${existing_pnl:>+,.2f}")
-    print(f"  Rebuilt net PnL            : ${rebuilt_pnl:>+,.2f}")
-    print(f"  Delta (recovered)          : ${delta:>+,.2f}  ({len(rebuilt_records) - len(existing_rows):+d} rows)")
+    print(f"  Existing net PnL (all rows) : ${existing_total_pnl:>+,.2f}")
+    print(f"  Existing net PnL (window)   : ${existing_window_pnl:>+,.2f}")
+    print(f"  Rebuilt net PnL (window)    : ${rebuilt_pnl:>+,.2f}")
+    print(f"  Window delta                : ${delta:>+,.2f}  ({len(rebuilt_records) - rows_replaced:+d} rows)")
     print()
     print(f"  Resulting row count        : {rows_preserved + len(rebuilt_records):>6}")
     print()
@@ -407,15 +412,20 @@ async def main(
         include_legacy=include_legacy,
     )
     if t0_iso is not None:
-        rows_replaced = sum(1 for r in existing_rows if (r.get("ts") or "") >= t0_iso)
+        existing_window_rows = [
+            r for r in existing_rows if (r.get("ts") or "") >= t0_iso
+        ]
+        rows_replaced = len(existing_window_rows)
         rows_preserved = len(existing_rows) - rows_replaced
     else:
+        existing_window_rows = []
         rows_replaced = 0
         rows_preserved = len(existing_rows)
 
     # 9. Print per-coin report (always, dry-run and apply alike)
     _print_report(
         existing_rows,
+        existing_window_rows,
         rebuilt_records,
         hl_source.name,
         dry_run=not apply,
