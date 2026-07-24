@@ -71,6 +71,27 @@ def test_open_excluded_from_closed_only_stats():
     assert s["total_pnl"] == 100.0     # the open ARB +25 is NOT counted
 
 
+def test_unknown_pnl_is_not_fabricated_as_zero_loss():
+    unknown = _row("2026-06-01T10:00:00Z", "BTC", 0, "FULL")
+    unknown["pnl"] = None
+
+    agg = aggregate_round_trips([unknown])
+    assert agg[0]["pnl"] is None
+    assert agg[0]["is_win"] is None
+    assert compute_stats(agg)["n_trades"] == 0
+
+
+def test_partially_unknown_round_trip_is_excluded_from_pnl_stats():
+    known = _row("2026-06-01T09:00:00Z", "ETH", 50, "PARTIAL")
+    unknown = _row("2026-06-01T10:00:00Z", "ETH", 0, "FULL")
+    unknown["pnl"] = None
+
+    agg = aggregate_round_trips([known, unknown])
+    assert len(agg) == 1
+    assert agg[0]["pnl"] is None
+    assert compute_stats(agg)["n_trades"] == 0
+
+
 def test_flip_same_coin_two_round_trips():
     # Long round-trip closes, then a short round-trip on the same coin.
     rows = [

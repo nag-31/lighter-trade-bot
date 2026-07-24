@@ -468,7 +468,9 @@ key. If one L1 address has subaccounts, repeat the source with the same
   window (not all historical rows). The HL realizing-fill client now exposes
   transport failure separately from an authoritative empty result, so the
   daily self-audit cannot report a transient API outage as missing PnL. These
-  changes are tested locally but have not been deployed to the VM yet.
+  changes are tested locally but have not been deployed to the VM yet. Missing
+  per-fill PnL is also kept as unknown during round-trip aggregation instead of
+  being converted to a zero-dollar loss.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 

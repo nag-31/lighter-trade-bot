@@ -270,7 +270,10 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
     aggregated.sort(key=lambda r: _parse_ts(r.get("ts")) or _MIN_DT)
     wins = total = 0
     for rec in aggregated:
-        if (rec.get("realization_kind") or "").upper() == "FULL":
+        if (
+            (rec.get("realization_kind") or "").upper() == "FULL"
+            and _f(rec.get("pnl")) is not None
+        ):
             total += 1
             if rec.get("is_win"):
                 wins += 1
@@ -284,7 +287,14 @@ def aggregate_round_trips(trades: list[dict]) -> list[dict]:
 def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
     """Build one aggregated record from a round-trip's realization rows."""
     last = rows[-1]
-    total_pnl = sum((_f(r.get("pnl")) or 0.0) for r in rows)
+    pnl_values = [_f(r.get("pnl")) for r in rows]
+    # Missing P&L is not zero. A round-trip with one unknown fill is not safe
+    # to include in net P&L, win-rate, or equity-curve calculations.
+    total_pnl = (
+        sum(v for v in pnl_values if v is not None)
+        if all(v is not None for v in pnl_values)
+        else None
+    )
     total_size = sum((_f(r.get("size")) or 0.0) for r in rows)
     total_notional = sum((_f(r.get("notional")) or 0.0) for r in rows)
 
@@ -295,7 +305,11 @@ def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
             cost_basis += e * s
     entry = (cost_basis / total_size) if total_size else _f(last.get("entry"))
     exit_ = _f(last.get("exit"))
-    pct = (total_pnl / cost_basis * 100.0) if cost_basis else None
+    pct = (
+        total_pnl / cost_basis * 100.0
+        if total_pnl is not None and cost_basis
+        else None
+    )
 
     # Carry only safe identity fields from the representative (final) row; the
     # caller re-derives HL *_disp fields from these REAL values.
@@ -313,7 +327,9 @@ def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
         "notional": total_notional,
         "pnl": total_pnl,
         "pct": pct,
-        "is_win": 1 if total_pnl > 0 else 0,
+        "is_win": (
+            (1 if total_pnl > 0 else 0) if total_pnl is not None else None
+        ),
         "leverage": last.get("leverage"),
         "card_path": last.get("card_path"),
         "trade_id": last.get("trade_id"),
