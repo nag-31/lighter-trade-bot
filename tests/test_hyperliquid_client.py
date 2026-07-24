@@ -132,6 +132,17 @@ class TestFetchRealizingFillsFiltering:
 
 
 class TestFetchTradesSinceHip3Cursors:
+    def test_prime_trade_anchors_warms_each_dex_without_returning_fills(self):
+        c = make_client()
+        fills = [
+            _raw_fill(tid=100, coin="BTC"),
+            _raw_fill(tid=7, coin="xyz:AMD"),
+        ]
+        with patch.object(c._info, "user_fills", return_value=fills):
+            _run(c.prime_trade_anchors())
+
+        assert c._last_tid_by_dex == {"": 100, "xyz": 7}
+
     def test_since_filter_uses_independent_dex_tid_anchors(self):
         c = make_client()
         c._last_tid_by_dex = {"": 100, "xyz": 1000}

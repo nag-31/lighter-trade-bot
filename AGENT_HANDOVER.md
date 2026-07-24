@@ -437,6 +437,10 @@ key. If one L1 address has subaccounts, repeat the source with the same
   retry storms.
 - Hyperliquid partial DEX failures and Lighter account failures are
   non-authoritative, so existing positions are retained instead of closed.
+- Hyperliquid/HIP-3 REST replay protection is persistent across restarts:
+  startup restores processed fill identities from `events.event_uid` and primes
+  each DEX's independent trade cursor from the current API window. A single
+  global cursor must never be used to classify HIP-3 fills.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 

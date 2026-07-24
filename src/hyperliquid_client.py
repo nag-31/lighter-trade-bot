@@ -532,6 +532,15 @@ class HyperliquidClient:
 
         return trades[-limit:] if limit else trades
 
+    async def prime_trade_anchors(self) -> None:
+        """Warm every DEX's latest trade cursor without yielding any fills.
+
+        Hyperliquid/HIP-3 trade IDs are only monotonic within their DEX. A
+        single persisted global cursor cannot safely filter a fresh REST
+        window for every namespace after restart.
+        """
+        await self.fetch_trades_since(None, limit=1)
+
     # ------------------------------------------------------------------ #
     # Realizing fills (closes / scale-outs)                               #
     # ------------------------------------------------------------------ #

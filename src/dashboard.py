@@ -37,6 +37,7 @@ from .db import (
     load_closed_trades,
     load_recent_events,
     load_recorded_event_uids,
+    load_recorded_trade_uids,
     load_source_cursor,
     load_tg_alerts,
     mark_notification,
@@ -1023,6 +1024,7 @@ async def _run() -> None:
     # Boot dedup set: union of all fill ids ever recorded — prevents re-recording
     # the same fill after a restart (e.g. reduce batch flushed before crash).
     _recorded_realizations: set[str] = set(await load_recorded_event_uids(DB_PATH))
+    _recorded_trade_uids: set[str] = await load_recorded_trade_uids(DB_PATH)
 
     # ── Re-derive privacy display fields for DB-loaded closed trades ──────────
     # Display fields (entry_disp, …) are in-memory only; after a restart the
@@ -1242,6 +1244,18 @@ async def _run() -> None:
             s.tracker.seed(init_pos)
             _dash_positions[s.id] = init_pos
             log.info("[%s] seeded with %d positions", s.name, len(init_pos))
+            # Restore fill deduplication across restarts. This prevents a REST
+            # replay from turning an old fill into a fresh Telegram alert.
+            s.seen_tids.update(
+                uid for uid in _recorded_trade_uids
+                if uid.startswith(f"{s.id}|")
+            )
+            if s.seen_tids:
+                log.info(
+                    "[%s] restored %d persisted fill identities",
+                    s.name,
+                    len(s.seen_tids),
+                )
             # Arm every already-open position so the reconciler never fires a SL/TP alert
             # for positions that existed before this bot session started.
             for mid in init_pos:
@@ -1266,6 +1280,8 @@ async def _run() -> None:
                         datetime.now(timezone.utc).isoformat(),
                     )
                     log.info("[%s] anchored trade cursor=%d", s.name, s.last_trade_id)
+            if hasattr(s.client, "prime_trade_anchors"):
+                await s.client.prime_trade_anchors()
             # Tell HL client the anchor so WS snapshot is filtered correctly
             if hasattr(s.client, "set_anchor"):
                 s.client.set_anchor(s.last_trade_id)

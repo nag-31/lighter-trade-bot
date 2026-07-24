@@ -476,6 +476,39 @@ async def load_recorded_event_uids(path: Path) -> set[str]:
     return await asyncio.to_thread(_load_recorded_event_uids_sync, path)
 
 
+def _load_recorded_trade_uids_sync(path: Path) -> set[str]:
+    """Return source-scoped fill identities already persisted in ``events``.
+
+    Event rows store ``<fill-uid>|<event-kind>``. Keeping the fill identity
+    across restarts prevents a REST replay from being classified as a new
+    position change and sent to Telegram again.
+    """
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(
+            "SELECT event_uid FROM events WHERE event_uid IS NOT NULL"
+        ).fetchall()
+    finally:
+        con.close()
+
+    result: set[str] = set()
+    for (event_uid,) in rows:
+        value = str(event_uid or "")
+        fill_uid, separator, kind = value.rpartition("|")
+        if separator and kind in {"OPEN", "CLOSE", "SIZE_CHANGE", "REDUCE"}:
+            result.add(fill_uid)
+        elif value:
+            # Preserve already-normalized legacy rows that did not include an
+            # event-kind suffix.
+            result.add(value)
+    return result
+
+
+async def load_recorded_trade_uids(path: Path) -> set[str]:
+    """Return all source-scoped fill identities previously recorded."""
+    return await asyncio.to_thread(_load_recorded_trade_uids_sync, path)
+
+
 def _save_cursor_sync(
     path: Path, source_id: str, cursor_key: str, cursor: str, updated_at: str
 ) -> None:

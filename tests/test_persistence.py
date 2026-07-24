@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ import pytest
 from src.db import (
     backfill_closed_trades_from_events,
     init_db,
+    load_recorded_trade_uids,
     load_closed_trades,
     save_closed_trade,
     save_event,
@@ -323,6 +325,28 @@ class TestBackfillFromEvents:
         assert rows[1]["wins"] == 1   # trade2 is a loss, wins stays 1
         assert rows[2]["total"] == 1
         assert rows[2]["wins"] == 1   # trade1 is a win
+
+
+def test_load_recorded_trade_uids_strips_event_kind_suffix(tmp_path: Path):
+    db = tmp_path / "test.db"
+    _run(init_db(db))
+    con = sqlite3.connect(db)
+    con.executemany(
+        "INSERT INTO events (ts, payload, event_uid) VALUES (?, ?, ?)",
+        [
+            ("2026-01-01T00:00:00+00:00", "{}", "hl|1|BOTH|10|OPEN"),
+            ("2026-01-01T00:00:01+00:00", "{}", "hl|2|BOTH|11|SIZE_CHANGE"),
+            ("2026-01-01T00:00:02+00:00", "{}", "legacy-fill-12"),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    assert _run(load_recorded_trade_uids(db)) == {
+        "hl|1|BOTH|10",
+        "hl|2|BOTH|11",
+        "legacy-fill-12",
+    }
 
 
 # ---------------------------------------------------------------------------
