@@ -503,6 +503,9 @@ Fresh read-only check on 2026-07-25: `lighterbot` remained active, the VM still
 did not contain the local rate-limit/PnL markers, and the outbox still had the
 same 9 historical failed rows plus 136 sent rows. There were no exact duplicate
 alert texts in the latest 24 hours; the 7-day window had one duplicate pair.
+The repeated 7-day card text was verified as two distinct `hl-main` close trade
+IDs with separate outbox event IDs, so it was legitimate repeated activity,
+not a duplicate delivery.
 
 ### Validation, migration, and reload
 
