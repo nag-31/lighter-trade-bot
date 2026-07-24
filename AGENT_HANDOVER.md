@@ -470,6 +470,26 @@ key. If one L1 address has subaccounts, repeat the source with the same
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 
+### Production correctness audit (2026-07-24)
+
+- The GCP `lighterbot` unit was healthy and ready during the audit, but it was
+  still running the older deployed source; the 2026-07-24 local hardening had
+  not been copied to the VM.
+- The production DB had no duplicate non-null event UIDs, no duplicate fill
+  IDs inside a single closed row, and no exact duplicate Telegram alert text
+  in the last 6 or 24 hours. It did have 9 failed Telegram outbox rows (all
+  recorded as API rejection), 6 legacy rows with `realization_kind=NULL`, and
+  no pending outbox rows.
+- Read-only Hyperliquid reconciliation for `hl-main` fetched 18 realizing
+  fills totaling +$550.89 from 2026-07-16T18:34:29Z onward. The matching DB
+  window contained 10 rows totaling +$1,021.18, so the accurate replacement
+  delta is -$470.29 and +8 rows. The existing reconcile report used all 74
+  historical rows in its delta and incorrectly displayed -$1,676.62/-56 rows;
+  the local report fix now compares only the replaced window.
+- `hl-second` returned zero realizing fills in the same 10-day dry run; its 18
+  existing rows were all older than the fetched window. No reconciliation
+  `--apply`, deployment, or service restart was performed during this audit.
+
 ### Validation, migration, and reload
 
 Redacted validation:
