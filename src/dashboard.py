@@ -3174,6 +3174,18 @@ async def _run() -> None:
             except Exception:
                 log.exception("self-audit: fetch_realizing_fills failed for %s", s.name)
                 continue
+            fetch_error = getattr(s.client, "last_realizing_fetch_error", None)
+            if fetch_error:
+                # An empty list after a failed API call is not authoritative.
+                # Skipping the audit avoids a false "all PnL disappeared"
+                # warning and prevents a transient outage from creating noise.
+                log.warning(
+                    "self-audit: skipping %s because realizing-fill fetch was "
+                    "non-authoritative (%s)",
+                    s.name,
+                    fetch_error,
+                )
+                continue
             ex_by_coin: dict[str, Decimal] = {}
             for f in ex_fills:
                 if f.timestamp >= day_end or s.is_excluded(f.market_symbol):

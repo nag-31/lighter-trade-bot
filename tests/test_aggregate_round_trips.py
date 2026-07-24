@@ -203,6 +203,29 @@ def test_legacy_null_row_without_fill_counterpart_is_kept():
     assert agg[0]["realization_kind"] == "FULL"
 
 
+def test_legacy_nearby_trade_with_different_pnl_is_not_silently_dropped():
+    rows = [
+        _row("2026-06-03T19:36:39Z", "TON", 42, None),
+        _row("2026-06-03T19:36:40Z", "TON", 41, "FULL"),
+    ]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 2
+    assert sorted(a["pnl"] for a in agg) == [41.0, 42.0]
+
+
+def test_legacy_duplicate_matching_one_position_side_does_not_drop_other_side():
+    rows = [
+        _row("2026-06-03T19:36:39Z", "BTC", 42, None, position_side="LONG"),
+        _row("2026-06-03T19:36:39Z", "BTC", 42, "FULL", position_side="SHORT"),
+    ]
+    agg = aggregate_round_trips(rows)
+    assert len(agg) == 2
+    assert sorted((a["position_side"], a["pnl"]) for a in agg) == [
+        ("LONG", 42.0),
+        ("SHORT", 42.0),
+    ]
+
+
 def test_legacy_null_row_outside_window_is_kept():
     # A legacy row hours away from an unrelated later fill-based trade on the
     # same coin is NOT a duplicate — both are distinct round-trips.

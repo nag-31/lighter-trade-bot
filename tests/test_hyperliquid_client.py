@@ -281,18 +281,28 @@ class TestFetchRealizingFillsErrorHandling:
         with patch.object(c._info, "user_fills", side_effect=RuntimeError("network down")):
             result = _run(c.fetch_realizing_fills())
         assert result == []
+        assert c.last_realizing_fetch_error == "RuntimeError"
 
     def test_non_list_response_returns_empty(self):
         c = make_client()
         with patch.object(c._info, "user_fills", return_value=None):
             result = _run(c.fetch_realizing_fills())
         assert result == []
+        assert c.last_realizing_fetch_error == "non-list response"
 
     def test_non_list_string_response_returns_empty(self):
         c = make_client()
         with patch.object(c._info, "user_fills", return_value="error string"):
             result = _run(c.fetch_realizing_fills())
         assert result == []
+        assert c.last_realizing_fetch_error == "non-list response"
+
+    def test_successful_empty_response_is_authoritative(self):
+        c = make_client()
+        with patch.object(c._info, "user_fills", return_value=[]):
+            result = _run(c.fetch_realizing_fills())
+        assert result == []
+        assert c.last_realizing_fetch_error is None
 
     def test_partial_malformed_fills_skipped(self):
         """Malformed fills (missing tid) are skipped; valid ones still returned."""

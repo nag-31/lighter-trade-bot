@@ -120,12 +120,13 @@ def filter_trades(
     return out
 
 
-# Legacy migration rows (realization_kind NULL, no fill_ids) that fall within
-# this many seconds of a real fill-based row for the same (source, symbol) are
-# treated as duplicates of that fill sequence and dropped. The known dupes share
-# the fill's exact sub-second timestamp; the window is generous head-room and is
-# only ever reachable by legacy rows (current code always writes PARTIAL/FULL).
-_LEGACY_DEDUP_WINDOW_SEC = 3600.0
+# Legacy migration rows (realization_kind NULL, no fill_ids) are only treated as
+# duplicates when their timestamp, source/symbol/position identity, and total PnL
+# match a fill-based sequence. A broad time-only rule can silently delete a real
+# trade made on the same coin within the same hour, which is unacceptable for a
+# correctness-first history view. Current rows always write PARTIAL/FULL.
+_LEGACY_DEDUP_WINDOW_SEC = 2.0
+_LEGACY_PNL_TOLERANCE = 1e-9
 
 
 def _source_key(row: dict) -> str:
@@ -158,30 +159,45 @@ def _drop_legacy_duplicate_rows(trades: list[dict]) -> list[dict]:
     ``realization_kind=None`` and no ``fill_ids``/``trade_id``. Six of them
     re-state a round-trip that ALSO exists as a PARTIAL/FULL fill sequence for
     the same coin at the same instant — summing both double-counts the PnL
-    (e.g. the TON +$42 seen twice). This drops a legacy row when a real
-    fill-based row for the same ``(source, market_symbol)`` exists within
-    ``_LEGACY_DEDUP_WINDOW_SEC``. A legacy row with NO fill-based counterpart
-    (a genuine standalone legacy round-trip, e.g. ENA/SPX) is kept untouched.
+    (e.g. the TON +$42 seen twice). This drops a legacy row only when a real
+    fill-based sequence with the same ``(source, market_symbol, position_side)``
+    and total PnL is within ``_LEGACY_DEDUP_WINDOW_SEC``. A legacy row with no
+    exact fill-based counterpart is kept untouched.
     """
-    fill_ts: dict[tuple[str, str], list[datetime]] = {}
+    fill_totals: dict[tuple[str, str, str, datetime], float] = {}
     for r in trades:
         if not _is_legacy_kind(r):
-            key = (_source_key(r), r.get("market_symbol") or "")
+            key = (
+                _source_key(r),
+                r.get("market_symbol") or "",
+                r.get("position_side") or "BOTH",
+                _parse_ts(r.get("ts")),
+            )
             dt = _parse_ts(r.get("ts"))
-            if dt is not None:
-                fill_ts.setdefault(key, []).append(dt)
+            pnl = _f(r.get("pnl"))
+            if dt is not None and pnl is not None:
+                fill_totals[key] = fill_totals.get(key, 0.0) + pnl
 
     out: list[dict] = []
     for r in trades:
         if _is_legacy_kind(r) and not _has_fill_ids(r):
-            key = (_source_key(r), r.get("market_symbol") or "")
+            source_key = _source_key(r)
+            symbol = r.get("market_symbol") or ""
+            position_side = r.get("position_side") or "BOTH"
             dt = _parse_ts(r.get("ts"))
-            near = fill_ts.get(key)
-            if dt is not None and near and any(
-                abs((dt - t).total_seconds()) <= _LEGACY_DEDUP_WINDOW_SEC
-                for t in near
-            ):
-                continue  # legacy duplicate of a fill sequence → drop
+            legacy_pnl = _f(r.get("pnl"))
+            if dt is not None and legacy_pnl is not None:
+                duplicate = False
+                for (sid, sym, side, fill_dt), fill_pnl in fill_totals.items():
+                    if sid != source_key or sym != symbol or side != position_side:
+                        continue
+                    if abs((dt - fill_dt).total_seconds()) <= _LEGACY_DEDUP_WINDOW_SEC and abs(
+                        legacy_pnl - fill_pnl
+                    ) <= _LEGACY_PNL_TOLERANCE:
+                        duplicate = True
+                        break
+                if duplicate:
+                    continue  # exact legacy duplicate of a fill sequence → drop
         out.append(r)
     return out
 

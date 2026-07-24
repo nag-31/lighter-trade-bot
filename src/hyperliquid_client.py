@@ -131,6 +131,11 @@ class HyperliquidClient:
         # Flag to signal clean shutdown to stream_trades()
         self._closed = False
 
+        # Distinguish an authoritative empty realizing-fill result from a
+        # transport/API failure. Consumers such as the daily self-audit must
+        # never interpret a failed fetch as "the account had no PnL".
+        self.last_realizing_fetch_error: Optional[str] = None
+
         log.info("[%s] HL client initialized for %s", source, self.address_masked)
 
     # ------------------------------------------------------------------ #
@@ -569,6 +574,7 @@ class HyperliquidClient:
         """
         _MAX_PAGES = 60   # 60 x 2000 = up to 120k raw fills — covers heavy histories
 
+        self.last_realizing_fetch_error = None
         try:
             if start_time_ms is not None:
                 # Page user_fills_by_time from start_time_ms to now.
@@ -615,6 +621,7 @@ class HyperliquidClient:
                     self._info.user_fills, self.address
                 )
                 if not isinstance(raw_fills_any, list):
+                    self.last_realizing_fetch_error = "non-list response"
                     log.warning(
                         "[%s] fetch_realizing_fills: user_fills returned non-list: %r",
                         self.source, type(raw_fills_any),
@@ -622,7 +629,8 @@ class HyperliquidClient:
                     return []
                 raw_fills = raw_fills_any
 
-        except Exception:
+        except Exception as exc:
+            self.last_realizing_fetch_error = type(exc).__name__
             log.exception("[%s] fetch_realizing_fills: SDK call failed", self.source)
             return []
 

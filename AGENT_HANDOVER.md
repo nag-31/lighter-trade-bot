@@ -465,8 +465,10 @@ key. If one L1 address has subaccounts, repeat the source with the same
   Telegram outbox atomically claims pending/retry sends, reclaims abandoned
   leases, and only applies in-memory dedup after confirmed delivery. The
   reconciliation report compares rebuilt PnL with only the replaced time
-  window (not all historical rows). These changes are tested locally but have
-  not been deployed to the VM yet.
+  window (not all historical rows). The HL realizing-fill client now exposes
+  transport failure separately from an authoritative empty result, so the
+  daily self-audit cannot report a transient API outage as missing PnL. These
+  changes are tested locally but have not been deployed to the VM yet.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 
