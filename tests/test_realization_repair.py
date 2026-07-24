@@ -4,7 +4,11 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
-from src.dashboard import _realization_sequence_key, _unrecorded_realizing_fills
+from src.dashboard import (
+    _merge_realized_pnl,
+    _realization_sequence_key,
+    _unrecorded_realizing_fills,
+)
 from tests.conftest import T0, make_trade
 
 
@@ -56,3 +60,9 @@ def test_same_timestamp_close_burst_uses_start_position_to_restore_sequence():
     ordered = sorted([first, flattening, remaining], key=_realization_sequence_key)
 
     assert [trade.trade_id for trade in ordered] == [3, 1, 2]
+
+
+def test_reduce_pnl_merge_preserves_unknown_after_later_known_fill():
+    assert _merge_realized_pnl(Decimal("10"), None) == (None, True)
+    assert _merge_realized_pnl(None, Decimal("5"), True) == (None, True)
+    assert _merge_realized_pnl(Decimal("10"), Decimal("5")) == (Decimal("15"), False)

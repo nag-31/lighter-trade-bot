@@ -194,6 +194,17 @@ def _unrecorded_realizing_fills(
     return out
 
 
+def _merge_realized_pnl(
+    current: Decimal | None,
+    incoming: Decimal | None,
+    unknown: bool = False,
+) -> tuple[Decimal | None, bool]:
+    """Accumulate a reduce batch without turning missing PnL into zero."""
+    if unknown or incoming is None:
+        return None, True
+    return (current or Decimal(0)) + incoming, False
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -1788,7 +1799,7 @@ async def _run() -> None:
         object.__setattr__(synth_ev_with_leverage, "leverage", leverage)
 
         # ── PnL / pct ─────────────────────────────────────────────────────────
-        is_win = realized_pnl is not None and realized_pnl > 0
+        is_win = None if realized_pnl is None else realized_pnl > 0
         # The win-rate record counts CLOSED TRADES: only a FULL close advances
         # it, judged on the ROUND-TRIP total (card_pnl_override when the trade
         # had scale-outs — a trade can end on a red fill yet be a win overall).
@@ -1866,7 +1877,7 @@ async def _run() -> None:
             "notional": str(reduced_size * fill_price),
             "pnl": str(realized_pnl) if realized_pnl is not None else None,
             "pct": str(pct) if pct is not None else None,
-            "is_win": 1 if is_win else 0,
+            "is_win": None if is_win is None else (1 if is_win else 0),
             "leverage": str(leverage) if leverage is not None else None,
             "wins": wins,
             "total": total,
@@ -2035,7 +2046,16 @@ async def _run() -> None:
             _pending_reduces[key]["reduced_size"] += ev.trade.size
             if pnl is not None:
                 prev = _pending_reduces[key]["total_pnl"]
-                _pending_reduces[key]["total_pnl"] = (prev or Decimal(0)) + pnl
+                merged, unknown = _merge_realized_pnl(
+                    prev,
+                    pnl,
+                    bool(_pending_reduces[key].get("pnl_unknown", False)),
+                )
+                _pending_reduces[key]["total_pnl"] = merged
+                _pending_reduces[key]["pnl_unknown"] = unknown
+            else:
+                _pending_reduces[key]["total_pnl"] = None
+                _pending_reduces[key]["pnl_unknown"] = True
             if ev.leverage is not None:
                 _pending_reduces[key]["leverage"] = ev.leverage
             if current_pos is not None:
@@ -2058,6 +2078,7 @@ async def _run() -> None:
                 "net_reduced": fill_notional,
                 "n_fills": 1,
                 "total_pnl": pnl,
+                "pnl_unknown": pnl is None,
                 "leverage": ev.leverage,
                 "position": current_pos,
                 # New fields for record_realization

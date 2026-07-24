@@ -470,7 +470,8 @@ key. If one L1 address has subaccounts, repeat the source with the same
   daily self-audit cannot report a transient API outage as missing PnL. These
   changes are tested locally but have not been deployed to the VM yet. Missing
   per-fill PnL is also kept as unknown during round-trip aggregation instead of
-  being converted to a zero-dollar loss.
+  being converted to a zero-dollar loss; reduce batches preserve that unknown
+  state even when a later fill has a known PnL.
 - Dashboard filters support exchange and account selection.
 - Reconciliation requires `--source-id` when multiple HL wallets exist.
 
