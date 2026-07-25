@@ -215,6 +215,16 @@ def _merge_realized_pnl(
     return (current or Decimal(0)) + incoming, False
 
 
+def _reduce_alert_should_send(
+    net_reduced: Decimal,
+    min_notional: Decimal,
+    *,
+    closing: bool = False,
+) -> bool:
+    """Only alert a reduce that is not immediately superseded by a close."""
+    return not closing and net_reduced >= min_notional
+
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -2052,7 +2062,11 @@ async def _run() -> None:
                  pos.notional_usd)
         _digest_send(source_id, text)
 
-    async def flush_reduce_aggregate(key: tuple[str, int]) -> None:
+    async def flush_reduce_aggregate(
+        key: tuple[str, int],
+        *,
+        send_alert: bool = True,
+    ) -> None:
         buf = _pending_reduces.pop(key, None)
         if buf is None:
             return
@@ -2071,7 +2085,11 @@ async def _run() -> None:
         # a small partial-close on a large position must not spam. The partial
         # is STILL recorded below regardless, so PnL/stats stay exact; only the
         # Telegram message is suppressed when the net reduced is below min.
-        if buf["net_reduced"] >= src.min_notional:
+        if _reduce_alert_should_send(
+            buf["net_reduced"],
+            src.min_notional,
+            closing=not send_alert,
+        ):
             text = format_reduce_aggregate(
                 position=pos,
                 net_reduced_usd=buf["net_reduced"],
@@ -2091,11 +2109,16 @@ async def _run() -> None:
                      src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
                      pos.notional_usd)
             _digest_send(source_id, text)
-        else:
+        elif send_alert:
             log.info("[%s] reduce aggregate: %s −$%.0f across %d fills below min $%.0f, "
                      "suppressing alert (still recording realization)",
                      src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"],
                      src.min_notional)
+        else:
+            log.info("[%s] reduce aggregate: %s −$%.0f across %d fills, "
+                     "suppressing intermediate alert because close follows "
+                     "(still recording realization)",
+                     src.name, pos.market_symbol, buf["net_reduced"], buf["n_fills"])
 
         # ── Record this partial close as its own realization row ───────────────
         last_trade = buf.get("last_trade")
@@ -2848,7 +2871,7 @@ async def _run() -> None:
                     # the CLOSE.  This replaces the old "accumulated_pnl merge" approach.
                     if key in _pending_reduces:
                         _pending_reduces[key]["task"].cancel()
-                        await flush_reduce_aggregate(key)
+                        await flush_reduce_aggregate(key, send_alert=False)
 
                     # Position is gone — remove from SL/TP cache and re-arm for next open
                     _sl_tp_cache.pop(key, None)

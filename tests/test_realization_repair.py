@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from src.dashboard import (
     _merge_realized_pnl,
+    _reduce_alert_should_send,
     _realization_sequence_key,
     _unrecorded_realizing_fills,
 )
@@ -66,3 +67,9 @@ def test_reduce_pnl_merge_preserves_unknown_after_later_known_fill():
     assert _merge_realized_pnl(Decimal("10"), None) == (None, True)
     assert _merge_realized_pnl(None, Decimal("5"), True) == (None, True)
     assert _merge_realized_pnl(Decimal("10"), Decimal("5")) == (Decimal("15"), False)
+
+
+def test_pending_reduce_before_close_does_not_send_intermediate_alert():
+    assert _reduce_alert_should_send(Decimal("1000"), Decimal("900")) is True
+    assert _reduce_alert_should_send(Decimal("1000"), Decimal("900"), closing=True) is False
+    assert _reduce_alert_should_send(Decimal("899"), Decimal("900")) is False
