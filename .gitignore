@@ -34,5 +34,8 @@ data/*.pid
 data/*.db
 data/*.db-*
 
+# private generated trade-analysis artifacts
+reports/trade_analysis_100/
+
 # local wallet validation evidence
 PORTFOLIO_LIVE_VALIDATION.md
