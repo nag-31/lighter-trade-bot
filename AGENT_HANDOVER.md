@@ -468,8 +468,8 @@ key. If one L1 address has subaccounts, repeat the source with the same
   window (not all historical rows). The HL realizing-fill client now exposes
   transport failure separately from an authoritative empty result, so the
   daily self-audit cannot report a transient API outage as missing PnL. These
-  changes are tested locally but have not been deployed to the VM yet. Missing
-  per-fill PnL is also kept as unknown during round-trip aggregation instead of
+  changes were deployed to the GCP VM on 2026-07-25 after local verification.
+  Missing per-fill PnL is also kept as unknown during round-trip aggregation instead of
   being converted to a zero-dollar loss; reduce batches preserve that unknown
   state even when a later fill has a known PnL. Telegram channel delivery now
   serializes sends, spaces requests, honors bounded 429 `retry_after` delays,
@@ -506,6 +506,31 @@ alert texts in the latest 24 hours; the 7-day window had one duplicate pair.
 The repeated 7-day card text was verified as two distinct `hl-main` close trade
 IDs with separate outbox event IDs, so it was legitimate repeated activity,
 not a duplicate delivery.
+
+### Duplicate REDUCE/CLOSE alert fix and deployment (2026-07-25)
+
+- Cause: when a final `CLOSE` arrived while a partial reduction was still inside
+  the debounce window, the consumer flushed that pending batch as a normal
+  `REDUCE` alert and then emitted the `CLOSE` alert. This produced two messages
+  for one completed trade.
+- Fix: the close path now flushes the pending reduction with
+  `send_alert=False`. The partial realization row and its PnL are still written;
+  only the intermediate Telegram message is suppressed. Reductions that were
+  already flushed and alerted before a later close remain legitimate separate
+  alerts.
+- Local verification: 860 tests passed. The fix was committed as `3341413`.
+- VM backup: `/home/ADMIN/backups/lighterbot-20260725T082442Z`.
+- Deployed runtime files: `src/dashboard.py`, `src/hyperliquid_client.py`,
+  `src/stats.py`, `src/db.py`, and `scripts/reconcile_hl_pnl.py`. The VM `.env`
+  and live database were not overwritten.
+- Post-deploy: `lighterbot` is active; `/health.json` is healthy and ready, with
+  all four configured sources reporting active tasks. The public dashboard is
+  healthy and the hub reports the tracker `Online`.
+- At verification, the outbox contained 141 sent rows and 9 historical failed
+  rows. Those failures predate this deployment and were Telegram rate-limit
+  rejections; they were not automatically resent to avoid another alert burst.
+- The hub separately reported the portfolio app as `Degraded`; this is outside
+  the tracker deployment and requires its own inspection.
 
 ### Validation, migration, and reload
 
