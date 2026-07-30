@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
-from src.dashboard import INDEX_HTML, _to_jsonable, _trade_dedup_key
+from src.dashboard import (
+    INDEX_HTML,
+    _plain_telegram_text,
+    _to_jsonable,
+    _trade_dedup_key,
+    _uses_telegram_html,
+)
 from src.types import Event, EventKind, Position
 
 
@@ -56,3 +63,52 @@ def test_frontend_contract_keeps_truth_and_alert_views_present():
 
     for fragment in required_fragments:
         assert fragment in INDEX_HTML
+
+
+def test_every_tracker_table_header_supports_click_and_keyboard_sorting():
+    assert "function initSortableTables()" in INDEX_HTML
+    assert "function sortTrackerTable(header)" in INDEX_HTML
+    assert 'event.target.closest("th[data-sort-index]")' in INDEX_HTML
+    assert 'event.key !== "Enter" && event.key !== " "' in INDEX_HTML
+    assert 'header.setAttribute("aria-sort", "none")' in INDEX_HTML
+    assert 'applyTableSort(tb.closest("table"));' in INDEX_HTML
+    assert 'data-sort-value="${new Date(t.timestamp).getTime()}"' in INDEX_HTML
+    assert 'data-sort-value="${p.unrealized_pnl ?? ""}"' in INDEX_HTML
+
+
+def test_address_tracker_shows_filter_aware_aggregate_live_pnl():
+    assert 'id="live-pnl-total"' in INDEX_HTML
+    assert 'id="live-notional-total"' in INDEX_HTML
+    assert "function renderLivePnl(positions)" in INDEX_HTML
+    assert "const rows = filtered.filter(p => !p.stale);" in INDEX_HTML
+    assert "renderLivePnl(data.positions);" in INDEX_HTML
+
+
+def test_telegram_alert_paths_never_append_configured_source_website():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "pool_url=src.url" not in source
+    assert "ev, src.url, src.name" not in source
+    assert "_fallback_event, src.url, src.name" not in source
+    assert '_caption += f"\\n{src.url}"' not in source
+
+
+def test_discussion_commands_reply_in_place_with_shared_anti_spam_gate():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_discussion_command_rate_seconds = 4.0" in source
+    assert "_command_chat_rate_last" in source
+    assert "community discussion commands reply in place" in source
+    assert "owner discussion commands publish to channel" not in source
+    assert "in_discussion = output_chat != origin_chat" not in source
+
+
+def test_telegram_html_is_detected_and_plain_alert_log_remains_readable():
+    rich = "🟢 <b>LONG</b> · P&amp;L: <b>+$12.50</b>"
+
+    assert _uses_telegram_html(rich)
+    assert _plain_telegram_text(rich) == "🟢 LONG · P&L: +$12.50"

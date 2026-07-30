@@ -1,5 +1,5 @@
 [Unit]
-Description=Crypto apps hub
+Description=Crypto Scientist App Hubs
 After=network-online.target
 Wants=network-online.target
 

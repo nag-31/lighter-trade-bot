@@ -107,6 +107,52 @@ async def test_wallet_discovery_error_does_not_expose_address():
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_wallet_skips_private_rest_history_and_orders(caplog):
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(500, request=request)
+
+    client = LighterClient(
+        pool_id=7402,
+        rest_base="https://example.com/api/v1",
+        ws_url="wss://example.com/stream",
+        source="wallet",
+        l1_address="0x" + "3" * 40,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await client.fetch_trades_since(None) == []
+        assert await client.fetch_open_orders() == []
+        assert await client.fetch_sl_tp(0) == (None, None)
+        assert requests == []
+        assert caplog.text.count("skipping unauthenticated Lighter private REST") == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_public_pool_skips_authenticated_orders_endpoint():
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(403, request=request)
+
+    client = make_client()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await client.fetch_open_orders() == []
+        assert await client.fetch_sl_tp(0) == (None, None)
+        assert requests == []
+    finally:
+        await client.close()
+
+
 # ---------------------------------------------------------------------------
 # market_symbol
 # ---------------------------------------------------------------------------

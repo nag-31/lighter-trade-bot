@@ -1,4 +1,5 @@
 from decimal import Decimal
+from html import escape
 from typing import Optional
 
 from .types import Event, EventKind, Position
@@ -24,15 +25,24 @@ def _fmt_pnl(pnl: Decimal) -> str:
 
 
 def _direction_emoji(side: str) -> str:
-    return "🟢 LONG" if side == "long" else "🔴 SHORT"
+    return "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
 
 
 def _header(source_name: str) -> str:
-    return f"📍 {source_name}\n" if source_name else ""
+    return f"📍 {escape(source_name)}\n" if source_name else ""
 
 
 def _footer(pool_url: str) -> str:
-    return f"\n{pool_url}" if pool_url else ""
+    return f"\n{escape(pool_url)}" if pool_url else ""
+
+
+def _pnl_line(pnl: Decimal) -> str:
+    marker = "🟢" if pnl >= 0 else "🔴"
+    return f"{marker} P&amp;L: <b>{_fmt_pnl(pnl)}</b>"
+
+
+def _leverage(leverage: Optional[float]) -> str:
+    return f"  ·  ⚡ <b>{leverage:g}x</b>" if leverage is not None else ""
 
 
 def _fmt_sl_tp(
@@ -57,10 +67,10 @@ def _fmt_sl_tp(
 
     parts = []
     if sl is not None:
-        parts.append(f"SL: {_fmt_price(sl)}")
+        parts.append(f"🛑 SL: <b>{_fmt_price(sl)}</b>")
     if tp is not None:
-        parts.append(f"TP: {_fmt_price(tp)}")
-    return ("\n" + "  |  ".join(parts)) if parts else ""
+        parts.append(f"🎯 TP: <b>{_fmt_price(tp)}</b>")
+    return ("\n" + "  ·  ".join(parts)) if parts else ""
 
 
 def format_sl_tp_set(
@@ -102,18 +112,21 @@ def format_sl_tp_set(
     direction = _direction_emoji(side)
     parts = []
     if sl is not None:
-        parts.append(f"SL: {_fmt_price(sl)}")
+        parts.append(f"🛑 SL: <b>{_fmt_price(sl)}</b>")
     if tp is not None:
-        parts.append(f"TP: {_fmt_price(tp)}")
-    sl_tp_line = "  |  ".join(parts)
-    body = f"🛡 SL/TP set · {direction} {market_symbol}\n{sl_tp_line}"
+        parts.append(f"🎯 TP: <b>{_fmt_price(tp)}</b>")
+    sl_tp_line = "  ·  ".join(parts)
+    body = (
+        f"🛡 <b>RISK UPDATED</b> · {direction} {escape(market_symbol)}\n"
+        f"{sl_tp_line}"
+    )
 
     fn = ""
     if privacy is not None and is_hl:
         from .display_transform import footnote
         fn = footnote(privacy, is_hl)
     if fn:
-        body += f"\n{fn}"
+        body += f"\n{escape(fn)}"
 
     return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
@@ -161,13 +174,13 @@ def format_event(
         disp_exit = _dp(t.price)
         disp_not  = _dn(pos.notional_usd)
         body = (
-            f"Closed {_direction_emoji(pos.side)} {pos.market_symbol}\n"
-            f"Exit: {_fmt_price(disp_exit)}  |  Notional: ${disp_not:,.0f}"
+            f"Closed {_direction_emoji(pos.side)} {escape(pos.market_symbol)}\n"
+            f"🎯 Exit: <b>{_fmt_price(disp_exit)}</b>\n"
+            f"💼 Position: <b>${disp_not:,.0f}</b>"
         )
-        if event.leverage is not None:
-            body += f"  |  {event.leverage:g}x"
+        body += _leverage(event.leverage)
         if t.realized_pnl is not None:
-            body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+            body += f"\n{_pnl_line(t.realized_pnl)}"
         # No SL/TP on CLOSE — orders are cancelled when position closes
 
     elif event.kind == EventKind.REDUCE and event.position_before is not None and event.position_after is not None:
@@ -178,14 +191,15 @@ def format_event(
         disp_not_b        = _dn(pos_b.notional_usd)
         fill_notional     = _dn(t.size * t.price)
         body = (
-            f"Reduced {_direction_emoji(pos_b.side)} {pos_b.market_symbol}\n"
-            f"−${fill_notional:,.0f} @ {_fmt_price(disp_trade_price)}\n"
-            f"Remaining: ${disp_not_a:,.0f}  (was ${disp_not_b:,.0f})"
+            f"Reduced {_direction_emoji(pos_b.side)} {escape(pos_b.market_symbol)}\n"
+            f"📤 Reduced: <b>${fill_notional:,.0f}</b> @ "
+            f"<b>{_fmt_price(disp_trade_price)}</b>\n"
+            f"💼 Remaining: <b>${disp_not_a:,.0f}</b> "
+            f"<i>(was ${disp_not_b:,.0f})</i>"
         )
-        if event.leverage is not None:
-            body += f"  |  {event.leverage:g}x"
+        body += _leverage(event.leverage)
         if t.realized_pnl is not None:
-            body += f"\nP&L: {_fmt_pnl(t.realized_pnl)}"
+            body += f"\n{_pnl_line(t.realized_pnl)}"
         body += _fmt_sl_tp(sl, tp, privacy=privacy, is_hl=is_hl, f=f, source_id=source_id)
 
     else:
@@ -194,11 +208,11 @@ def format_event(
         disp_not         = _dn(notional)
         verb = {EventKind.OPEN: "Opened", EventKind.SIZE_CHANGE: "Added to"}.get(event.kind, "Updated")
         body = (
-            f"{verb} {direction} {t.market_symbol}\n"
-            f"Price: {_fmt_price(disp_trade_price)}  |  Notional: ${disp_not:,.0f}"
+            f"{verb} {direction} {escape(t.market_symbol)}\n"
+            f"🎯 Entry: <b>{_fmt_price(disp_trade_price)}</b>\n"
+            f"💼 Position: <b>${disp_not:,.0f}</b>"
         )
-        if event.leverage is not None:
-            body += f"  |  {event.leverage:g}x"
+        body += _leverage(event.leverage)
         body += _fmt_sl_tp(sl, tp, privacy=privacy, is_hl=is_hl, f=f, source_id=source_id)
 
     fn = ""
@@ -206,7 +220,7 @@ def format_event(
         from .display_transform import footnote
         fn = footnote(privacy, is_hl)
     if fn:
-        body += f"\n{fn}"
+        body += f"\n{escape(fn)}"
 
     return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
@@ -247,12 +261,12 @@ def format_aggregate(
         disp_net_added = disp_notional(privacy, is_hl, net_added_usd)
 
     body = (
-        f"Added {direction} {position.market_symbol}\n"
-        f"+${disp_net_added:,.0f} across {n_fills} {fill_word} → position now ${disp_not:,.0f}\n"
-        f"Avg entry: {_fmt_price(disp_avg_entry)}"
+        f"Added {direction} {escape(position.market_symbol)}\n"
+        f"📥 Added: <b>+${disp_net_added:,.0f}</b> across {n_fills} {fill_word}\n"
+        f"💼 Position: <b>${disp_not:,.0f}</b>\n"
+        f"🎯 Avg entry: <b>{_fmt_price(disp_avg_entry)}</b>"
     )
-    if leverage is not None:
-        body += f"  |  {leverage:g}x"
+    body += _leverage(leverage)
     body += _fmt_sl_tp(sl, tp, privacy=privacy, is_hl=is_hl, f=f, source_id=source_id)
 
     fn = ""
@@ -260,7 +274,7 @@ def format_aggregate(
         from .display_transform import footnote
         fn = footnote(privacy, is_hl)
     if fn:
-        body += f"\n{fn}"
+        body += f"\n{escape(fn)}"
 
     return f"{_header(source_name)}{body}{_footer(pool_url)}"
 
@@ -300,13 +314,13 @@ def format_reduce_aggregate(
         disp_net_reduced = disp_notional(privacy, is_hl, net_reduced_usd)
 
     body = (
-        f"Reduced {direction} {position.market_symbol}\n"
-        f"−${disp_net_reduced:,.0f} across {n_fills} {fill_word} → remaining ${disp_not:,.0f}"
+        f"Reduced {direction} {escape(position.market_symbol)}\n"
+        f"📤 Reduced: <b>${disp_net_reduced:,.0f}</b> across {n_fills} {fill_word}\n"
+        f"💼 Remaining: <b>${disp_not:,.0f}</b>"
     )
-    if leverage is not None:
-        body += f"  |  {leverage:g}x"
+    body += _leverage(leverage)
     if realized_pnl is not None:
-        body += f"\nP&L: {_fmt_pnl(realized_pnl)}"
+        body += f"\n{_pnl_line(realized_pnl)}"
     body += _fmt_sl_tp(sl, tp, privacy=privacy, is_hl=is_hl, f=f, source_id=source_id)
 
     fn = ""
@@ -314,6 +328,6 @@ def format_reduce_aggregate(
         from .display_transform import footnote
         fn = footnote(privacy, is_hl)
     if fn:
-        body += f"\n{fn}"
+        body += f"\n{escape(fn)}"
 
     return f"{_header(source_name)}{body}{_footer(pool_url)}"

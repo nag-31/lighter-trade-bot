@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as html_lib
 import json
 import logging
 import os
@@ -30,6 +31,12 @@ from dotenv import load_dotenv
 
 from pathlib import Path
 
+from .canonical_pnl import (
+    backfill_canonical_ledger,
+    load_canonical_realizations,
+    project_portfolio,
+    sync_portfolio_membership,
+)
 from .db import (
     backfill_closed_trades_from_events,
     enqueue_notification,
@@ -58,13 +65,18 @@ from .stats import aggregate_round_trips, compute_stats, filter_trades, format_s
 from .stats_card import render_stats_card
 from .supervisor import supervise
 from .telegram_commands import (
+    OWNER_COMMANDS,
+    command_is_allowed,
     command_output_chat,
     filter_rows_by_source,
+    format_about,
     format_fills,
     format_health,
+    format_leaderboard,
     format_help,
     format_orders,
     format_positions,
+    format_public_status,
     format_risk,
     format_sources,
     format_trades,
@@ -76,6 +88,19 @@ from .types import Event, EventKind, OpenOrder, Position, Trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
+
+_TELEGRAM_HTML_TAG = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|blockquote)(?:\s[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _uses_telegram_html(text: str) -> bool:
+    return bool(_TELEGRAM_HTML_TAG.search(text or ""))
+
+
+def _plain_telegram_text(text: str) -> str:
+    return html_lib.unescape(_TELEGRAM_HTML_TAG.sub("", text or ""))
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 DB_PATH = DATA_DIR / "events.db"
@@ -182,6 +207,8 @@ def _unrecorded_realizing_fills(
     recorded: set[str],
     source_id: str,
     current_trade: Trade,
+    *,
+    lifecycle_start: datetime | None = None,
 ) -> list[Trade]:
     """Return exchange fills missing from local realization persistence.
 
@@ -191,9 +218,21 @@ def _unrecorded_realizing_fills(
     close-recording path.
     """
     current_key = current_trade.event_uid(source_id)
+    if lifecycle_start is not None:
+        if lifecycle_start.tzinfo is None:
+            lifecycle_start = lifecycle_start.replace(tzinfo=timezone.utc)
+        else:
+            lifecycle_start = lifecycle_start.astimezone(timezone.utc)
     out: list[Trade] = []
     seen: set[str] = set()
     for fill in sorted(fills, key=_realization_sequence_key):
+        fill_ts = fill.timestamp
+        if fill_ts.tzinfo is None:
+            fill_ts = fill_ts.replace(tzinfo=timezone.utc)
+        else:
+            fill_ts = fill_ts.astimezone(timezone.utc)
+        if lifecycle_start is not None and fill_ts < lifecycle_start:
+            continue
         if fill.timestamp > current_trade.timestamp:
             continue
         key = fill.event_uid(source_id)
@@ -220,9 +259,179 @@ def _reduce_alert_should_send(
     min_notional: Decimal,
     *,
     closing: bool = False,
+    remaining_notional: Decimal | None = None,
 ) -> bool:
-    """Only alert a reduce that is not immediately superseded by a close."""
-    return not closing and net_reduced >= min_notional
+    """Only alert a material reduce that is not effectively a full close.
+
+    When a large position is reduced to dust, a separate "reduced" message is
+    noise: the full-close card follows shortly and contains the complete trade
+    result. The realization is still persisted even when its alert is muted.
+    """
+    if closing or net_reduced < min_notional:
+        return False
+    if remaining_notional is not None and remaining_notional < min_notional:
+        return False
+    return True
+
+
+def _is_pre_session_backfill(
+    trade_timestamp: datetime,
+    session_started_at: datetime,
+    *,
+    grace_seconds: int = 120,
+) -> bool:
+    """Return True for an old fill replayed during startup/onboarding.
+
+    A source can send a non-snapshot history burst after subscription. Applying
+    those fills to a tracker already seeded with current positions creates
+    phantom OPEN/REDUCE/CLOSE alerts. Cursor state is advanced before this
+    check, so skipping the replay cannot loop forever.
+    """
+    trade_ts = trade_timestamp
+    session_ts = session_started_at
+    if trade_ts.tzinfo is None:
+        trade_ts = trade_ts.replace(tzinfo=timezone.utc)
+    if session_ts.tzinfo is None:
+        session_ts = session_ts.replace(tzinfo=timezone.utc)
+    return trade_ts.astimezone(timezone.utc) < (
+        session_ts.astimezone(timezone.utc) - timedelta(seconds=grace_seconds)
+    )
+
+
+def _roundtrip_partial_context(
+    rows: list[dict],
+    source_id: str,
+    source_name: str,
+    market_symbol: str,
+    position_side: str = "BOTH",
+) -> dict[str, Any]:
+    """Summarize the current round-trip's persisted partial exits.
+
+    Besides P&L, this preserves the size and cost basis already closed before a
+    final dust fill. The final close card can therefore describe the complete
+    lifecycle rather than showing only the last $1 remainder.
+    """
+    total_pnl = Decimal(0)
+    total_size = Decimal(0)
+    total_cost_basis = Decimal(0)
+    total_exit_notional = Decimal(0)
+    oldest_ts: str | None = None
+    pnl_unknown = False
+    count = 0
+
+    matching_rows: list[dict] = []
+    for row in rows:
+        belongs = (
+            row.get("source_id") == source_id
+            if row.get("source_id")
+            else row.get("source") == source_name
+        )
+        if (
+            not belongs
+            or row.get("market_symbol") != market_symbol
+            or (row.get("position_side") or "BOTH") != position_side
+        ):
+            continue
+        matching_rows.append(row)
+
+    def _event_time(row: dict) -> datetime:
+        raw = row.get("ts")
+        if isinstance(raw, datetime):
+            parsed = raw
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                parsed = datetime.min.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    # closed_trades is loaded by insertion id, but a repair can insert an old
+    # exchange fill today. Lifecycle boundaries must therefore use exchange
+    # event time, never database insertion order. At an identical timestamp,
+    # a FULL close is the boundary before any PARTIAL row.
+    matching_rows.sort(
+        key=lambda row: (
+            _event_time(row),
+            (row.get("realization_kind") or "").upper() != "PARTIAL",
+        ),
+        reverse=True,
+    )
+
+    for row in matching_rows:
+        if (row.get("realization_kind") or "").upper() != "PARTIAL":
+            break
+        count += 1
+        if row.get("ts"):
+            oldest_ts = str(row["ts"])
+        try:
+            size = Decimal(str(row.get("size") or 0))
+        except Exception:
+            size = Decimal(0)
+        try:
+            entry = Decimal(str(row.get("entry") or 0))
+        except Exception:
+            entry = Decimal(0)
+        try:
+            exit_price = Decimal(str(row.get("exit") or 0))
+        except Exception:
+            exit_price = Decimal(0)
+        total_size += size
+        total_cost_basis += entry * size
+        total_exit_notional += exit_price * size
+        if row.get("pnl") is None:
+            pnl_unknown = True
+        else:
+            try:
+                total_pnl += Decimal(str(row["pnl"]))
+            except Exception:
+                pnl_unknown = True
+
+    return {
+        "count": count,
+        "pnl": None if pnl_unknown else total_pnl,
+        "pnl_unknown": pnl_unknown,
+        "size": total_size,
+        "cost_basis": total_cost_basis,
+        "exit_notional": total_exit_notional,
+        "oldest_ts": oldest_ts,
+    }
+
+
+def _lifecycle_card_position(
+    final_position: Position | None,
+    partial_context: dict[str, Any],
+) -> Position | None:
+    """Reconstruct the full position represented by a dust-closing fill.
+
+    The persisted FULL realization remains the final fill only.  This synthetic
+    position is used exclusively by the image renderer so its NOTIONAL and
+    entry basis describe every scale-out in the current round trip.
+    """
+    if final_position is None or not partial_context.get("count"):
+        return final_position
+    prior_size = Decimal(str(partial_context.get("size") or 0))
+    total_size = prior_size + final_position.size
+    if total_size <= 0:
+        return final_position
+    prior_cost = Decimal(str(partial_context.get("cost_basis") or 0))
+    total_cost = prior_cost + (
+        final_position.avg_entry_price * final_position.size
+    )
+    return replace(
+        final_position,
+        size=total_size,
+        avg_entry_price=total_cost / total_size,
+    )
+
+
+def _close_already_observed_by_fill(
+    market_id: int,
+    tracked_positions: dict[int, Position],
+) -> bool:
+    """A missing tracker position means the fill consumer handled the close."""
+    return market_id not in tracked_positions
 
 
 INDEX_HTML = """<!doctype html>
@@ -249,6 +458,12 @@ INDEX_HTML = """<!doctype html>
   .col-right h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color:#9ca3af; margin: 0 0 12px; }
   table { width:100%; border-collapse: collapse; font-size: 12px; }
   th { text-align:left; color:#6b7280; font-weight:500; padding: 6px 8px; border-bottom: 1px solid #1f242c; }
+  th[data-sort-index] { cursor:pointer; user-select:none; transition:color .15s, background .15s; }
+  th[data-sort-index]::after { content:"↕"; display:inline-block; margin-left:5px; color:#4b5563; font-size:9px; }
+  th[data-sort-index]:hover, th[data-sort-index]:focus-visible, th[data-sort-index].sorted { color:#d8dbe0; background:rgba(96,165,250,.05); outline:none; }
+  th[data-sort-index]:focus-visible { box-shadow:inset 0 0 0 1px #60a5fa; }
+  th[data-sort-index].sort-asc::after { content:"▲"; color:#60a5fa; }
+  th[data-sort-index].sort-desc::after { content:"▼"; color:#60a5fa; }
   td { padding: 8px; border-bottom: 1px solid #11141a; }
   tr:last-child td { border-bottom: none; }
   .long { color: #22c55e; }
@@ -333,6 +548,12 @@ INDEX_HTML = """<!doctype html>
   .oo-pulse { animation: ooPulse 0.6s ease-out; }
   .filters { display:flex; gap:8px; margin:0 0 16px; }
   .filters select { background:#13161b; color:#d8dbe0; border:1px solid #374151; border-radius:5px; padding:6px 8px; font:inherit; font-size:11px; }
+  .live-pnl-strip { display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; margin:0 0 16px; }
+  .live-pnl-card { background:#13161b; border:1px solid #1f242c; border-radius:8px; padding:11px 14px; }
+  .live-pnl-card span { display:block; color:#6b7280; font-size:9px; text-transform:uppercase; letter-spacing:.7px; }
+  .live-pnl-card b { display:block; margin-top:4px; color:#fff; font-size:18px; font-variant-numeric:tabular-nums; }
+  .live-pnl-card small { display:block; margin-top:3px; color:#6b7280; font-size:9px; }
+  @media (max-width: 700px) { .live-pnl-strip { grid-template-columns:repeat(2,1fr); } }
 </style>
 </head>
 <body>
@@ -345,6 +566,12 @@ INDEX_HTML = """<!doctype html>
 <div class="filters">
   <select id="exchange-filter"><option value="">All exchanges</option></select>
   <select id="source-filter"><option value="">All accounts</option></select>
+</div>
+<div class="live-pnl-strip" aria-label="Filtered live portfolio totals">
+  <div class="live-pnl-card"><span>Aggregate live P&amp;L</span><b id="live-pnl-total">â€”</b><small id="live-pnl-note">fresh open positions</small></div>
+  <div class="live-pnl-card"><span>Open notional</span><b id="live-notional-total">â€”</b><small>current filter</small></div>
+  <div class="live-pnl-card"><span>Active positions</span><b id="live-position-count">0</b><small>across tracked markets</small></div>
+  <div class="live-pnl-card"><span>Active accounts</span><b id="live-account-count">0</b><small>with open risk</small></div>
 </div>
 <div class="grid">
   <div class="col-left">
@@ -449,6 +676,79 @@ const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;"
 let _latestPayload = null;
 const _exchangeFilter = document.getElementById("exchange-filter");
 const _sourceFilter = document.getElementById("source-filter");
+function initSortableTables() {
+  document.querySelectorAll("table").forEach(table => {
+    table.querySelectorAll("thead th").forEach((header, index) => {
+      header.dataset.sortIndex = String(index);
+      header.dataset.sortType = header.classList.contains("num") ? "number" : "text";
+      header.tabIndex = 0;
+      header.setAttribute("aria-sort", "none");
+      header.title = "Click to sort";
+    });
+  });
+}
+function tableCellSortValue(cell, type) {
+  const raw = cell?.dataset.sortValue ?? cell?.textContent.trim() ?? "";
+  if (raw === "" || raw === "—") return null;
+  if (type === "number") {
+    const value = Number(String(raw).replace(/[$,%+\\s,]/g, "").replace(/^[−]/, "-"));
+    return Number.isFinite(value) ? value : null;
+  }
+  return String(raw).toLocaleLowerCase();
+}
+function applyTableSort(table) {
+  const index = Number(table.dataset.sortColumn);
+  if (!Number.isInteger(index)) return;
+  const direction = table.dataset.sortDirection || "asc";
+  const headers = [...table.querySelectorAll("thead th")];
+  const type = headers[index]?.dataset.sortType || "text";
+  const body = table.tBodies[0];
+  if (!body) return;
+  const rows = [...body.rows].filter(row => row.cells.length === headers.length);
+  rows.map((row, originalIndex) => ({ row, originalIndex })).sort((a, b) => {
+    const left = tableCellSortValue(a.row.cells[index], type);
+    const right = tableCellSortValue(b.row.cells[index], type);
+    if (left == null && right == null) return a.originalIndex - b.originalIndex;
+    if (left == null) return 1;
+    if (right == null) return -1;
+    const comparison = type === "number"
+      ? left - right
+      : String(left).localeCompare(String(right), undefined, { numeric:true, sensitivity:"base" });
+    return (direction === "asc" ? comparison : -comparison)
+      || a.originalIndex - b.originalIndex;
+  }).forEach(item => body.appendChild(item.row));
+}
+function sortTrackerTable(header) {
+  const table = header.closest("table");
+  const index = header.dataset.sortIndex;
+  const sameColumn = table.dataset.sortColumn === index;
+  const numeric = header.dataset.sortType === "number";
+  table.dataset.sortColumn = index;
+  table.dataset.sortDirection = sameColumn
+    ? (table.dataset.sortDirection === "asc" ? "desc" : "asc")
+    : (numeric ? "desc" : "asc");
+  table.querySelectorAll("thead th").forEach(item => {
+    const active = item === header;
+    item.classList.toggle("sorted", active);
+    item.classList.toggle("sort-asc", active && table.dataset.sortDirection === "asc");
+    item.classList.toggle("sort-desc", active && table.dataset.sortDirection === "desc");
+    item.setAttribute("aria-sort", active
+      ? (table.dataset.sortDirection === "asc" ? "ascending" : "descending")
+      : "none");
+  });
+  applyTableSort(table);
+}
+document.addEventListener("click", event => {
+  const header = event.target.closest("th[data-sort-index]");
+  if (header) sortTrackerTable(header);
+});
+document.addEventListener("keydown", event => {
+  const header = event.target.closest("th[data-sort-index]");
+  if (!header || (event.key !== "Enter" && event.key !== " ")) return;
+  event.preventDefault();
+  sortTrackerTable(header);
+});
+initSortableTables();
 const filterRows = rows => (rows || []).filter(row => {
   const identity = row && row.trade ? row.trade : row;
   return (!_exchangeFilter.value || identity.exchange === _exchangeFilter.value) &&
@@ -474,13 +774,31 @@ function renderPositions(positions) {
       <td>${esc(p.source)}${stale}</td>
       <td>${esc(p.market_symbol)}</td>
       <td class="${p.side}">${p.side.toUpperCase()}${leg}</td>
-      <td class="num">${fmtPrice(entry)}${fn}</td>
-      <td class="num">${fmtUsd(Number(size) * Number(entry))}</td>
-      <td class="num">${fmtPnl(p.unrealized_pnl)}</td>
-      <td class="num">${p.sl_price != null ? fmtPrice(p.sl_price) : "—"}</td>
-      <td class="num">${p.tp_price != null ? fmtPrice(p.tp_price) : "—"}</td>
+      <td class="num" data-sort-value="${Number(entry)}">${fmtPrice(entry)}${fn}</td>
+      <td class="num" data-sort-value="${Number(size) * Number(entry)}">${fmtUsd(Number(size) * Number(entry))}</td>
+      <td class="num" data-sort-value="${p.unrealized_pnl ?? ""}">${fmtPnl(p.unrealized_pnl)}</td>
+      <td class="num" data-sort-value="${p.sl_price ?? ""}">${p.sl_price != null ? fmtPrice(p.sl_price) : "—"}</td>
+      <td class="num" data-sort-value="${p.tp_price ?? ""}">${p.tp_price != null ? fmtPrice(p.tp_price) : "—"}</td>
     </tr>`;
   }).join("");
+  applyTableSort(tb.closest("table"));
+}
+function renderLivePnl(positions) {
+  const filtered = filterRows(positions);
+  const rows = filtered.filter(p => !p.stale);
+  const staleCount = filtered.length - rows.length;
+  const pnl = rows.reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
+  const notional = rows.reduce((sum, p) => sum + (
+    Number(p.notional_usd) || (Number(p.size) * Number(p.avg_entry_price)) || 0
+  ), 0);
+  document.getElementById("live-pnl-total").innerHTML = fmtPnl(pnl);
+  document.getElementById("live-notional-total").textContent = fmtUsd(notional);
+  document.getElementById("live-position-count").textContent = String(rows.length);
+  document.getElementById("live-account-count").textContent =
+    String(new Set(rows.map(p => p.source_id || p.source)).size);
+  document.getElementById("live-pnl-note").textContent = staleCount
+    ? `${staleCount} stale position${staleCount === 1 ? "" : "s"} excluded`
+    : "fresh open positions";
 }
 function renderEvents(events) {
   const tb = document.getElementById("events");
@@ -496,15 +814,16 @@ function renderEvents(events) {
     const notional = disp.notional ?? (Number(size) * Number(price));
     const fn = disp.footnote ? ` <span style="font-size:10px;color:#6b7280">${esc(disp.footnote)}</span>` : "";
     return `<tr>
-      <td>${time}</td>
+      <td data-sort-value="${new Date(t.timestamp).getTime()}">${time}</td>
       <td>${esc(t.source)}</td>
       <td class="kind-${e.kind}">${e.kind}</td>
       <td>${esc(t.market_symbol)}</td>
       <td class="${t.side}">${t.side.toUpperCase()}</td>
-      <td class="num">${fmtPrice(price)}${fn}</td>
-      <td class="num">${fmtUsd(notional)}</td>
+      <td class="num" data-sort-value="${Number(price)}">${fmtPrice(price)}${fn}</td>
+      <td class="num" data-sort-value="${Number(notional)}">${fmtUsd(notional)}</td>
     </tr>`;
   }).join("");
+  applyTableSort(tb.closest("table"));
 }
 function renderAlerts(alerts) {
   const tb = document.getElementById("alerts");
@@ -512,10 +831,11 @@ function renderAlerts(alerts) {
   if (!a.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">no alerts sent yet</td></tr>'; return; }
   tb.innerHTML = a.map(x => `
     <tr>
-      <td class="num">${toIST(x.ts)}</td>
+      <td class="num" data-sort-value="${new Date(x.ts).getTime()}">${toIST(x.ts)}</td>
       <td><span class="badge badge-${x.kind === 'card' ? 'card' : 'text'}">${x.kind === 'card' ? 'CARD' : 'TEXT'}</span></td>
       <td class="alert-msg">${esc(x.text)}</td>
     </tr>`).join("");
+  applyTableSort(tb.closest("table"));
 }
 function renderSources(sources) {
   const s = sources || [];
@@ -538,6 +858,7 @@ function renderPayload(data) {
   _latestPayload = data;
   renderSources(data.sources);
   renderSourceFilters(data.source_details);
+  renderLivePnl(data.positions);
   renderPositions(data.positions);
   renderOpenOrders(data.open_orders || []);
   renderEvents(filterRows(data.recent_events));
@@ -906,12 +1227,13 @@ function renderOpenOrders(orders) {
       <td>${esc(o.market_symbol)}</td>
       <td class="${sideClass}">${o.side.toUpperCase()}</td>
       <td>${esc(o.order_kind)}</td>
-      <td class="num">${price}</td>
-      <td class="num">${trigger}</td>
-      <td class="num">${notional}</td>
+      <td class="num" data-sort-value="${o.price ?? ""}">${price}</td>
+      <td class="num" data-sort-value="${o.trigger_px ?? ""}">${trigger}</td>
+      <td class="num" data-sort-value="${o.notional ?? ""}">${notional}</td>
     </tr>`;
   }).join("");
   fnEl.textContent = footnoteTxt;
+  applyTableSort(tb.closest("table"));
 }
 
 // --- Send stats to Telegram button ---
@@ -1076,6 +1398,69 @@ async def _run() -> None:
     if backfill_count:
         log.info("backfilled %d closed trades from events table", backfill_count)
 
+    # Canonical reads remain opt-in until account aliases have passed live
+    # parity checks.  This lets alert-only releases ship without silently
+    # changing historical P&L or portfolio membership.
+    canonical_reads_enabled = os.getenv(
+        "CANONICAL_PNL_READS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    # Canonical accounting cutover: adapt legacy rows once, then make the
+    # default portfolio membership exactly match configured account IDs.
+    # Historical ledgers are retained when an account is removed; only its
+    # membership flag changes, so aggregate P&L adjusts without deleting data.
+    # A temporarily unavailable/config-error account keeps its membership so a
+    # missing credential cannot make historical P&L disappear.  Only an
+    # explicitly disabled or removed source is excluded.
+    _membership_accounts = [
+        {
+            "account_id": source.id,
+            "display_name": source.name,
+            "exchange": source.exchange,
+        }
+        for source in sources
+    ]
+    _membership_accounts.extend(
+        {
+            "account_id": issue.source_id,
+            "display_name": issue.name,
+            "exchange": issue.exchange,
+        }
+        for issue in source_report.issues
+        if issue.source_id and issue.status != "disabled"
+    )
+    _source_aliases = {
+        (account["display_name"], account["exchange"]): account["account_id"]
+        for account in _membership_accounts
+    }
+    _source_aliases.update(
+        {
+            (account["display_name"], ""): account["account_id"]
+            for account in _membership_accounts
+        }
+    )
+    if canonical_reads_enabled:
+        canonical_backfill = await backfill_canonical_ledger(
+            DB_PATH, aliases=_source_aliases
+        )
+        if canonical_backfill["inserted"]:
+            log.info(
+                "canonical ledger backfill inserted %d/%d realizations",
+                canonical_backfill["inserted"],
+                canonical_backfill["scanned"],
+            )
+        membership_result = await sync_portfolio_membership(
+            DB_PATH,
+            _membership_accounts,
+        )
+        log.info(
+            "canonical portfolio membership: %d included, %d removed",
+            membership_result["included"],
+            membership_result["removed"],
+        )
+    else:
+        log.info("canonical PnL reads disabled; using legacy realization view")
+
     # recent_events holds Event objects (new this session) and dicts (loaded from DB).
     # _to_jsonable handles both transparently.
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
@@ -1083,12 +1468,32 @@ async def _run() -> None:
 
     # Load full history for stats when cfg.stats_full_history; cap the UI payload slice.
     if cfg.stats_full_history:
-        _all_closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, None))
+        _all_closed_trades: list[dict] = list(
+            await (
+                load_canonical_realizations(DB_PATH, None)
+                if canonical_reads_enabled
+                else load_closed_trades(DB_PATH, None)
+            )
+        )
         closed_trades: list[dict] = _all_closed_trades  # keep full list; sliced in payload
-        log.info("loaded %d closed trades (full history) from db", len(closed_trades))
+        log.info(
+            "loaded %d %s realizations (full history)",
+            len(closed_trades),
+            "canonical" if canonical_reads_enabled else "legacy",
+        )
     else:
-        closed_trades: list[dict] = list(await load_closed_trades(DB_PATH, cfg.max_closed_trades))
-        log.info("loaded %d closed trades from db", len(closed_trades))
+        closed_trades: list[dict] = list(
+            await (
+                load_canonical_realizations(DB_PATH, cfg.max_closed_trades)
+                if canonical_reads_enabled
+                else load_closed_trades(DB_PATH, cfg.max_closed_trades)
+            )
+        )
+        log.info(
+            "loaded %d %s realizations",
+            len(closed_trades),
+            "canonical" if canonical_reads_enabled else "legacy",
+        )
 
     # Boot dedup set: union of all fill ids ever recorded — prevents re-recording
     # the same fill after a restart (e.g. reduce batch flushed before crash).
@@ -1207,8 +1612,14 @@ async def _run() -> None:
             symbols=cfg.stats_symbols,
             exclude_symbols=_excluded_symbols,
         )
-        # 2. Build one record per round-trip from the surviving fills.
-        agg = aggregate_round_trips(rows)
+        # 2. Project every account independently, then compose the central
+        #    portfolio view.  The dashboard never invents a second grouping
+        #    rule on top of the canonical accounting handler.
+        agg = list(
+            project_portfolio(rows).trades
+            if canonical_reads_enabled
+            else aggregate_round_trips(rows)
+        )
         for row in agg:
             _derive_hl_disp_fields(row)
         if not include_open:
@@ -1262,6 +1673,10 @@ async def _run() -> None:
     # Each source is wrapped in an individual try/except so a Binance failure
     # (e.g. all proxies dead) never prevents HL/Lighter from starting.
     # Failed sources are marked down in health and omitted from the active loop.
+    _source_session_started_at: dict[str, datetime] = {
+        source.id: datetime.now(timezone.utc) for source in sources
+    }
+    _suppressed_startup_backfills: dict[str, int] = {}
     _active_sources: list[Source] = []
     for s in sources:
         try:
@@ -1544,10 +1959,13 @@ async def _run() -> None:
             log.info("tg_send: another sender owns pending alert %s", outbox_uid)
             return
         try:
+            send_data = {"chat_id": tg_channel, "text": text}
+            if _uses_telegram_html(text):
+                send_data["parse_mode"] = "HTML"
             r, body = await _tg_channel_post(
                 "sendMessage",
                 dedup_hash=h,
-                data={"chat_id": tg_channel, "text": text},
+                data=send_data,
             )
             if body.get("_dedup"):
                 await mark_notification(
@@ -1574,7 +1992,7 @@ async def _run() -> None:
                 )
             else:
                 health.mark_up("telegram")
-                await _record_tg_alert("text", text)
+                await _record_tg_alert("text", _plain_telegram_text(text))
                 _tg_sent[h] = time.monotonic()
                 await mark_notification(
                     DB_PATH,
@@ -1627,9 +2045,12 @@ async def _run() -> None:
             log.info("tg_send_photo: another sender owns pending alert %s", outbox_uid)
             return
         try:
+            send_data = {"chat_id": tg_channel, "caption": caption}
+            if _uses_telegram_html(caption):
+                send_data["parse_mode"] = "HTML"
             r, body = await _tg_channel_post(
                 "sendPhoto",
-                data={"chat_id": tg_channel, "caption": caption},
+                data=send_data,
                 files={"photo": ("card.png", image_bytes, "image/png")},
             )
             if not body.get("ok"):
@@ -1712,7 +2133,10 @@ async def _run() -> None:
             )
             return
         src = by_id.get(source_id)
-        header = f"📦 {src.name if src else source_id} — {len(msgs)} updates"
+        header = (
+            f"📦 {html_lib.escape(src.name if src else source_id)}"
+            f" — {len(msgs)} updates"
+        )
         # Pack messages into as few sends as the 4096-char cap allows.
         chunk: list[str] = []
         chunk_len = len(header)
@@ -1786,27 +2210,14 @@ async def _run() -> None:
         FULL close card show the whole trade's total. Restart-safe: the partials
         were persisted, so they're back in closed_trades after a reboot.
         """
-        total = Decimal(0)
-        for row in closed_trades:
-            if (
-                not _row_belongs_to_source(row, source_id, source_name)
-                or row.get("market_symbol") != market_symbol
-                or (row.get("position_side") or "BOTH") != position_side
-            ):
-                continue
-            # ANY non-PARTIAL row (FULL, legacy NULL, unknown) closes a round-trip
-            # — same rule as stats.aggregate_round_trips. Breaking only on FULL
-            # let legacy NULL rows from the PREVIOUS trade leak into this card's
-            # total (e.g. a FET card showed +165.47 instead of +16.61).
-            if (row.get("realization_kind") or "").upper() != "PARTIAL":
-                break  # boundary of the previous round-trip
-            p = row.get("pnl")
-            if p is not None:
-                try:
-                    total += Decimal(str(p))
-                except Exception:
-                    pass
-        return total
+        context = _roundtrip_partial_context(
+            closed_trades,
+            source_id,
+            source_name,
+            market_symbol,
+            position_side,
+        )
+        return context["pnl"] if context["pnl"] is not None else Decimal(0)
 
     def _roundtrip_start_ts(
         source_id: str,
@@ -1817,20 +2228,13 @@ async def _run() -> None:
         """ISO ts of the OLDEST recorded PARTIAL in the current (not-yet-closed)
         round-trip for this (source, coin), or None if it has no partials.
         Same walk/boundary rule as _roundtrip_partial_pnl."""
-        oldest: "str | None" = None
-        for row in closed_trades:
-            if (
-                not _row_belongs_to_source(row, source_id, source_name)
-                or row.get("market_symbol") != market_symbol
-                or (row.get("position_side") or "BOTH") != position_side
-            ):
-                continue
-            if (row.get("realization_kind") or "").upper() != "PARTIAL":
-                break
-            ts = row.get("ts")
-            if ts:
-                oldest = ts  # newest-first walk → last seen is the oldest
-        return oldest
+        return _roundtrip_partial_context(
+            closed_trades,
+            source_id,
+            source_name,
+            market_symbol,
+            position_side,
+        )["oldest_ts"]
 
     # ── Shared realization recorder ───────────────────────────────────────────
     async def record_realization(
@@ -1847,6 +2251,7 @@ async def _run() -> None:
         fill_ids: "list[int]",
         anchor_entry: Decimal,
         card_pnl_override: "Decimal | None" = None,
+        card_position_before: "Position | None" = None,
     ) -> None:
         """Record a single realization event (partial close or full close).
 
@@ -1889,7 +2294,7 @@ async def _run() -> None:
         synth_ev = _Event(
             kind=_EventKind.CLOSE,
             trade=synth_trade,
-            position_before=position_before,
+            position_before=card_position_before or position_before,
             position_after=None,
         )
         synth_ev_with_leverage = synth_ev
@@ -2048,7 +2453,7 @@ async def _run() -> None:
             net_added_usd=buf["net_added"],
             n_fills=buf["n_fills"],
             leverage=buf["leverage"],
-            pool_url=src.url,
+            pool_url="",
             source_name=src.name,
             sl=sl,
             tp=tp,
@@ -2089,6 +2494,7 @@ async def _run() -> None:
             buf["net_reduced"],
             src.min_notional,
             closing=not send_alert,
+            remaining_notional=pos.notional_usd,
         ):
             text = format_reduce_aggregate(
                 position=pos,
@@ -2096,7 +2502,7 @@ async def _run() -> None:
                 n_fills=buf["n_fills"],
                 realized_pnl=buf["total_pnl"],
                 leverage=buf["leverage"],
-                pool_url=src.url,
+                pool_url="",
                 source_name=src.name,
                 sl=sl,
                 tp=tp,
@@ -2487,14 +2893,40 @@ async def _run() -> None:
                                 if disp_tp is not None:
                                     sl_parts.append(f"TP: ${disp_tp:,.4f}")
                                 sl_tp_str = ("\n" + "  |  ".join(sl_parts)) if sl_parts else ""
-                                footer    = f"\n{src.url}" if src.url else ""
-                                fn_line   = f"\n{fn_text}" if fn_text else ""
+                                footer = ""
+                                fn_line = (
+                                    f"\n{html_lib.escape(fn_text)}"
+                                    if fn_text else ""
+                                )
+                                side_html = (
+                                    "🟢 <b>LONG</b>"
+                                    if pos.side == "long"
+                                    else "🔴 <b>SHORT</b>"
+                                )
+                                risk_parts = []
+                                if disp_sl is not None:
+                                    risk_parts.append(
+                                        f"🛑 SL: <b>${disp_sl:,.4f}</b>"
+                                    )
+                                if disp_tp is not None:
+                                    risk_parts.append(
+                                        f"🎯 TP: <b>${disp_tp:,.4f}</b>"
+                                    )
+                                risk_line = (
+                                    "\n" + "  ·  ".join(risk_parts)
+                                    if risk_parts else ""
+                                )
+                                leverage_html = (
+                                    f"  ·  ⚡ <b>{lev:g}x</b>"
+                                    if lev is not None else ""
+                                )
                                 msg = (
-                                    f"📍 {src.name}\n"
-                                    f"Opened {direction} {pos.market_symbol}\n"
-                                    f"Entry: ${disp_entry_val:,.4f}  |  "
-                                    f"Notional: ${disp_not_val:,.0f}"
-                                    f"{lev_str}{sl_tp_str}{fn_line}{footer}"
+                                    f"📍 {html_lib.escape(src.name)}\n"
+                                    f"Opened {side_html} "
+                                    f"{html_lib.escape(pos.market_symbol)}\n"
+                                    f"🎯 Entry: <b>${disp_entry_val:,.4f}</b>\n"
+                                    f"💼 Position: <b>${disp_not_val:,.0f}</b>"
+                                    f"{leverage_html}{risk_line}{fn_line}{footer}"
                                 )
                                 await tg_send(
                                     msg,
@@ -2522,6 +2954,20 @@ async def _run() -> None:
                 # fill-based tracker, so we catch closes the tracker also missed.
                 for market_id, pos in prev_dash.items():
                     if market_id not in actual:
+                        # The fill consumer already removed this market from the
+                        # tracker before generating its close card. In that case
+                        # this API transition is confirmation, not an unobserved
+                        # close, and must not emit a second text alert/backfill.
+                        if _close_already_observed_by_fill(market_id, tracked):
+                            log.info(
+                                "[%s] reconcile: %s close already handled by fill; "
+                                "suppressing duplicate close alert",
+                                src.name,
+                                pos.market_symbol,
+                            )
+                            _reconciler_alerted_opens.discard((src.id, market_id))
+                            _sl_tp_alerted.discard((src.id, market_id))
+                            continue
                         log.warning(
                             "[%s] reconcile: %s %s closed while unobserved",
                             src.name, pos.side, pos.market_symbol,
@@ -2612,7 +3058,7 @@ async def _run() -> None:
 
                         if tg_token and tg_channel:
                             direction = "🟢 LONG" if pos.side == "long" else "🔴 SHORT"
-                            footer    = f"\n{src.url}" if src.url else ""
+                            footer = ""
 
                             # Transform displayed values for HL (close price unavailable)
                             disp_entry_val = pos.avg_entry_price
@@ -2631,11 +3077,22 @@ async def _run() -> None:
                                 # Clear anchor now that position is gone
                                 _privacy_anchor.get(src.id, {}).pop(market_id, None)
 
-                            fn_line = f"\n{fn_text}" if fn_text else ""
+                            fn_line = (
+                                f"\n{html_lib.escape(fn_text)}"
+                                if fn_text else ""
+                            )
+                            side_html = (
+                                "🟢 <b>LONG</b>"
+                                if pos.side == "long"
+                                else "🔴 <b>SHORT</b>"
+                            )
                             msg = (
-                                f"📍 {src.name}\n"
-                                f"Closed {direction} {pos.market_symbol}\n"
-                                f"Entry: ${disp_entry_val:,.2f}  |  Notional: ${disp_not_val:,.0f}  (close price unavailable)"
+                                f"📍 {html_lib.escape(src.name)}\n"
+                                f"Closed {side_html} "
+                                f"{html_lib.escape(pos.market_symbol)}\n"
+                                f"🎯 Entry: <b>${disp_entry_val:,.2f}</b>\n"
+                                f"💼 Position: <b>${disp_not_val:,.0f}</b>\n"
+                                f"<i>Close price unavailable</i>"
                                 f"{fn_line}{footer}"
                             )
                             await tg_send(
@@ -2669,7 +3126,7 @@ async def _run() -> None:
                             market_symbol=pos.market_symbol,
                             sl=sl,
                             tp=tp,
-                            pool_url=src.url,
+                            pool_url="",
                             privacy=privacy,
                             is_hl=src.is_hyperliquid,
                             anchor_entry=ae,
@@ -2770,6 +3227,28 @@ async def _run() -> None:
                 str(src.last_trade_id),
                 datetime.now(timezone.utc).isoformat(),
             )
+            session_started = _source_session_started_at.get(src.id)
+            if (
+                session_started is not None
+                and _is_pre_session_backfill(
+                    trade.timestamp,
+                    session_started,
+                    grace_seconds=max(120, cfg.rest_poll_seconds * 2),
+                )
+            ):
+                count = _suppressed_startup_backfills.get(src.id, 0) + 1
+                _suppressed_startup_backfills[src.id] = count
+                if count <= 3 or count in {10, 25, 50, 100, 250, 500}:
+                    log.warning(
+                        "[%s] suppressed pre-session backfill fill %s "
+                        "(trade ts=%s, session=%s, suppressed=%d)",
+                        src.name,
+                        trade.event_uid(src.id),
+                        trade.timestamp.isoformat(),
+                        session_started.isoformat(),
+                        count,
+                    )
+                continue
             events = src.tracker.apply(trade)
             for ev in events:
                 if src.is_excluded(ev.trade.market_symbol):
@@ -2851,7 +3330,7 @@ async def _run() -> None:
                         ae = _anchor(src, ev.trade.market_id, ev.trade.price)
                         await tg_send(
                             format_event(
-                                ev, src.url, src.name, sl=sl, tp=tp,
+                                ev, "", src.name, sl=sl, tp=tp,
                                 privacy=privacy, is_hl=src.is_hyperliquid,
                                 anchor_entry=ae, source_id=src.id,
                             ),
@@ -2907,15 +3386,21 @@ async def _run() -> None:
                     # booked on this trade's scale-outs + this close fill. The
                     # pending reduce batch was flushed just above, so those PARTIAL
                     # rows are already in closed_trades.
-                    _rt_partials = _roundtrip_partial_pnl(
+                    _rt_context = _roundtrip_partial_context(
+                        closed_trades,
                         src.id,
                         src.name,
                         ev.trade.market_symbol,
                         ev.trade.position_side,
                     )
+                    _rt_partials = _rt_context["pnl"]
                     _card_total = (
                         (_rt_partials + realized)
-                        if (realized is not None and _rt_partials != 0)
+                        if (
+                            realized is not None
+                            and _rt_context["count"]
+                            and _rt_partials is not None
+                        )
                         else None  # no scale-outs → card shows this fill's pnl as usual
                     )
 
@@ -2952,6 +3437,9 @@ async def _run() -> None:
                                     _recorded_realizations,
                                     src.id,
                                     ev.trade,
+                                    lifecycle_start=(
+                                        _rt_start_dt - timedelta(seconds=2)
+                                    ),
                                 )
                                 for _missing_fill in _missing_ex_fills:
                                     if pos_b is None:
@@ -3002,6 +3490,23 @@ async def _run() -> None:
                                     src.name, ev.trade.market_symbol, exc_info=True,
                                 )
 
+                    # Include any missing exchange fills inserted above, then
+                    # reconstruct the complete lifecycle for card rendering.
+                    _rt_context = _roundtrip_partial_context(
+                        closed_trades,
+                        src.id,
+                        src.name,
+                        ev.trade.market_symbol,
+                        ev.trade.position_side,
+                    )
+                    _full_close_position = (
+                        pos_b if pos_b is not None else ev.position_before
+                    )
+                    _card_position = _lifecycle_card_position(
+                        _full_close_position,
+                        _rt_context,
+                    )
+
                     # Record the FULL close realization (card + DB + broadcast)
                     await record_realization(
                         src=src,
@@ -3016,6 +3521,7 @@ async def _run() -> None:
                         fill_ids=[ev.trade.trade_id] if ev.trade.trade_id is not None else [],
                         anchor_entry=_close_anchor,
                         card_pnl_override=_card_total,
+                        card_position_before=_card_position,
                     )
 
                     if cfg.alert_on_close:
@@ -3054,9 +3560,19 @@ async def _run() -> None:
                             # searchable by ticker (the figures were previously
                             # only inside the image). PnL exact = allowed by the
                             # privacy posture; no price/size in the caption.
-                            _caption = f"{ev.trade.market_symbol} {side_txt} · {pnl_txt}"
-                            if src.url:
-                                _caption += f"\n{src.url}"
+                            side_marker = (
+                                "🟢" if side_txt == "LONG" else "🔴"
+                            )
+                            pnl_marker = (
+                                "🟢"
+                                if pnl_for_log is not None and pnl_for_log >= 0
+                                else "🔴"
+                            )
+                            _caption = (
+                                f"<b>{html_lib.escape(ev.trade.market_symbol)}</b>\n"
+                                f"{side_marker} <b>{side_txt} CLOSED</b>\n"
+                                f"{pnl_marker} P&amp;L: <b>{pnl_txt}</b>"
+                            )
                             await tg_send_photo(
                                 card_bytes,
                                 caption=_caption,
@@ -3068,9 +3584,14 @@ async def _run() -> None:
                             )
                         else:
                             ae = _close_anchor
+                            _fallback_event = (
+                                replace(ev, position_before=_card_position)
+                                if _card_position is not None
+                                else ev
+                            )
                             await tg_send(
                                 format_event(
-                                    ev, src.url, src.name,
+                                    _fallback_event, "", src.name,
                                     privacy=privacy, is_hl=src.is_hyperliquid,
                                     anchor_entry=ae, source_id=src.id,
                                 ),
@@ -3281,8 +3802,13 @@ async def _run() -> None:
             symbols=cfg.stats_symbols,
             exclude_symbols=_excluded_symbols,
         )
+        projected_rows = (
+            project_portfolio(rows).trades
+            if canonical_reads_enabled
+            else aggregate_round_trips(rows)
+        )
         agg = [
-            r for r in aggregate_round_trips(rows)
+            r for r in projected_rows
             if (r.get("realization_kind") or "").upper() == "FULL"
         ]
         if not agg:
@@ -3387,23 +3913,37 @@ async def _run() -> None:
                 except Exception:
                     log.exception("daily self-audit failed")
 
-    # ── Owner-only Telegram commands ─────────────────────────────────────────
-    _telegram_commands = [
+    # ── Community + owner Telegram commands ──────────────────────────────────
+    _community_telegram_commands = [
         {"command": "positions", "description": "Live open positions"},
-        {"command": "orders", "description": "Cached open orders"},
         {"command": "trades", "description": "Recent completed trades"},
-        {"command": "fills", "description": "Recent executions and events"},
+        {"command": "latest", "description": "Latest completed trades"},
         {"command": "pnl", "description": "PnL for today, 7d, 30d or all"},
+        {"command": "today", "description": "Today's performance"},
+        {"command": "weekly", "description": "Seven-day performance"},
         {"command": "stats", "description": "Performance summary and card"},
+        {"command": "coin", "description": "Performance for one coin"},
+        {"command": "leaderboard", "description": "Top coins by realized PnL"},
+        {"command": "status", "description": "Public tracker status"},
+        {"command": "about", "description": "How this tracker works"},
+        {"command": "help", "description": "Show community commands"},
+    ]
+    _owner_telegram_commands = [
+        *_community_telegram_commands,
+        {"command": "orders", "description": "Cached open orders"},
+        {"command": "fills", "description": "Recent executions and events"},
         {"command": "risk", "description": "Exposure and concentration"},
         {"command": "sources", "description": "Configured source status"},
         {"command": "health", "description": "Bot component health"},
         {"command": "dashboard", "description": "Open the web dashboard"},
         {"command": "version", "description": "Version and process start time"},
-        {"command": "help", "description": "Show command help"},
     ]
-    _command_rate_last = 0.0
-    _command_rate_seconds = 2.0
+    _command_rate_last: dict[tuple[int, int], float] = {}
+    _command_chat_rate_last: dict[int, float] = {}
+    _community_command_rate_seconds = 5.0
+    _owner_command_rate_seconds = 1.0
+    _discussion_command_rate_seconds = 4.0
+    _community_card_rate_seconds = 15.0
 
     async def _tg_reply(
         chat_id: str,
@@ -3419,6 +3959,8 @@ async def _run() -> None:
                 "text": chunk,
                 "disable_web_page_preview": "true",
             }
+            if _uses_telegram_html(chunk):
+                data["parse_mode"] = "HTML"
             if reply_to_message_id is not None:
                 data["reply_parameters"] = json.dumps(
                     {"message_id": reply_to_message_id}
@@ -3434,11 +3976,28 @@ async def _run() -> None:
                 raise RuntimeError("Telegram rejected command reply")
 
     async def _tg_reply_photo(
-        chat_id: str, image_bytes: bytes, caption: str
+        chat_id: str,
+        image_bytes: bytes,
+        caption: str,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> None:
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "caption": caption[:1000],
+        }
+        if _uses_telegram_html(caption):
+            data["parse_mode"] = "HTML"
+        if reply_to_message_id is not None:
+            data["reply_parameters"] = json.dumps(
+                {"message_id": reply_to_message_id}
+            )
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
         response = await tg_client.post(
             f"https://api.telegram.org/bot{tg_token}/sendPhoto",
-            data={"chat_id": chat_id, "caption": caption[:1000]},
+            data=data,
             files={"photo": ("stats.png", image_bytes, "image/png")},
         )
         response.raise_for_status()
@@ -3551,98 +4110,173 @@ async def _run() -> None:
         ]
 
     async def _handle_tg_command(
-        command: str, args: list[str], chat_id: str
+        command: str,
+        args: list[str],
+        chat_id: str,
+        *,
+        is_owner: bool,
+        reply_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        if command in {"start", "help"}:
-            await _tg_reply(chat_id, format_help())
+        reply_options = reply_kwargs or {}
+
+        async def reply(text: str) -> None:
+            await _tg_reply(chat_id, text, **reply_options)
+
+        if not command_is_allowed(command, is_owner=is_owner):
+            if command in OWNER_COMMANDS:
+                await reply("That command is available only to the bot owner.")
+            else:
+                await reply(
+                    f"Unknown command: /{command}\n\n"
+                    f"{format_help(owner=is_owner)}"
+                )
+            return
+
+        if command in {"start", "help", "commands"}:
+            await reply(format_help(owner=is_owner))
+            return
+        if command == "about":
+            await reply(format_about())
+            return
+        if command == "status":
+            snap = health.snapshot()
+            updated = datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
+                "%d %b %Y, %I:%M:%S %p IST"
+            )
+            await reply(
+                format_public_status(
+                    ready=bool(snap.get("ready")),
+                    active_sources=len(sources),
+                    open_positions=len(all_positions()),
+                    updated_at=updated,
+                )
+            )
             return
         if command == "positions":
-            await _tg_reply(chat_id, format_positions(all_positions(), " ".join(args)))
+            await reply(format_positions(all_positions(), " ".join(args)))
             return
         if command == "orders":
-            await _tg_reply(chat_id, format_orders(all_open_orders(), " ".join(args)))
+            await reply(format_orders(all_open_orders(), " ".join(args)))
             return
-        if command == "trades":
-            count, source_query = parse_count_and_source(args)
-            await _tg_reply(
-                chat_id,
+        if command in {"trades", "latest"}:
+            default_count = 5 if command == "latest" else 10
+            count, source_query = parse_count_and_source(
+                args, default=default_count
+            )
+            await reply(
                 format_trades(
                     display_trades(include_open=False), count, source_query
-                ),
+                )
             )
             return
         if command == "fills":
             count, source_query = parse_count_and_source(args)
-            await _tg_reply(
-                chat_id,
-                format_fills(_safe_recent_fills(), count, source_query),
+            await reply(
+                format_fills(_safe_recent_fills(), count, source_query)
             )
             return
-        if command == "pnl":
-            window = "all"
+        if command in {"pnl", "today", "weekly"}:
+            window = {
+                "today": "today",
+                "weekly": "7d",
+            }.get(command, "all")
             source_args = list(args)
-            if source_args and source_args[0].lower() in {
+            if command == "pnl" and source_args and source_args[0].lower() in {
                 "today", "7d", "30d", "all"
             }:
                 window = source_args.pop(0).lower()
             source_query = " ".join(source_args)
             summary = compute_stats(_pnl_rows(window, source_query))
             title = f"PnL — {window}{f' · {source_query}' if source_query else ''}"
-            await _tg_reply(chat_id, format_stats_summary(summary, title=title))
+            await reply(format_stats_summary(summary, title=title))
             return
-        if command == "stats":
+        if command in {"stats", "performance"}:
             text = format_stats_summary(stats_state)
             try:
-                await _tg_reply_photo(chat_id, render_stats_card(stats_state), text)
+                await _tg_reply_photo(
+                    chat_id,
+                    render_stats_card(stats_state),
+                    text,
+                    **reply_options,
+                )
             except Exception:
                 log.exception("Telegram /stats card failed; sending text")
-                await _tg_reply(chat_id, text)
+                await reply(text)
+            return
+        if command == "coin":
+            if not args:
+                await reply("Usage: /coin BTC [today|7d|30d|all] [source]")
+                return
+            symbol = args[0].upper()
+            rest = list(args[1:])
+            window = "all"
+            if rest and rest[0].lower() in {"today", "7d", "30d", "all"}:
+                window = rest.pop(0).lower()
+            source_query = " ".join(rest)
+            rows = [
+                row
+                for row in _pnl_rows(window, source_query)
+                if str(row.get("market_symbol") or "").upper() == symbol
+            ]
+            title = f"{symbol} performance — {window}"
+            await reply(format_stats_summary(compute_stats(rows), title=title))
+            return
+        if command == "leaderboard":
+            window = (
+                args[0].lower()
+                if args and args[0].lower() in {"today", "7d", "30d", "all"}
+                else "all"
+            )
+            source_args = args[1:] if args and args[0].lower() == window else args
+            summary = compute_stats(_pnl_rows(window, " ".join(source_args)))
+            await reply(format_leaderboard(summary, window))
             return
         if command == "risk":
-            await _tg_reply(chat_id, format_risk(all_positions(), " ".join(args)))
+            await reply(format_risk(all_positions(), " ".join(args)))
             return
         if command == "sources":
             details = [
                 {"id": source.id, "name": source.name, "exchange": source.exchange}
                 for source in sources
             ]
-            await _tg_reply(chat_id, format_sources(details, health.snapshot()))
+            await reply(format_sources(details, health.snapshot()))
             return
         if command == "health":
-            await _tg_reply(chat_id, format_health(health.snapshot()))
+            await reply(format_health(health.snapshot()))
             return
         if command == "dashboard":
             url = os.getenv(
                 "DASHBOARD_PUBLIC_URL",
                 "https://dashboard.8-231-102-153.sslip.io/",
             ).strip()
-            await _tg_reply(chat_id, f"Trade tracker dashboard\n{url}")
+            await reply(f"Trade tracker dashboard\n{url}")
             return
         if command == "version":
             marker = Path(".deployed_commit")
             commit = marker.read_text(encoding="utf-8").strip() if marker.exists() else "local"
             snap = health.snapshot()
-            await _tg_reply(
-                chat_id,
+            await reply(
                 f"Trade tracker version\nCommit: {commit}\n"
-                f"Started: {snap.get('started_at') or 'unknown'}",
+                f"Started: {snap.get('started_at') or 'unknown'}"
             )
             return
-        await _tg_reply(chat_id, f"Unknown command: /{command}\n\n{format_help()}")
 
     async def telegram_command_listener() -> None:
-        """Serve owner commands from DM or the linked discussion group."""
-        nonlocal _command_rate_last
-        if not (tg_token and tg_owner):
+        """Serve community commands in DMs and the linked discussion group."""
+        nonlocal _command_rate_last, _command_chat_rate_last
+        if not tg_token:
             health.mark_disabled(
-                "telegram_commands", "bot token or owner user id is missing"
+                "telegram_commands", "bot token is missing"
             )
             return
-        try:
-            owner_id = int(tg_owner)
-        except ValueError:
-            health.mark_down("telegram_commands", "invalid owner user id")
-            return
+        owner_id: int | None = None
+        if tg_owner:
+            try:
+                owner_id = int(tg_owner)
+            except ValueError:
+                health.mark_degraded(
+                    "telegram_commands", error="invalid owner user id"
+                )
 
         discussion_id: int | None = None
         configured_discussion = os.getenv(
@@ -3675,21 +4309,47 @@ async def _run() -> None:
                 )
 
         discussion_menu_ok = discussion_id is not None
-        scopes = [{"type": "chat", "chat_id": owner_id}]
-        if discussion_id is not None:
-            scopes.append(
-                {
-                    "type": "chat_member",
-                    "chat_id": discussion_id,
-                    "user_id": owner_id,
-                }
+        menu_scopes: list[tuple[dict[str, Any], list[dict], str]] = [
+            (
+                {"type": "all_private_chats"},
+                _community_telegram_commands,
+                "community private",
             )
-        for scope in scopes:
+        ]
+        if owner_id is not None:
+            menu_scopes.append(
+                (
+                    {"type": "chat", "chat_id": owner_id},
+                    _owner_telegram_commands,
+                    "owner private",
+                )
+            )
+        if discussion_id is not None:
+            menu_scopes.append(
+                (
+                    {"type": "chat", "chat_id": discussion_id},
+                    _community_telegram_commands,
+                    "community discussion",
+                )
+            )
+            if owner_id is not None:
+                menu_scopes.append(
+                    (
+                        {
+                            "type": "chat_member",
+                            "chat_id": discussion_id,
+                            "user_id": owner_id,
+                        },
+                        _owner_telegram_commands,
+                        "owner discussion",
+                    )
+                )
+        for scope, commands, scope_label in menu_scopes:
             try:
                 response = await tg_client.post(
                     f"https://api.telegram.org/bot{tg_token}/setMyCommands",
                     data={
-                        "commands": json.dumps(_telegram_commands),
+                        "commands": json.dumps(commands),
                         "scope": json.dumps(scope),
                     },
                 )
@@ -3697,16 +4357,18 @@ async def _run() -> None:
                 if not response.json().get("ok"):
                     raise RuntimeError("Telegram rejected command menu")
             except Exception as exc:
-                if scope.get("type") == "chat_member":
+                if "discussion" in scope_label:
                     discussion_menu_ok = False
                     log.warning(
-                        "Telegram discussion command menu unavailable (%s); "
+                        "Telegram %s command menu unavailable (%s); "
                         "add the bot as an administrator in the linked discussion",
+                        scope_label,
                         type(exc).__name__,
                     )
                 else:
                     log.error(
-                        "could not register private Telegram command menu (%s)",
+                        "could not register %s Telegram command menu (%s)",
+                        scope_label,
                         type(exc).__name__,
                     )
 
@@ -3782,24 +4444,71 @@ async def _run() -> None:
                     if output_chat is None:
                         continue
                     origin_chat = str((message.get("chat") or {}).get("id"))
-                    in_discussion = output_chat != origin_chat
+                    sender_id = int((message.get("from") or {}).get("id"))
+                    chat_id_value = int((message.get("chat") or {}).get("id"))
+                    chat_type = str((message.get("chat") or {}).get("type") or "")
+                    in_discussion = (
+                        discussion_id is not None
+                        and chat_id_value == discussion_id
+                        and chat_type in {"group", "supergroup"}
+                    )
                     feedback_kwargs = {
                         "reply_to_message_id": message.get("message_id"),
                         "message_thread_id": message.get("message_thread_id"),
                     } if in_discussion else {}
-                    now_mono = time.monotonic()
-                    if now_mono - _command_rate_last < _command_rate_seconds:
-                        await _tg_reply(
-                            origin_chat,
-                            "Please wait a moment before sending another command.",
-                            **feedback_kwargs,
-                        )
-                        continue
-                    _command_rate_last = now_mono
                     command, args = parsed
+                    now_mono = time.monotonic()
+                    is_owner = owner_id is not None and sender_id == owner_id
+                    rate_key = (chat_id_value, sender_id)
+                    cooldown = (
+                        _owner_command_rate_seconds
+                        if is_owner
+                        else (
+                            _community_card_rate_seconds
+                            if command in {"stats", "performance"}
+                            else _community_command_rate_seconds
+                        )
+                    )
+                    if in_discussion:
+                        chat_previous = _command_chat_rate_last.get(
+                            chat_id_value, 0.0
+                        )
+                        if (
+                            now_mono - chat_previous
+                            < _discussion_command_rate_seconds
+                        ):
+                            continue
+                    previous = _command_rate_last.get(rate_key, 0.0)
+                    if now_mono - previous < cooldown:
+                        if not in_discussion:
+                            await _tg_reply(
+                                origin_chat,
+                                "Please wait a moment before sending another command.",
+                                **feedback_kwargs,
+                            )
+                        continue
+                    _command_rate_last[rate_key] = now_mono
+                    if in_discussion:
+                        _command_chat_rate_last[chat_id_value] = now_mono
+                    if len(_command_rate_last) > 1000:
+                        cutoff = now_mono - 3600
+                        _command_rate_last = {
+                            key: seen
+                            for key, seen in _command_rate_last.items()
+                            if seen >= cutoff
+                        }
+                        _command_chat_rate_last = {
+                            key: seen
+                            for key, seen in _command_chat_rate_last.items()
+                            if seen >= cutoff
+                        }
                     try:
                         await _handle_tg_command(
-                            command, args, output_chat
+                            command,
+                            args,
+                            output_chat,
+                            is_owner=is_owner,
+                            reply_kwargs=feedback_kwargs,
                         )
                     except Exception as exc:
                         log.error(
@@ -3813,7 +4522,7 @@ async def _run() -> None:
                             **feedback_kwargs,
                         )
                 health.mark_up(
-                    "telegram_commands", detail="owner DM long polling"
+                    "telegram_commands", detail="community DM long polling"
                 )
                 if discussion_id is None:
                     health.mark_disabled(
@@ -3828,7 +4537,7 @@ async def _run() -> None:
                 else:
                     health.mark_up(
                         "telegram_discussion_commands",
-                        detail="owner discussion commands publish to channel",
+                        detail="community discussion commands reply in place",
                     )
             except asyncio.CancelledError:
                 raise

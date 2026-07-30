@@ -366,6 +366,28 @@ class TestFetchRealizingFillsByTime:
         assert len(result) == 1
         assert result[0].trade_id == 100
 
+    def test_discards_api_rows_older_than_requested_start(self):
+        c = make_client()
+        fills = [
+            _raw_fill(
+                tid=99,
+                closed_pnl="500",
+                dir_="Close Long",
+                time_ms=1699999999000,
+            ),
+            _raw_fill(
+                tid=100,
+                closed_pnl="600",
+                dir_="Close Long",
+                time_ms=1700000001000,
+            ),
+        ]
+
+        with patch.object(c._info, "user_fills_by_time", return_value=fills):
+            result = _run(c.fetch_realizing_fills(start_time_ms=1700000000000))
+
+        assert [trade.trade_id for trade in result] == [100]
+
     def test_by_time_error_returns_empty(self):
         c = make_client()
         with patch.object(c._info, "user_fills_by_time", side_effect=Exception("timeout")):

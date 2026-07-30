@@ -39,6 +39,8 @@ stop_all() {
 trap stop_all EXIT INT TERM
 
 start_app "portfolio" "$ROOT" 8790 "$PYTHON_BIN" -B -m src.portfolio_app --host 127.0.0.1 --port 8790
+start_app "signal_research" "$ROOT" 8810 "$PYTHON_BIN" -B -m command_center.app --host 127.0.0.1 --port 8810
+start_app "trade_journal" "$ROOT" 8811 "$PYTHON_BIN" -B -m trade_journal.app --host 127.0.0.1 --port 8811
 start_app "pnl_analytics" "$ROOT" 8787 "$PYTHON_BIN" -B -m standalone.pnl_analytics_bot.dashboard.server --host 127.0.0.1 --port 8787
 start_app "apps_hub" "$ROOT" 8800 "$PYTHON_BIN" -B -m apps_hub.access_page --host 127.0.0.1 --port 8800
 start_app "trade_tracker" "$ROOT" 8080 "$PYTHON_BIN" -B -m src.dashboard
@@ -48,7 +50,9 @@ if [ -f "$ROOT/bots/full_fledged_bot/full_fledged_bot/cli.py" ]; then
 fi
 
 echo
-echo "Lighter Apps Hub: http://127.0.0.1:8800/"
+echo "Crypto Scientist App Hubs: http://127.0.0.1:8800/"
+echo "Signal Research: http://127.0.0.1:8810/"
+echo "Trade Journal: http://127.0.0.1:8811/"
 echo "Logs: $LOG_DIR"
 echo
 echo "Press Ctrl+C to stop apps started by this launcher."

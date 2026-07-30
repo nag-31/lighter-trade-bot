@@ -1,4 +1,4 @@
-# Lighter Apps Hub
+# Crypto Scientist App Hubs
 
 This repo contains several standalone dashboards. They stay separate, but can be started together and accessed from one local page.
 
@@ -20,6 +20,8 @@ In PowerShell, press Enter in the launcher terminal to stop the apps it started.
 
 | App | URL |
 | --- | --- |
+| Signal Research | http://127.0.0.1:8810/ |
+| Trade Journal | http://127.0.0.1:8811/ |
 | Portfolio Overview | http://127.0.0.1:8790/ |
 | Trade Tracker Dashboard | http://127.0.0.1:8080/ |
 | Standalone PnL Analytics | http://127.0.0.1:8787/ |

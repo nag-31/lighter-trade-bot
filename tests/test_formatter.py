@@ -66,7 +66,8 @@ class TestFmtSlTp:
         result = _fmt_sl_tp(Decimal("90"), Decimal("120"))
         assert "SL:" in result
         assert "TP:" in result
-        assert "|" in result
+        assert "·" in result
+        assert "<b>$90.0000</b>" in result
 
     def test_only_sl(self):
         result = _fmt_sl_tp(Decimal("90"), None)
@@ -183,7 +184,7 @@ class TestFormatEventClose:
 
     def test_pnl_shown_when_present(self):
         msg = format_event(self._close_event(pnl="500"), "")
-        assert "P&L:" in msg
+        assert "P&amp;L:" in msg
         assert "+$500" in msg
 
     def test_pnl_negative(self):
@@ -226,7 +227,7 @@ class TestFormatEventReduce:
 
     def test_pnl_shown_when_present(self):
         msg = format_event(self._reduce_event(pnl="200"), "")
-        assert "P&L:" in msg
+        assert "P&amp;L:" in msg
 
     def test_sl_tp_shown_on_reduce(self):
         ev = self._reduce_event()
@@ -386,7 +387,7 @@ class TestFormatReduceAggregate:
 
     def test_pnl_shown_when_present(self):
         msg = format_reduce_aggregate(self._pos(), Decimal("3000"), 5, Decimal("150"), 5.0, "", "pool")
-        assert "P&L:" in msg
+        assert "P&amp;L:" in msg
         assert "+$150" in msg
 
     def test_pnl_none_not_shown(self):

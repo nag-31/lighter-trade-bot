@@ -77,6 +77,8 @@ function Stop-All {
 }
 
 try {
+    Start-App -Name "command_center" -WorkingDirectory $Root -Arguments @("-B", "-m", "command_center.app", "--host", "127.0.0.1", "--port", "8810") -Port 8810 -RestartExisting -ProcessMatch "-m\s+command_center\.app(?:\s|$)"
+    Start-App -Name "trade_journal" -WorkingDirectory $Root -Arguments @("-B", "-m", "trade_journal.app", "--host", "127.0.0.1", "--port", "8811") -Port 8811 -RestartExisting -ProcessMatch "-m\s+trade_journal\.app(?:\s|$)"
     Start-App -Name "portfolio" -WorkingDirectory $Root -Arguments @("-B", "-m", "src.portfolio_app", "--host", "127.0.0.1", "--port", "8790") -Port 8790
     Start-App -Name "pnl_analytics" -WorkingDirectory $Root -Arguments @("-B", "-m", "standalone.pnl_analytics_bot.dashboard.server", "--host", "127.0.0.1", "--port", "8787") -Port 8787
     Start-App -Name "apps_hub" -WorkingDirectory $Root -Arguments @("-B", "-m", "apps_hub.access_page", "--host", "127.0.0.1", "--port", "8800") -Port 8800 -RestartExisting -ProcessMatch "-m\s+apps_hub\.access_page(?:\s|$)"
@@ -92,8 +94,10 @@ try {
         }
     }
     Write-Host ""
-    Write-Host "Lighter Apps Hub: http://127.0.0.1:8800/"
-    if (Test-Path (Join-Path $HackAlertRoot "alertbot\__main__.py")) { Write-Host "DeFi Hack Alert:  http://127.0.0.1:8788/" }
+    Write-Host "Signal Research:  http://127.0.0.1:8810/"
+    Write-Host "Trade Journal:    http://127.0.0.1:8811/"
+    Write-Host "Crypto Scientist App Hubs: http://127.0.0.1:8800/"
+    if (Test-Path (Join-Path $HackAlertRoot "alertbot\__main__.py")) { Write-Host "TVL Monitor:      http://127.0.0.1:8788/" }
     Write-Host "Logs: $LogDir"
     Write-Host ""
     Write-Host "Press Enter to stop apps started by this launcher."

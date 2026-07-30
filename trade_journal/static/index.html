@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b1017">
+  <title>Crypto Scientist — Trade Journal</title>
+  <meta name="description" content="Position-level trade journaling, execution review, and live PnL.">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <a class="identity" href="/" aria-label="Trade Journal home">
+      <span class="identity-mark">TJ</span>
+      <span><b>CRYPTO SCIENTIST</b><small>Trade journal</small></span>
+    </a>
+    <div class="state-rail">
+      <span class="state-dot" id="stateDot"></span>
+      <span><b id="stateLabel">Loading journal</b><small id="lastSync">Reading VM state…</small></span>
+    </div>
+    <div class="header-actions">
+      <button class="button quiet" id="syncButton" type="button">Sync now</button>
+      <button class="button primary" id="newEntry" type="button">New journal entry</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div>
+        <p class="eyebrow">POSITION LIFECYCLES / EXECUTION REVIEW</p>
+        <h1>The complete trade, not the last fill.</h1>
+      </div>
+      <p>Every scale-in, partial exit, reversal, reason, and outcome stays attached to one reviewable position chain.</p>
+    </section>
+
+    <section class="summary-grid" id="summaryGrid" aria-label="Journal summary"></section>
+
+    <div class="workspace-tabs" role="tablist" aria-label="Journal workspace">
+      <button class="tab active" data-tab="trades" role="tab" aria-selected="true">Trade lifecycles <span id="tradeCount">0</span></button>
+      <button class="tab" data-tab="entries" role="tab" aria-selected="false">Journal entries <span id="entryCount">0</span></button>
+    </div>
+
+    <section class="workspace active" id="tradesWorkspace">
+      <div class="toolbar">
+        <input id="tradeSearch" type="search" placeholder="Search symbol or account">
+        <select id="tradeStatus" aria-label="Filter trades by status">
+          <option value="all">All lifecycle states</option>
+          <option value="open">Active</option>
+          <option value="closed">Closed</option>
+          <option value="reversed">Reversed</option>
+        </select>
+        <select id="tradeSide" aria-label="Filter trades by side">
+          <option value="all">Long &amp; short</option>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+        </select>
+        <select id="tradeJournalState" aria-label="Filter trades by journal state">
+          <option value="all">Journaled &amp; pending</option>
+          <option value="pending">Needs journal</option>
+          <option value="journaled">Journaled</option>
+        </select>
+      </div>
+      <div class="trade-grid" id="tradeGrid"></div>
+    </section>
+
+    <section class="workspace" id="entriesWorkspace">
+      <div class="toolbar">
+        <input id="entrySearch" type="search" placeholder="Search thesis, reason, or asset">
+        <select id="entryStatus" aria-label="Filter journal entries by status">
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="closed">Closed</option>
+          <option value="planned">Planned</option>
+          <option value="invalidated">Invalidated</option>
+          <option value="skipped">Skipped</option>
+        </select>
+        <select id="entrySide" aria-label="Filter entries by direction">
+          <option value="all">All directions</option>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+          <option value="neutral">Neutral</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-sort="updated" tabindex="0" aria-sort="descending">Updated <i>▼</i></th>
+              <th data-sort="asset" tabindex="0" aria-sort="none">Asset <i>↕</i></th>
+              <th data-sort="thesis" tabindex="0" aria-sort="none">Thesis &amp; reasons <i>↕</i></th>
+              <th data-sort="side" tabindex="0" aria-sort="none">Side <i>↕</i></th>
+              <th data-sort="status" tabindex="0" aria-sort="none">Status <i>↕</i></th>
+              <th data-sort="result" tabindex="0" aria-sort="none">PnL <i>↕</i></th>
+              <th><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="entryTable"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="entryDialog">
+    <form id="entryForm" method="dialog">
+      <header class="dialog-head">
+        <div><p class="eyebrow" id="dialogEyebrow">TRADE REVIEW</p><h2 id="dialogTitle">New journal entry</h2></div>
+        <button type="button" class="close-button" data-close aria-label="Close">×</button>
+      </header>
+      <input type="hidden" id="tradeId">
+      <input type="hidden" id="tradeKind">
+      <label class="full">Thesis<textarea name="thesis" required rows="3" placeholder="What did you see, and why did you act?"></textarea></label>
+      <div class="form-grid">
+        <label>Direction<select name="direction"><option value="long">Long</option><option value="short">Short</option><option value="neutral">Neutral</option></select></label>
+        <label>Confidence<input name="confidence" type="number" min="0" max="100" value="60"><span class="suffix">%</span></label>
+        <label>Entry<input name="entry" type="number" step="any"></label>
+        <label>Invalidation<input name="invalidation" type="number" step="any"></label>
+        <label>Target<input name="target" type="number" step="any"></label>
+        <label>Maximum risk<input name="max_risk_usd" type="number" min="0" step="any"><span class="prefix">$</span></label>
+      </div>
+      <section class="reason-picker">
+        <header><div><span>WHY DID I TAKE IT?</span><b>Select every reason that mattered</b></div><small id="reasonCount">0 selected</small></header>
+        <div id="reasonGroups"></div>
+        <div class="custom-reason">
+          <select id="customReasonCategory">
+            <option value="Setup">Setup</option>
+            <option value="Trigger">Trigger</option>
+            <option value="Market context">Market context</option>
+            <option value="Execution">Execution</option>
+            <option value="Psychology">Psychology</option>
+          </select>
+          <input id="customReasonLabel" type="text" maxlength="60" placeholder="Add a reusable reason">
+          <button class="button quiet" id="addReason" type="button">Add reason</button>
+        </div>
+      </section>
+      <label class="full">Notes<textarea name="notes" rows="3" placeholder="Execution detail, emotion, catalyst, or lesson"></textarea></label>
+      <footer class="dialog-actions">
+        <button type="button" class="button quiet" data-close>Cancel</button>
+        <button type="submit" class="button primary" id="saveEntry">Save journal entry</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

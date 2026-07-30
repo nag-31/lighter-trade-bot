@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a1020">
+  <title>Crypto Scientist — Signal Research</title>
+  <meta name="description" content="Market signals, counterfactual outcomes, and edge review.">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="Crypto Scientist home">
+        <span class="brand-mark">CS</span>
+        <span><strong>CRYPTO SCIENTIST</strong><small>Signal research</small></span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <small class="nav-group-label">MARKET INTELLIGENCE</small>
+        <button class="nav-item active" data-view="today"><span>01</span>Today</button>
+        <button class="nav-item" data-view="edge"><span>03</span>Edge lab</button>
+        <button class="nav-item" data-view="review"><span>04</span>Weekly signal review</button>
+        <small class="nav-group-label journal-group" hidden>TRADING JOURNAL</small>
+        <button class="nav-item" data-view="journal" hidden><span>02</span>Trade journal</button>
+      </nav>
+      <div class="system-card">
+        <div class="system-line"><span class="pulse"></span><b>VM production state</b></div>
+        <p>Page loads are read-only. Refreshing does not run ingestion.</p>
+        <button id="syncButton" class="quiet-button">Sync research sources</button>
+        <small id="lastSync">Waiting for first sync</small>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="overline" id="viewEyebrow">Sunday · Decision queue</p>
+          <h1 id="viewTitle">What needs your attention</h1>
+        </div>
+        <div class="header-actions">
+          <div class="clock"><span>LOCAL</span><strong id="clock">--:--</strong></div>
+          <button class="primary-button" id="newDecision" hidden>+ New decision</button>
+        </div>
+      </header>
+
+      <section class="view active" id="todayView">
+        <div class="risk-strip">
+          <div>
+            <span class="metric-label">RISK AVAILABLE</span>
+            <strong id="riskAvailable" class="metric-value">$—</strong>
+            <small id="riskBudget">of $— daily budget</small>
+          </div>
+          <div class="risk-meter"><i id="riskMeter"></i></div>
+          <div class="strip-metric positions-metric"><span>OPEN POSITIONS</span><strong id="openPositions" class="metric-value">—</strong><small id="positionNotional">— notional</small></div>
+          <div class="strip-metric pnl-metric"><span>REALIZED P&amp;L</span><strong id="realizedPnl" class="metric-value">—</strong></div>
+          <div class="strip-metric edge-metric"><span>24H SIGNAL EDGE</span><strong id="signalEdge" class="metric-value">—</strong></div>
+          <button class="text-button" id="editRisk">Edit limits</button>
+        </div>
+
+        <div class="today-grid">
+          <section class="panel queue-panel">
+            <div class="panel-head">
+              <div>
+                <p class="overline">Priority stack</p>
+                <h2>Decision queue</h2>
+              </div>
+              <div class="segmented" id="signalFilter">
+                <button class="active" data-filter="actionable">Active</button>
+                <button data-filter="speculation">Market</button>
+                <button data-filter="hack" hidden>Risk</button>
+                <button data-filter="archive">Archive</button>
+                <button data-filter="simulation">Sim</button>
+              </div>
+            </div>
+            <div id="signalQueue" class="signal-list loading-lines" aria-live="polite"></div>
+          </section>
+
+          <aside class="right-column">
+            <section class="panel focus-panel">
+              <div class="panel-head compact">
+                <div><p class="overline">Selected signal</p><h2>Research card</h2></div>
+                <span class="badge neutral" id="focusSource">Waiting</span>
+              </div>
+              <div id="focusCard" class="empty-state">
+                <span class="empty-glyph">⌁</span>
+                <p>Select a signal to inspect its evidence and record a decision.</p>
+              </div>
+            </section>
+            <section class="panel pulse-panel">
+              <div class="panel-head compact">
+                <div><p class="overline">System pulse</p><h2>Feedback loop</h2></div>
+              </div>
+              <div class="pulse-grid">
+                <div><b id="pulseSignals">—</b><span>actionable</span></div>
+                <div><b id="pulseOutcomes">—</b><span>prod. measured</span></div>
+                <div><b id="pulseExcluded">—</b><span>sims excluded</span></div>
+              </div>
+              <p class="microcopy" id="integrityNote">Production and simulated evidence are kept separate to protect your edge statistics.</p>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="journalView">
+        <div class="section-intro">
+          <div><p class="overline">Signal → thesis → trade → outcome</p><h2>Decision journal</h2></div>
+          <p>Trades, reasons, and execution reviews live here. TVL drops and market alerts stay in Market Intelligence.</p>
+        </div>
+        <div class="journal-stats" id="journalStats"></div>
+        <section class="panel">
+          <div class="table-tools">
+            <input id="journalSearch" type="search" placeholder="Search thesis, signal, or asset…">
+            <select id="journalStatus" aria-label="Filter decisions by status">
+              <option value="all">All statuses</option>
+              <option value="planned">Planned</option>
+              <option value="active">Active</option>
+              <option value="closed">Closed</option>
+              <option value="invalidated">Invalidated</option>
+              <option value="skipped">Skipped</option>
+            </select>
+            <select id="journalDirection" aria-label="Filter journal by direction">
+              <option value="all">All directions</option>
+              <option value="long">Long</option>
+              <option value="short">Short</option>
+              <option value="neutral">Neutral</option>
+            </select>
+            <select id="journalLinkage" aria-label="Filter journal by trade linkage">
+              <option value="all">Linked &amp; unlinked</option>
+              <option value="linked">Linked trades</option>
+              <option value="unlinked">Unlinked only</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th data-decision-sort="updated" tabindex="0" aria-sort="descending">Updated <span class="sort-indicator" aria-hidden="true">▼</span></th>
+                <th data-decision-sort="asset" tabindex="0" aria-sort="none">Asset / signal <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                <th data-decision-sort="thesis" tabindex="0" aria-sort="none">Thesis <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                <th data-decision-sort="plan" tabindex="0" aria-sort="none">Plan <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                <th data-decision-sort="status" tabindex="0" aria-sort="none">Status <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                <th data-decision-sort="result" tabindex="0" aria-sort="none">Result <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                <th><span class="visually-hidden">Actions</span></th>
+              </tr></thead>
+              <tbody id="decisionTable"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel unlinked-panel">
+          <div class="panel-head compact">
+            <div><p class="overline">Close the loop</p><h2>Unlinked trades</h2></div>
+            <span class="badge amber" id="unlinkedCount">0 pending</span>
+          </div>
+          <div id="unlinkedTrades" class="trade-grid"></div>
+        </section>
+      </section>
+
+      <section class="view" id="edgeView">
+        <div class="section-intro">
+          <div><p class="overline">Evidence, not intuition</p><h2>Edge lab</h2></div>
+          <p>Compare detectors, time horizons, and your acted-versus-ignored decisions.</p>
+        </div>
+        <div class="edge-hero">
+          <article class="edge-score">
+            <span>24H PRECISION</span><strong id="edgePrecision">—</strong>
+            <p id="edgeSample">Waiting for completed outcomes</p>
+          </article>
+          <article class="counterfactual">
+            <span class="overline">Decision quality</span>
+            <h3>Are you adding value?</h3>
+            <div class="compare-bars">
+              <div><label>Acted signals <b id="actedEdge">—</b></label><i><em id="actedBar"></em></i></div>
+              <div><label>Ignored signals <b id="ignoredEdge">—</b></label><i><em id="ignoredBar"></em></i></div>
+            </div>
+            <p id="decisionVerdict">More measured outcomes are needed for a reliable comparison.</p>
+          </article>
+        </div>
+        <div class="edge-grid">
+          <section class="panel">
+            <div class="panel-head compact"><div><p class="overline">Leaderboard</p><h2>Signal strategies</h2></div></div>
+            <div id="strategyTable" class="strategy-list"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head compact"><div><p class="overline">Decay curve</p><h2>Edge by horizon</h2></div></div>
+            <div id="horizonChart" class="horizon-chart"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="reviewView">
+        <div class="section-intro">
+          <div><p class="overline">Your operating review</p><h2>Weekly field notes</h2></div>
+          <button class="secondary-button" id="copyReview">Copy summary</button>
+        </div>
+        <div class="review-layout">
+          <article class="review-paper">
+            <header>
+              <div><span>CRYPTO SCIENTIST / WEEKLY REVIEW</span><h2 id="reviewDates">—</h2></div>
+              <strong id="disciplineScore">—</strong>
+            </header>
+            <div class="review-kpis" id="reviewKpis"></div>
+            <section>
+              <h3>What happened</h3>
+              <ul id="reviewObservations"></ul>
+            </section>
+            <section class="review-callouts">
+              <div><span>BEST SIGNAL</span><strong id="bestSignal">No measured signal yet</strong></div>
+              <div><span>BEST IGNORED</span><strong id="bestIgnored">No ignored winner yet</strong></div>
+            </section>
+            <section>
+              <h3>Next-week protocol</h3>
+              <ol>
+                <li>Write the invalidation before linking a trade.</li>
+                <li>Keep committed risk inside the daily budget.</li>
+                <li>Review every ignored signal with a completed 24h outcome.</li>
+              </ol>
+            </section>
+          </article>
+          <aside class="review-aside">
+            <div class="quote">“A trading edge that is not measured is only a story.”</div>
+            <div class="mini-card"><span>Generated from</span><b>Signals · Decisions · Trades · Outcomes</b></div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="decisionDialog">
+    <form method="dialog" id="decisionForm">
+      <div class="dialog-head">
+        <div><p class="overline" id="dialogEyebrow">Pre-trade record</p><h2 id="dialogTitle">New decision</h2></div>
+        <button type="button" class="icon-button" aria-label="Close" data-dialog-close="decisionDialog">×</button>
+      </div>
+      <input type="hidden" name="signal_id" id="decisionSignalId">
+      <input type="hidden" id="decisionTradeId">
+      <label class="full">Thesis<textarea name="thesis" required rows="3" placeholder="What do you believe, and why now?"></textarea></label>
+      <div class="form-grid">
+        <label>Direction<select name="direction"><option value="long">Long</option><option value="short">Short</option><option value="neutral">Neutral / observe</option></select></label>
+        <label>Confidence<input name="confidence" type="number" min="0" max="100" value="60"><span class="suffix">%</span></label>
+        <label>Entry<input name="entry" type="number" step="any" placeholder="Optional"></label>
+        <label>Invalidation<input name="invalidation" type="number" step="any" placeholder="Required before trade"></label>
+        <label>Target<input name="target" type="number" step="any" placeholder="Optional"></label>
+        <label>Maximum risk<input name="max_risk_usd" type="number" min="0" step="any" placeholder="$0"><span class="prefix">$</span></label>
+      </div>
+      <section class="reason-picker" aria-labelledby="reasonPickerTitle">
+        <div class="reason-picker-head">
+          <div><span class="field-label">Why did I take it?</span><b id="reasonPickerTitle">Choose all that apply</b></div>
+          <small id="reasonCount">0 selected</small>
+        </div>
+        <div id="reasonGroups"></div>
+        <div class="custom-reason">
+          <select id="customReasonCategory" aria-label="Custom reason category">
+            <option value="Setup">Setup</option>
+            <option value="Trigger">Trigger</option>
+            <option value="Market context">Market context</option>
+            <option value="Execution">Execution</option>
+            <option value="Psychology">Psychology</option>
+          </select>
+          <input id="customReasonLabel" type="text" maxlength="60" placeholder="Add your own reusable reason…">
+          <button id="addCustomReason" type="button" class="secondary-button">+ Add reason</button>
+        </div>
+      </section>
+      <label class="full">Notes<textarea name="notes" rows="2" placeholder="Evidence, catalyst, timing, or execution notes"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-dialog-close="decisionDialog">Cancel</button>
+        <button type="submit" value="default" class="primary-button">Save decision</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="linkDialog">
+    <form method="dialog" id="linkForm">
+      <div class="dialog-head">
+        <div><p class="overline">Complete the chain</p><h2>Link trade to a decision</h2></div>
+        <button type="button" class="icon-button" aria-label="Close" data-dialog-close="linkDialog">×</button>
+      </div>
+      <input type="hidden" id="linkTradeId">
+      <label class="full">Decision<select id="linkDecisionId" required></select></label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-dialog-close="linkDialog">Cancel</button>
+        <button type="submit" value="default" class="primary-button">Link trade</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="riskDialog">
+    <form method="dialog" id="riskForm">
+      <div class="dialog-head">
+        <div><p class="overline">Guardrails</p><h2>Risk limits</h2></div>
+        <button type="button" class="icon-button" aria-label="Close" data-dialog-close="riskDialog">×</button>
+      </div>
+      <label class="full">Daily risk budget<input id="riskBudgetInput" name="daily_risk_budget" type="number" min="0" step="1"></label>
+      <label class="full">Maximum open decisions<input id="maxDecisionsInput" name="max_open_decisions" type="number" min="1" step="1"></label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-dialog-close="riskDialog">Cancel</button>
+        <button type="submit" value="default" class="primary-button">Save limits</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

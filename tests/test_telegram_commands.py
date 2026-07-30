@@ -2,11 +2,16 @@ import logging
 
 from src.dashboard import _SecretRedactionFilter, _safe_telegram_error
 from src.telegram_commands import (
+    command_is_allowed,
     command_output_chat,
+    format_about,
     format_fills,
     format_health,
+    format_help,
+    format_leaderboard,
     format_orders,
     format_positions,
+    format_public_status,
     format_risk,
     format_sources,
     format_trades,
@@ -29,7 +34,7 @@ def test_command_output_chat_routes_owner_dm_privately():
     ) == "42"
 
 
-def test_command_output_chat_routes_owner_discussion_to_channel():
+def test_command_output_chat_keeps_owner_discussion_reply_in_discussion():
     message = {
         "from": {"id": 42},
         "chat": {"id": -200, "type": "supergroup"},
@@ -39,12 +44,29 @@ def test_command_output_chat_routes_owner_discussion_to_channel():
         owner_id=42,
         discussion_chat_id=-200,
         channel_id="-100",
-    ) == "-100"
+    ) == "-200"
 
 
-def test_command_output_chat_rejects_other_users_chats_and_anonymous_admins():
+def test_command_output_chat_allows_community_dm_and_linked_discussion_only():
+    assert command_output_chat(
+        {"from": {"id": 99}, "chat": {"id": 99, "type": "private"}},
+        owner_id=42,
+        discussion_chat_id=-200,
+        channel_id="-100",
+    ) == "99"
+    assert command_output_chat(
+        {
+            "from": {"id": 99},
+            "chat": {"id": -200, "type": "supergroup"},
+        },
+        owner_id=42,
+        discussion_chat_id=-200,
+        channel_id="-100",
+    ) == "-200"
+
+
+def test_command_output_chat_rejects_other_groups_and_anonymous_admins():
     cases = [
-        {"from": {"id": 99}, "chat": {"id": -200, "type": "supergroup"}},
         {"from": {"id": 42}, "chat": {"id": -201, "type": "supergroup"}},
         {
             "sender_chat": {"id": -100},
@@ -58,6 +80,56 @@ def test_command_output_chat_rejects_other_users_chats_and_anonymous_admins():
             discussion_chat_id=-200,
             channel_id="-100",
         ) is None
+
+
+def test_community_and_owner_command_permissions_are_separate():
+    for command in ("help", "positions", "trades", "coin", "leaderboard"):
+        assert command_is_allowed(command, is_owner=False)
+    for command in ("orders", "fills", "risk", "health", "dashboard"):
+        assert not command_is_allowed(command, is_owner=False)
+        assert command_is_allowed(command, is_owner=True)
+    assert not command_is_allowed("shutdown", is_owner=True)
+
+
+def test_help_exposes_owner_tools_only_to_owner():
+    community = format_help(owner=False)
+    owner = format_help(owner=True)
+
+    assert "/coin BTC" in community
+    assert "/leaderboard" in community
+    assert "/dashboard" not in community
+    assert "/health" not in community
+    assert "/dashboard" in owner
+    assert "/health" in owner
+
+
+def test_public_status_about_and_leaderboard_are_safe_and_useful():
+    status = format_public_status(
+        ready=True,
+        active_sources=4,
+        open_positions=7,
+        updated_at="now",
+    )
+    assert "ONLINE" in status
+    assert "Sources: 4" in status
+    assert "Open positions: 7" in status
+    assert "read-only" in status
+
+    about = format_about()
+    assert "grouped into one trade" in about
+    assert "Nothing sent to this bot can place, modify or close a trade" in about
+
+    board = format_leaderboard(
+        {
+            "by_symbol": [
+                {"symbol": "BTC", "n": 3, "pnl": 120.5},
+                {"symbol": "ETH", "n": 2, "pnl": -10},
+            ]
+        },
+        "7d",
+    )
+    assert "1. BTC · +$120.50 · 3 trades" in board
+    assert "2. ETH · $-10.00 · 2 trades" in board
 
 
 def test_telegram_token_is_redacted_from_http_logs():
@@ -129,9 +201,29 @@ def test_positions_filter_and_stale_marker():
         },
     ]
     result = format_positions(rows, "hl")
-    assert "HL 2 · BTC LONG · STALE" in result
+    assert "📍 <b>BTC</b>  ·  HL 2" in result
+    assert "🟢 <b>LONG</b>" in result
+    assert "⚠️ <b>STALE</b>" in result
     assert "Lighter" not in result
-    assert "uPnL +$4.50" in result
+    assert "uPnL: <b>+$4.50</b>" in result
+    assert "Position: <b>$100.00</b>" in result
+
+
+def test_positions_escape_dynamic_html_values():
+    rows = [
+        {
+            "source": "Desk & One",
+            "market_symbol": "<BTC>",
+            "side": "long",
+            "notional_usd": "100",
+        }
+    ]
+
+    result = format_positions(rows)
+
+    assert "Desk &amp; One" in result
+    assert "&lt;BTC&gt;" in result
+    assert "Desk & One" not in result
 
 
 def test_orders_empty_explains_protocol_limitations():
@@ -176,7 +268,9 @@ def test_fills_and_risk_summaries():
             "ts": "now",
         }
     ]
-    assert "SOL SHORT · REDUCE" in format_fills(fills, 10)
+    fills_text = format_fills(fills, 10)
+    assert "📍 <b>SOL</b> · Lighter" in fills_text
+    assert "🔴 <b>SHORT</b> · <b>REDUCE</b>" in fills_text
 
     positions = [
         {
@@ -195,8 +289,8 @@ def test_fills_and_risk_summaries():
         },
     ]
     risk = format_risk(positions)
-    assert "Gross exposure: $1,000.00" in risk
-    assert "Combined uPnL: +$8.00" in risk
+    assert "Gross exposure: <b>$1,000.00</b>" in risk
+    assert "Combined uPnL: <b>+$8.00</b>" in risk
     assert "(70.0%)" in risk
 
 

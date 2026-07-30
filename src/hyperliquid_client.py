@@ -645,6 +645,10 @@ class HyperliquidClient:
                 continue
             if t is None:
                 continue
+            if start_time_ms is not None:
+                fill_time_ms = int(t.timestamp.timestamp() * 1000)
+                if fill_time_ms < start_time_ms:
+                    continue
             # De-dupe by trade_id
             fill_key = self._fill_key(raw)
             if fill_key is not None and fill_key in seen_ids:

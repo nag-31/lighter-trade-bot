@@ -135,6 +135,11 @@ def _init_sync(path: Path) -> None:
             last_error   TEXT
         )
     """)
+    # Additive v3 accounting schema.  Existing tables remain intact during the
+    # shadow/cutover period; canonical_pnl owns all new ledger tables.
+    from .canonical_pnl import init_canonical_schema
+
+    init_canonical_schema(con)
     con.commit()
     con.close()
 
@@ -208,21 +213,37 @@ _CLOSED_TRADE_COLUMNS = (
 
 def _save_closed_trade_sync(path: Path, record: dict) -> None:
     con = sqlite3.connect(path)
-    placeholders = ", ".join("?" for _ in _CLOSED_TRADE_COLUMNS)
-    cols = ", ".join(_CLOSED_TRADE_COLUMNS)
-    values = tuple(record.get(c) for c in _CLOSED_TRADE_COLUMNS)
-    if record.get("event_uid"):
-        con.execute(
-            f"INSERT OR IGNORE INTO closed_trades ({cols}) VALUES ({placeholders})",
-            values,
-        )
-    else:
-        con.execute(
-            f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
-            values,
-        )
-    con.commit()
-    con.close()
+    try:
+        placeholders = ", ".join("?" for _ in _CLOSED_TRADE_COLUMNS)
+        cols = ", ".join(_CLOSED_TRADE_COLUMNS)
+        values = tuple(record.get(c) for c in _CLOSED_TRADE_COLUMNS)
+        if record.get("event_uid"):
+            cursor = con.execute(
+                f"INSERT OR IGNORE INTO closed_trades ({cols}) VALUES ({placeholders})",
+                values,
+            )
+            if cursor.rowcount == 0:
+                existing = con.execute(
+                    "SELECT id FROM closed_trades WHERE event_uid=?",
+                    (record["event_uid"],),
+                ).fetchone()
+                row_id = existing[0] if existing else None
+            else:
+                row_id = cursor.lastrowid
+        else:
+            cursor = con.execute(
+                f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
+                values,
+            )
+            row_id = cursor.lastrowid
+
+        if row_id is not None:
+            from .canonical_pnl import write_closed_trade_ledger_entry
+
+            write_closed_trade_ledger_entry(con, row_id, record)
+        con.commit()
+    finally:
+        con.close()
 
 
 def _load_closed_trades_sync(path: Path, limit: int | None) -> list[dict]:
@@ -254,6 +275,17 @@ def _delete_closed_trades_by_source_sync(path: Path, source: str) -> int:
     """Delete all closed_trades rows WHERE source = ?  Returns row count deleted."""
     con = sqlite3.connect(path)
     try:
+        row_ids = [
+            row[0]
+            for row in con.execute(
+                "SELECT id FROM closed_trades WHERE source = ?", (source,)
+            ).fetchall()
+        ]
+        from .canonical_pnl import retract_closed_trade_rows
+
+        retract_closed_trade_rows(
+            con, row_ids, reason="legacy source-scoped reconciliation"
+        )
         cur = con.execute(
             "DELETE FROM closed_trades WHERE source = ?", (source,)
         )
@@ -287,6 +319,18 @@ def _delete_closed_trades_by_source_since_sync(
     """
     con = sqlite3.connect(path)
     try:
+        row_ids = [
+            row[0]
+            for row in con.execute(
+                "SELECT id FROM closed_trades WHERE source = ? AND ts >= ?",
+                (source, ts_iso),
+            ).fetchall()
+        ]
+        from .canonical_pnl import retract_closed_trade_rows
+
+        retract_closed_trade_rows(
+            con, row_ids, reason="legacy source-window reconciliation"
+        )
         cur = con.execute(
             "DELETE FROM closed_trades WHERE source = ? AND ts >= ?",
             (source, ts_iso),
@@ -380,12 +424,37 @@ def _delete_closed_trades_by_identity_since_sync(
     con = sqlite3.connect(path)
     try:
         if include_legacy:
+            row_ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM closed_trades WHERE ts>=? AND "
+                    "(source_id=? OR (source_id IS NULL AND source=?))",
+                    (ts_iso, source_id, legacy_name),
+                ).fetchall()
+            ]
+            from .canonical_pnl import retract_closed_trade_rows
+
+            retract_closed_trade_rows(
+                con, row_ids, reason="account-window reconciliation"
+            )
             cur = con.execute(
                 "DELETE FROM closed_trades WHERE ts>=? AND "
                 "(source_id=? OR (source_id IS NULL AND source=?))",
                 (ts_iso, source_id, legacy_name),
             )
         else:
+            row_ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM closed_trades WHERE ts>=? AND source_id=?",
+                    (ts_iso, source_id),
+                ).fetchall()
+            ]
+            from .canonical_pnl import retract_closed_trade_rows
+
+            retract_closed_trade_rows(
+                con, row_ids, reason="account-window reconciliation"
+            )
             cur = con.execute(
                 "DELETE FROM closed_trades WHERE ts>=? AND source_id=?",
                 (ts_iso, source_id),

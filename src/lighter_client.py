@@ -50,6 +50,7 @@ class LighterClient:
     ):
         self.pool_id = pool_id
         self._l1_address = l1_address
+        self._is_wallet_account = l1_address is not None
         self._account_slot = account_slot
         self._account_resolve_lock = asyncio.Lock()
         self.source = source
@@ -64,6 +65,7 @@ class LighterClient:
         self._ws_proxy_url = ws_proxy_url or proxy_url
         # One-shot flag so a persistent geo-block logs once, not every retry.
         self._ws_geo_warned = False
+        self._private_rest_warned = False
         if ws_proxy_url:
             log.info("[%s] Lighter WS will route via proxy %s", source, ws_proxy_url)
 
@@ -299,53 +301,11 @@ class LighterClient:
         returns an unexpected shape, silently returns (None, None) — alerts
         still fire without SL/TP.
         """
-        try:
-            account_index = await self._ensure_account_index()
-            r = await self._http.get(
-                f"{self._rest_base}/orders",
-                params={"account_index": account_index, "status": "open"},
-            )
-            if r.status_code != 200:
-                return None, None
-            body = r.json()
-        except Exception:
-            return None, None
-
-        orders = body if isinstance(body, list) else (
-            body.get("orders") or body.get("data") or []
-        )
-        if not isinstance(orders, list):
-            return None, None
-
-        sl: Optional[Decimal] = None
-        tp: Optional[Decimal] = None
-
-        for order in orders:
-            if not isinstance(order, dict):
-                continue
-            if int(order.get("market_id", -1)) != market_id:
-                continue
-
-            otype = str(
-                order.get("type") or order.get("order_type") or ""
-            ).lower()
-            # Lighter uses "trigger_price" or "price" depending on order type
-            px_str = order.get("trigger_price") or order.get("price")
-            price = None
-            if px_str is not None:
-                try:
-                    price = Decimal(str(px_str))
-                except Exception:
-                    pass
-            if price is None or price == 0:
-                continue
-
-            if "stop" in otype or otype in ("sl", "stop_loss"):
-                sl = price
-            elif "take_profit" in otype or otype in ("tp", "take_profit"):
-                tp = price
-
-        return sl, tp
+        # /orders is private/authenticated for both public pools and wallet
+        # accounts. This read-only client has no signing credentials, so a
+        # probe can only generate recurring 403s.
+        self._warn_private_rest_unavailable()
+        return None, None
 
     # ----- open orders -----
 
@@ -356,118 +316,9 @@ class LighterClient:
         Returns [] on ANY error or unknown shape — same graceful degradation
         as fetch_sl_tp.  Does not raise.
         """
-        try:
-            account_index = await self._ensure_account_index()
-            r = await self._http.get(
-                f"{self._rest_base}/orders",
-                params={"account_index": account_index, "status": "open"},
-            )
-            if r.status_code != 200:
-                return []
-            body = r.json()
-        except Exception:
-            log.debug("Lighter fetch_open_orders HTTP failed")
-            return []
-
-        try:
-            orders = body if isinstance(body, list) else (
-                body.get("orders") or body.get("data") or []
-            )
-            if not isinstance(orders, list):
-                return []
-
-            out: list[OpenOrder] = []
-            for order in orders:
-                if not isinstance(order, dict):
-                    continue
-                try:
-                    mid_raw = order.get("market_id")
-                    if mid_raw is None:
-                        continue
-                    mid = int(mid_raw)
-
-                    otype = str(
-                        order.get("type") or order.get("order_type") or ""
-                    ).lower()
-
-                    # Side: Lighter uses sign or ask/bid fields
-                    sign = order.get("sign")
-                    if sign is not None:
-                        side: str = "long" if int(sign) > 0 else "short"
-                    else:
-                        # Fallback: check ask/bid account fields
-                        ask = int(order.get("ask_account_id", -1))
-                        bid = int(order.get("bid_account_id", -1))
-                        if ask == self.pool_id:
-                            side = "short"
-                        elif bid == self.pool_id:
-                            side = "long"
-                        else:
-                            side = "long"  # best-effort default
-
-                    px_raw = order.get("price") or order.get("limit_price")
-                    trig_raw = order.get("trigger_price")
-                    size_raw = order.get("size") or order.get("amount")
-
-                    price: Optional[Decimal] = None
-                    if px_raw is not None:
-                        try:
-                            price = Decimal(str(px_raw))
-                        except Exception:
-                            pass
-
-                    trigger_px: Optional[Decimal] = None
-                    if trig_raw is not None:
-                        try:
-                            trigger_px = Decimal(str(trig_raw))
-                        except Exception:
-                            pass
-
-                    size: Optional[Decimal] = None
-                    if size_raw is not None:
-                        try:
-                            size = Decimal(str(size_raw))
-                        except Exception:
-                            pass
-
-                    reduce_only = bool(order.get("reduce_only", False))
-
-                    oid_raw = order.get("order_id") or order.get("id")
-                    order_id: Optional[int] = None
-                    if oid_raw is not None:
-                        try:
-                            order_id = int(oid_raw)
-                        except Exception:
-                            pass
-
-                    if "stop" in otype or otype in ("sl", "stop_loss"):
-                        kind = "stop_loss"
-                    elif "take_profit" in otype or otype in ("tp", "take_profit"):
-                        kind = "take_profit"
-                    else:
-                        kind = "limit"
-
-                    symbol = self.market_symbol(mid)
-                    out.append(OpenOrder(
-                        source=self.source,
-                        market_id=mid,
-                        market_symbol=symbol,
-                        side=side,
-                        order_kind=kind,
-                        price=price,
-                        trigger_px=trigger_px,
-                        size=size,
-                        reduce_only=reduce_only,
-                        order_id=order_id,
-                    ))
-                except Exception:
-                    log.debug("Lighter could not parse open order %r", order)
-
-            log.debug("Lighter fetch_open_orders: %d order(s)", len(out))
-            return out
-        except Exception:
-            log.warning("Lighter fetch_open_orders parse failed")
-            return []
+        # See fetch_sl_tp: without signed private-API auth this always 403s.
+        self._warn_private_rest_unavailable()
+        return []
 
     # ----- trades: REST safety net -----
 
@@ -476,6 +327,9 @@ class LighterClient:
 
         Lighter's endpoint requires sort_by + limit. We pull desc and reverse.
         """
+        if self._is_wallet_account:
+            self._warn_private_rest_unavailable()
+            return []
         try:
             account_index = await self._ensure_account_index()
             r = await self._http.get(
@@ -507,6 +361,17 @@ class LighterClient:
             trades.append(t)
         trades.sort(key=lambda x: x.trade_id)
         return trades
+
+    def _warn_private_rest_unavailable(self) -> None:
+        """Log once when unauthenticated wallet-only REST calls are skipped."""
+        if self._private_rest_warned:
+            return
+        self._private_rest_warned = True
+        log.warning(
+            "[%s] skipping unauthenticated Lighter private REST history/orders; "
+            "live WebSocket fills and public position polling remain active",
+            self.source,
+        )
 
     # ----- trades: WebSocket primary stream -----
 

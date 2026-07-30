@@ -30,6 +30,7 @@ data/portfolio.db
 data/portfolio.db-*
 # local runtime state and logs
 data/app_logs/
+data/pytest-tmp/
 data/*.pid
 data/*.db
 data/*.db-*
@@ -39,3 +40,8 @@ reports/trade_analysis_100/
 
 # local wallet validation evidence
 PORTFOLIO_LIVE_VALIDATION.md
+
+# deployment packages, rollback scripts, and machine-state snapshots
+.deploy/
+.local-backups/
+.vm-state/

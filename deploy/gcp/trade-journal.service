@@ -1,0 +1,18 @@
+[Unit]
+Description=Crypto Scientist Trade Journal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+WorkingDirectory=/home/ADMIN/apps/lighter-trade-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ADMIN/apps/lighter-trade-bot/.venv/bin/python -B -m trade_journal.app --host 127.0.0.1 --port 8811
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
