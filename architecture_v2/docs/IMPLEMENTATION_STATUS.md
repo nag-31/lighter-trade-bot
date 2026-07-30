@@ -1,9 +1,9 @@
 # Architecture V2 Implementation Status
 
-Status: local foundation implemented and regression-tested; no production
-cutover or deployment
+Status: foundation implemented, regression-tested, and installed on the VM as
+isolated source; no production import, migration, or consumer cutover
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 ## Delivered slice
 
@@ -90,6 +90,36 @@ Run the repository:
 Result on 2026-07-30: **967 passed**, with 294 pre-existing aiohttp
 `NotAppKeyWarning` warnings from portfolio-app tests.
 
+## VM source deployment
+
+Commit `fb229f7325bb7afdb09ad756d65c4a8ecc916608` was installed on
+`crypto-apps-vm` on 2026-07-31 IST from the dedicated
+`codex/architecture-v2` branch.
+
+Deployment boundary:
+
+- copied `architecture_v2/` and its tracked architecture/operator documents;
+- created consistent backups of `events.db`, `command_center.db`, and
+  `trading_journal.db` before replacing source;
+- ran the V2 smoke scenario and all **54 V2 tests** on Linux/Python 3.12;
+- restarted **zero** services;
+- ran **zero** database migrations;
+- added **zero** `v2_*` tables and **zero** V2 files under production `data/`;
+- left dashboard, Telegram, recap, Journal, and exchange ingestion paths
+  unchanged.
+
+Rollback and audit evidence:
+
+```text
+/home/ADMIN/apps/deploy-backups/architecture-v2-20260730T185018Z
+```
+
+The 3,976,194-byte directory contains the prior source targets, three
+integrity-checked SQLite snapshots, their hashes, service state, deployed-source
+hashes, and post-deployment database integrity evidence. Full procedure and
+rollback scope are in
+[`VM_SOURCE_DEPLOYMENT.md`](VM_SOURCE_DEPLOYMENT.md).
+
 ## Explicitly not delivered yet
 
 - no production database backfill;
@@ -97,7 +127,7 @@ Result on 2026-07-30: **967 passed**, with 294 pre-existing aiohttp
 - no dashboard, Telegram, recap, or Journal consumer cutover;
 - no native Hyperliquid candle adapter or approved Lighter candle fallback;
 - no chart artifact cache or Telegram media-group outbox extension;
-- no VM deployment.
+- no service or consumer activation of V2.
 
 ## Next safe slice
 

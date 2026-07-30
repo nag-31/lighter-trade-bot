@@ -1,6 +1,6 @@
 # Crypto Scientist Project Ledger
 
-Last updated: 2026-07-30 (Asia/Calcutta)
+Last updated: 2026-07-31 (Asia/Calcutta)
 
 ## Purpose
 
@@ -240,9 +240,29 @@ followed by a separate **LONG** reversal lifecycle.
 
 ## Deployment state
 
-Architecture V2 is implemented and tested **locally only**. It has not been
-deployed, connected to a production database, enabled as a shadow writer, or
-selected by any dashboard, Telegram, recap, or Journal consumer.
+Architecture V2 commit `fb229f7325bb7afdb09ad756d65c4a8ecc916608`
+is installed on the VM as isolated source from branch
+`codex/architecture-v2`. It is not connected to a production database, enabled
+as a shadow writer, or selected by any dashboard, Telegram, recap, or Journal
+consumer.
+
+V2 source deployment evidence:
+
+- backup:
+  `/home/ADMIN/apps/deploy-backups/architecture-v2-20260730T185018Z`;
+- follow-up documentation backup:
+  `/home/ADMIN/apps/deploy-backups/architecture-v2-docs-20260730T185018Z`;
+- backup size: **3,976,194 bytes**;
+- all three consistent database snapshots: integrity `ok`;
+- V2 tests on VM/Linux/Python 3.12: **54 passed**;
+- services restarted: **0**;
+- database migrations: **0**;
+- post-deployment production `v2_*` tables: **0**;
+- post-deployment V2 files in `data/`: **0**;
+- all four services active and all four local health endpoints HTTP 200.
+
+The complete source-only deployment and rollback record is
+`architecture_v2/docs/VM_SOURCE_DEPLOYMENT.md`.
 
 Production deployment completed successfully on 2026-07-30.
 

@@ -98,8 +98,10 @@ per-account projection, portfolio composition, fill-time and lifecycle-close
 reporting, additive SQLite storage, checkpoints/outbox, a runtime adapter,
 shared execution-chart specifications, a deterministic PNG renderer, and
 projection/shadow evaluators. It has **not** replaced production accounting,
-been connected to production databases, or been deployed. The exact status and
-next gates are in
+been connected to production databases, or been enabled for a production
+consumer. Commit `fb229f7` is installed on the VM as inert source for
+inspection and testing; it ran no migrations and restarted no services. The
+exact status and next gates are in
 [`architecture_v2/docs/IMPLEMENTATION_STATUS.md`](architecture_v2/docs/IMPLEMENTATION_STATUS.md).
 
 ## Applications and local ports

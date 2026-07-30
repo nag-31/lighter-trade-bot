@@ -33,8 +33,9 @@ The first local implementation slice is complete and tested:
   selection, and deterministic Pillow PNG rendering;
 - a projection invariant evaluator and read-only legacy/V2 metric comparator.
 
-This code has no production import or write path. It has not been deployed or
-enabled for any consumer. See
+This code has no production import or write path. Commit `fb229f7` has been
+installed on the VM as isolated source, where its 54 tests pass. It has not
+been enabled for any consumer and did not migrate a production database. See
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the module
 map, commands, evidence, and next gates.
 
