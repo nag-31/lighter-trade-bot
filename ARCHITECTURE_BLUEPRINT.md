@@ -1,12 +1,15 @@
 # Crypto Scientist Architecture Blueprint
 
-Status: approved design checkpoint; implementation is paused until this model is
-reviewed.
+Status: approved design; isolated phases 1 and the initial phase 2 foundation
+are implemented and tested locally. No production cutover is active.
 
 Last updated: 2026-07-30 (Asia/Calcutta)
 
 Implementation workspace: `architecture_v2/`. All new architecture work stays
 inside that subdirectory until an explicit, verified consumer cutover.
+
+Implementation evidence and the current module map are in
+`architecture_v2/docs/IMPLEMENTATION_STATUS.md`.
 
 Migration strategy: incremental strangler replacement. Working exchange,
 runtime, delivery, and presentation code is reused. See
@@ -539,6 +542,8 @@ Exit gate: backups restore successfully and baseline reports are reproducible.
 
 ### Phase 1 — Contracts and pure domain engine
 
+Status: complete locally with automated tests.
+
 1. Add typed execution, realization, lifecycle, and report models.
 2. Implement one-account projection as pure functions.
 3. Implement portfolio composition without regrouping.
@@ -550,6 +555,10 @@ counting.
 
 ### Phase 2 — Additive normalized storage
 
+Status: the isolated V2 schema, repository, memberships, checkpoint, and outbox
+foundation are complete locally. Production backfill and reconciliation have
+not started.
+
 1. Add v2 tables without removing current tables.
 2. Backfill stable account/execution/realization/lifecycle UIDs.
 3. Mark ambiguous legacy records instead of guessing.
@@ -558,6 +567,10 @@ counting.
 Exit gate: unexplained PnL difference is zero; every exception is documented.
 
 ### Phase 3 — Shadow projection
+
+Status: a read-only metric comparison contract and projection invariant
+evaluator are complete locally. Continuous production shadow projection has not
+started.
 
 1. Keep existing production reads.
 2. Write/project v2 in parallel.

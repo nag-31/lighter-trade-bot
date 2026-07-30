@@ -26,16 +26,18 @@ development/auditing, never an independent production state.
 
 ## Current design checkpoint
 
-Implementation of the fill-time/lifecycle-close reporting change is paused at
-the owner's request until the end-to-end architecture is reviewed. The target
-system, diagrams, module boundaries, accounting invariants, storage contracts,
-API contracts, migration, test strategy, and rollout gates are defined in
-`ARCHITECTURE_BLUEPRINT.md`.
+The owner approved starting the latest architecture implementation and required
+tests to be written throughout. The target system, diagrams, module boundaries,
+accounting invariants, storage contracts, API contracts, migration, test
+strategy, and rollout gates remain defined in `ARCHITECTURE_BLUEPRINT.md`.
 
-No dashboard, Telegram, database, or production deployment cutover should occur
-until that blueprint is accepted or amended. The earlier unshipped period
-accounting prototype was removed from `src/`; implementation will begin inside
-the isolated V2 workspace.
+The first V2 foundation is now implemented under `architecture_v2/`: immutable
+execution identities, Decimal/time validation, per-account lifecycle
+projection, portfolio composition, one period report, additive SQLite storage,
+memberships, checkpoints, outbox, current-runtime adaptation, shared trade-chart
+specification, deterministic PNG rendering, projection invariants, and a
+read-only shadow metric comparator. Details are recorded in
+`architecture_v2/docs/IMPLEMENTATION_STATUS.md`.
 
 All new redesign implementation is isolated under `architecture_v2/`. Existing
 production modules remain outside the V2 dependency graph until shadow
@@ -51,8 +53,10 @@ seams. The detailed classification and cutover order live in
 Execution-chart research and the proposed candle-provider, marker, rendering,
 Telegram album, Journal interaction, privacy, idempotency, and verification
 contracts are recorded in
-`architecture_v2/docs/EXECUTION_CHART_DESIGN.md`. This is design-only and has
-not been enabled in production.
+`architecture_v2/docs/EXECUTION_CHART_DESIGN.md`. The shared chart contract,
+batching/interval rules, and static renderer are implemented locally; candle
+providers, artifact delivery, interactive Journal integration, and production
+enablement remain pending.
 
 ## Current architecture decision
 
@@ -140,6 +144,10 @@ workspace scan or lifecycle rebuild.
 - The VM is the single production state; local state must be refreshed from it.
 - Keep this ledger updated so the project can be explained or handed to another
   person without reconstructing history from chat.
+- Implement the approved modular architecture inside `architecture_v2/`, not as
+  a full-code rewrite.
+- Write focused tests with each implementation slice and include them in the
+  default repository test command.
 
 ## Why the Command Center used to sync on every page load
 
@@ -214,6 +222,10 @@ followed by a separate **LONG** reversal lifecycle.
 
 ## Verification evidence
 
+- V2 focused suite: **54 passed** on 2026-07-30.
+- Full repository regression after adding V2 to default discovery:
+  **967 passed** on Python 3.12 on 2026-07-30. The run emitted 294 existing
+  aiohttp `NotAppKeyWarning` warnings from portfolio-app tests and no failures.
 - Full repository suite after the final single-writer boundary: **913 passed**.
 - Pre-Git-publication verification on Python 3.12 with the documented
   development dependencies: **913 passed** on 2026-07-30. Windows verification
@@ -227,6 +239,10 @@ followed by a separate **LONG** reversal lifecycle.
   reasons restored, and click sorting functional.
 
 ## Deployment state
+
+Architecture V2 is implemented and tested **locally only**. It has not been
+deployed, connected to a production database, enabled as a shadow writer, or
+selected by any dashboard, Telegram, recap, or Journal consumer.
 
 Production deployment completed successfully on 2026-07-30.
 

@@ -1,6 +1,6 @@
 # Current-to-V2 Migration Map
 
-Status: architecture iteration 2
+Status: migration design with first isolated implementation slice complete
 
 The redesign is not a full rewrite. It is a staged replacement of the
 accounting path while preserving working ingestion, supervision, delivery, and
@@ -226,5 +226,8 @@ The first slice is deliberately small and pure:
 5. fixtures for partial exit, final dust close, and reversal;
 6. tests only—no production imports, database writes, or deployment.
 
-Once this slice is reviewed, storage and shadow adapters can be added without
-changing the domain rules.
+This slice is now implemented. The isolated additive storage repository,
+runtime-shape adapter, chart contract/renderer, projection evaluator, and
+generic read-only shadow comparator are also implemented. Production backfill,
+continuous shadow execution, consumer imports, and deployment remain gated.
+See `IMPLEMENTATION_STATUS.md`.

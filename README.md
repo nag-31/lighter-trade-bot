@@ -93,8 +93,14 @@ The planned PnL-card execution chart—candles plus buy, sell, entry, scale,
 partial-exit, reversal, and close markers—is described in
 [`architecture_v2/docs/EXECUTION_CHART_DESIGN.md`](architecture_v2/docs/EXECUTION_CHART_DESIGN.md).
 
-V2 is currently a design/isolation workspace. It has not replaced production
-accounting and must not write to production databases during development.
+V2 now has a locally implemented, isolated foundation: immutable executions,
+per-account projection, portfolio composition, fill-time and lifecycle-close
+reporting, additive SQLite storage, checkpoints/outbox, a runtime adapter,
+shared execution-chart specifications, a deterministic PNG renderer, and
+projection/shadow evaluators. It has **not** replaced production accounting,
+been connected to production databases, or been deployed. The exact status and
+next gates are in
+[`architecture_v2/docs/IMPLEMENTATION_STATUS.md`](architecture_v2/docs/IMPLEMENTATION_STATUS.md).
 
 ## Applications and local ports
 
@@ -217,12 +223,14 @@ python -m pytest -q tests/test_canonical_pnl.py
 python -m pytest -q tests/test_trade_journal.py
 python -m pytest -q tests/test_command_center.py
 python -m pytest -q tests/test_telegram_commands.py
+python -m pytest -q architecture_v2/tests
 ```
 
 Accounting changes must include regression fixtures for partial exits, final
 dust closes, reversals, duplicate fills, time boundaries, and multiple
 accounts. Dashboard and Telegram totals must be verified against the same input
-and accounting version.
+and accounting version. The default test configuration discovers both
+`tests/` and `architecture_v2/tests/`.
 
 ## Production state and local snapshots
 

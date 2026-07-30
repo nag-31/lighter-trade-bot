@@ -14,6 +14,30 @@ The existing production application remains outside this directory and is not
 modified or replaced until V2 passes its migration, shadow-comparison, and
 deployment gates.
 
+## Implementation status
+
+The first local implementation slice is complete and tested:
+
+- immutable, account-scoped execution identities and Decimal/time validation;
+- a pure per-account lifecycle projector for long, short, scale, partial close,
+  full close, explicit hedge sides, and reversal;
+- fill-time `Realization` records and lifecycle-close trade outcomes;
+- portfolio composition from independent account projections;
+- one `AccountingPeriodReport` handler with `[start, end)` boundaries;
+- additive SQLite tables for accounts, portfolios, memberships, executions,
+  realizations, lifecycles, checkpoints, and an integration outbox;
+- atomic append-and-reproject ingestion with replay idempotency and late-fill
+  rebuilding;
+- a structural adapter for the current runtime trade shape;
+- a shared `TradeChartSpec`, lifecycle-aware marker batching, interval
+  selection, and deterministic Pillow PNG rendering;
+- a projection invariant evaluator and read-only legacy/V2 metric comparator.
+
+This code has no production import or write path. It has not been deployed or
+enabled for any consumer. See
+[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the module
+map, commands, evidence, and next gates.
+
 ## Directory contract
 
 ```text
@@ -40,12 +64,31 @@ architecture_v2/
 5. Every comparison records its input snapshot hash and accounting version.
 6. No deployment occurs without a fresh VM backup and rollback package.
 
-## Initial implementation order
+## Migration order
 
-1. Pure domain contracts and accounting invariants.
-2. One-account projection.
-3. Portfolio composition.
-4. Period report projector.
-5. Additive storage and migration.
-6. Shadow comparison against current production behavior.
-7. Consumer adapters and controlled cutover.
+1. **Complete locally:** pure domain contracts and accounting invariants.
+2. **Complete locally:** one-account projection and portfolio composition.
+3. **Complete locally:** period report projector and additive V2 storage.
+4. **Complete locally:** runtime-edge adapter, chart contract, PNG renderer,
+   projection evaluator, and generic shadow comparator.
+5. **Next:** normalize anonymized/current snapshots into V2 fixtures and run
+   account/symbol/day/lifecycle shadow comparisons.
+6. **Later:** add exchange candle providers, artifact cache, and notification
+   delivery-group integration.
+7. **After gates pass:** cut over read consumers individually, with rollback.
+
+## Test
+
+From the repository root:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pytest -q architecture_v2\tests `
+  --basetemp data\pytest-tmp\v2
+```
+
+The normal repository command also discovers this directory:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pytest -q `
+  --basetemp data\pytest-tmp\full
+```

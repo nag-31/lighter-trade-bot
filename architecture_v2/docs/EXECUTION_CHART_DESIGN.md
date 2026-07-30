@@ -1,6 +1,7 @@
 # Trade Execution Chart and PnL Card Design
 
-Status: researched design; no production implementation
+Status: shared contract, interval selection, marker batching, and deterministic
+static PNG renderer implemented locally; provider/delivery integrations pending
 
 Last updated: 2026-07-30
 
@@ -347,12 +348,12 @@ Human review:
 
 ## 13. Implementation slices
 
-1. `TradeChartSpec` and fixtures.
-2. interval/window selector.
-3. lifecycle-aware marker batching.
+1. **Complete locally:** `TradeChartSpec` and fixtures.
+2. **Complete locally:** interval/window selector.
+3. **Complete locally:** lifecycle-aware marker batching.
 4. Hyperliquid candle provider.
 5. approved Lighter fallback policy.
-6. deterministic static renderer.
+6. **Complete locally:** deterministic static renderer.
 7. artifact cache and media-group outbox.
 8. interactive Journal renderer.
 9. shadow generation without sending.
