@@ -1,0 +1,4 @@
+# Optional shared OHLC renderer. Pillow remains the runtime fallback when these
+# extras (or Kaleido's Chrome runtime) are unavailable.
+plotly>=6.1.1
+kaleido>=1.0.0

@@ -21,6 +21,7 @@
     </div>
     <div class="header-actions">
       <button class="button quiet" id="syncButton" type="button">Sync now</button>
+      <button class="button quiet" id="v2ModeButton" type="button" hidden>V2 review</button>
       <button class="button primary" id="newEntry" type="button">New journal entry</button>
     </div>
   </header>
@@ -34,14 +35,52 @@
       <p>Every scale-in, partial exit, reversal, reason, and outcome stays attached to one reviewable position chain.</p>
     </section>
 
+    <section class="v2-workspace" id="v2Workspace" hidden aria-label="V2 execution review">
+      <header class="v2-toolbar">
+        <div>
+          <p class="eyebrow">V2 READ MODEL / EXECUTION REVIEW</p>
+          <h2>One lifecycle, one trace.</h2>
+        </div>
+        <div class="v2-toolbar-actions">
+          <span class="v2-status" id="v2Status">V2 preview</span>
+          <button class="button quiet button-compact" id="v2LegacyButton" type="button">Legacy view</button>
+        </div>
+      </header>
+      <div class="v2-layout">
+        <aside class="v2-rail panel-surface">
+          <div class="v2-rail-head"><span>Lifecycle queue</span><b id="v2LifecycleCount">0</b></div>
+          <div id="v2LifecycleList" class="v2-lifecycle-list"></div>
+        </aside>
+        <section class="v2-chart-panel panel-surface">
+          <header class="v2-chart-head">
+            <div>
+              <div class="v2-symbol-line"><span class="v2-venue" id="v2Venue">—</span><h3 id="v2Symbol">Select a lifecycle</h3><span id="v2Direction" class="v2-direction">—</span></div>
+              <p id="v2ChartMeta">Immutable V2 chart spec · execution-only until candle adapters are promoted.</p>
+            </div>
+            <div class="v2-chart-controls" aria-label="Chart controls">
+              <span class="v2-timeframe active">1m</span><span class="v2-timeframe">5m</span><span class="v2-timeframe">15m</span><span class="v2-timeframe">1h</span>
+            </div>
+          </header>
+          <div id="v2Chart" class="v2-chart" role="img" aria-label="V2 lifecycle chart"></div>
+          <div id="v2ExecutionStrip" class="v2-execution-strip"></div>
+        </section>
+        <aside class="v2-inspector panel-surface">
+          <div class="v2-inspector-head"><span>Position state</span><span id="v2StateBadge" class="v2-state-badge">—</span></div>
+          <div id="v2Metrics" class="v2-metrics"></div>
+          <div class="v2-inspector-section"><span class="v2-section-label">Spec provenance</span><p id="v2Provenance">—</p></div>
+          <div class="v2-inspector-section"><span class="v2-section-label">What V2 protects</span><p>Accounting stays in the domain model. This panel only renders the immutable read model.</p></div>
+        </aside>
+      </div>
+    </section>
+
     <section class="summary-grid" id="summaryGrid" aria-label="Journal summary"></section>
 
     <div class="workspace-tabs" role="tablist" aria-label="Journal workspace">
-      <button class="tab active" data-tab="trades" role="tab" aria-selected="true">Trade lifecycles <span id="tradeCount">0</span></button>
-      <button class="tab" data-tab="entries" role="tab" aria-selected="false">Journal entries <span id="entryCount">0</span></button>
+      <button class="tab active" id="tradesTab" data-tab="trades" role="tab" aria-selected="true" aria-controls="tradesWorkspace">Trade lifecycles <span id="tradeCount">0</span></button>
+      <button class="tab" id="entriesTab" data-tab="entries" role="tab" aria-selected="false" aria-controls="entriesWorkspace">Journal entries <span id="entryCount">0</span></button>
     </div>
 
-    <section class="workspace active" id="tradesWorkspace">
+    <section class="workspace active" id="tradesWorkspace" role="tabpanel" aria-labelledby="tradesTab">
       <div class="toolbar">
         <input id="tradeSearch" type="search" placeholder="Search symbol or account">
         <select id="tradeStatus" aria-label="Filter trades by status">
@@ -64,7 +103,7 @@
       <div class="trade-grid" id="tradeGrid"></div>
     </section>
 
-    <section class="workspace" id="entriesWorkspace">
+    <section class="workspace" id="entriesWorkspace" role="tabpanel" aria-labelledby="entriesTab" hidden>
       <div class="toolbar">
         <input id="entrySearch" type="search" placeholder="Search thesis, reason, or asset">
         <select id="entryStatus" aria-label="Filter journal entries by status">
@@ -139,6 +178,15 @@
         <button type="submit" class="button primary" id="saveEntry">Save journal entry</button>
       </footer>
     </form>
+  </dialog>
+
+  <dialog id="tradeInspectDialog" class="inspect-dialog" aria-labelledby="inspectTitle">
+    <div class="dialog-head">
+      <div><p class="eyebrow">EXECUTION TRACE / POSITION PROVENANCE</p><h2 id="inspectTitle">Trade lifecycle</h2><p id="inspectMeta" class="dialog-meta"></p></div>
+      <button type="button" class="close-button" id="closeInspect" aria-label="Close execution review">Ã—</button>
+    </div>
+    <div id="inspectBody" class="inspect-body"></div>
+    <footer class="dialog-actions"><button type="button" class="button quiet" id="closeInspectFooter">Close review</button></footer>
   </dialog>
 
   <div class="toast" id="toast" role="status"></div>

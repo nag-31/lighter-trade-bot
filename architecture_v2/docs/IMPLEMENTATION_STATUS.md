@@ -1,9 +1,10 @@
 # Architecture V2 Implementation Status
 
-Status: foundation implemented, regression-tested, and installed on the VM as
-isolated source; no production import, migration, or consumer cutover
+Status: foundation and an opt-in Journal read consumer are implemented,
+regression-tested, and remain reversible; no production import, migration, or
+default consumer cutover
 
-Last updated: 2026-07-31
+Last updated: 2026-08-02
 
 ## Delivered slice
 
@@ -23,6 +24,7 @@ flowchart LR
     RP --> SC["Read-only shadow comparator"]
     AP --> CS["TradeChartSpec"]
     CS --> PNG["Deterministic PNG"]
+    CS --> JR["Opt-in Journal V2 read view"]
 ```
 
 The accounting dependency direction is one way: adapters normalize facts,
@@ -45,6 +47,7 @@ recalculate PnL.
 | `adapters/runtime_trade.py` | current runtime shape to immutable execution boundary |
 | `domain/charts.py` | shared chart DTO, interval selection, and marker batching |
 | `tracker/static_chart.py` | deterministic static chart renderer |
+| `trade_journal/v2_consumer.py` | read-only lifecycle-to-V2 chart adapter for the opt-in Journal view |
 | `application/evaluations.py` | projection invariants and read-only shadow metric differences |
 
 ## Accounting guarantees covered by tests
@@ -124,10 +127,53 @@ rollback scope are in
 
 - no production database backfill;
 - no production shadow writer or comparison endpoint;
-- no dashboard, Telegram, recap, or Journal consumer cutover;
+- no default dashboard, Telegram, recap, or Journal consumer cutover;
+- no V2 write-path activation; the Journal V2 view remains read-only and feature-flagged;
 - no native Hyperliquid candle adapter or approved Lighter candle fallback;
 - no chart artifact cache or Telegram media-group outbox extension;
 - no service or consumer activation of V2.
+
+## Exchange-basis and cutoff hardening
+
+The lifecycle projector now treats each exit as an execution-time realization:
+
+- exchange-reported PnL is retained when present (for example Hyperliquid
+  `closedPnl`);
+- otherwise the exchange position immediately before the fill is used as the
+  cost basis (required for Lighter scale-ins and partial exits);
+- a lifecycle-wide entry VWAP is only a marked fallback for historical rows
+  that lack an exchange position basis.
+
+Reconciliation is windowed explicitly. Use
+`scripts/reconcile_hl_pnl.py --from-date YYYY-MM-DD` to rebuild only fills at
+or after a UTC cutoff; rows before that boundary are preserved. Period reports
+use the same `[start, end)` semantics while retaining pre-cutoff position
+context so a position already open at the boundary is not mispriced.
+
+## Per-account immutable ledgers
+
+Account ledgers now live under `data/accounts/<account_id>.db` and are
+partitioned by stable configured account IDs (`hl-main`, `hl-second`,
+`lighter-wallet`, and so on). `exchange_fills` is append-only and keyed by the
+exchange-scoped fill UID. If the exchange returns a changed payload for an
+existing fill, the change is recorded in `fill_observations`; the canonical
+fill row is not rewritten. `pnl_realizations` is a rebuildable projection over
+those facts.
+
+The dashboard idempotently migrates the existing shared database into these
+files and writes new fills/realizations to the account ledger while retaining
+the legacy shared DB for rollback. Backfill reconciliation updates the ledger
+and the dashboard/PnL read model but does not enqueue Telegram notifications.
+
+Run `scripts/migrate_account_ledgers.py --apply` to perform the one-time local
+migration explicitly; the command is dry-run by default.
+Use `scripts/rebuild_account_projections.py --apply` when a preserved shared
+archive has already been repaired; it replaces only derived rows at/after
+`2026-06-01T00:00:00Z`.
+
+The dashboard now exposes a multi-wallet selector. Analytics rows are filtered
+by selected account IDs in the browser, while the server continues to
+calculate the canonical all-account view for Telegram commands.
 
 ## Next safe slice
 

@@ -148,6 +148,38 @@ def render_trade_chart_png(
             fill=color,
         )
 
+    # With no candle provider, the execution markers are the chart's only
+    # price/time series. Connect them so a two-fill trade (such as a small
+    # priced token like LDO) cannot look like an empty canvas in Telegram's
+    # thumbnail. The marker triangles remain the semantic event labels.
+    execution_points = [
+        (x_for(marker.first_at), y_for(marker.price_vwap))
+        for marker in spec.markers
+    ]
+    if execution_points:
+        path_color = BUY_COLOR if spec.direction.value == "LONG" else SELL_COLOR
+        if len(execution_points) > 1:
+            draw.line(execution_points, fill=path_color, width=3)
+        for x, y in execution_points:
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=path_color)
+
+    if not spec.candles:
+        notice_left = right - 232
+        notice_top = top + 8
+        draw.rounded_rectangle(
+            (notice_left, notice_top, right - 8, notice_top + 22),
+            radius=5,
+            fill=BG_COLOR,
+            outline=GRID_COLOR,
+            width=1,
+        )
+        draw.text(
+            (notice_left + 8, notice_top + 6),
+            "EXECUTION-ONLY / NO CANDLES",
+            fill=MUTED_COLOR,
+            font=font,
+        )
+
     # Entry and exit VWAP are review overlays, not accounting entries.
     entry_y = y_for(spec.entry_vwap)
     _dashed_horizontal(

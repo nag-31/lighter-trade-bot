@@ -3,8 +3,6 @@ const state = {
   selectedSignal: null,
   signalFilter: "actionable",
   selectedReasonIds: new Set(),
-  editingDecisionId: null,
-  decisionSort: { key: "updated", direction: "desc" },
   view: "today"
 };
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -30,6 +28,19 @@ const sidePill = side => {
   return `<span class="side-pill ${normalized}">${marker} ${esc(String(side || "neutral").toUpperCase())}</span>`;
 };
 const qualityClass = value => Number(value) >= 55 ? "positive" : Number(value) < 45 ? "negative" : "warning";
+const tradeJournalUrl = params => {
+  const host = window.location.hostname;
+  const local = host === "127.0.0.1" || host === "localhost";
+  const journalHost = local ? host : host.replace(/^command\./, "journal.");
+  const url = new URL(`${window.location.protocol}//${journalHost}/`);
+  if (local) url.port = "8811";
+  url.search = "";
+  url.hash = "";
+  Object.entries(params || {}).forEach(([key, value]) => url.searchParams.set(key, value));
+  return url.toString();
+};
+const tradeJournalLink = $("[data-trade-journal-link]");
+if (tradeJournalLink) tradeJournalLink.href = tradeJournalUrl({});
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -64,7 +75,6 @@ async function load(showToast = false) {
 function renderAll() {
   renderSummary();
   renderSignals();
-  renderJournal();
   renderEdge();
   renderReview();
   switchView(state.view);
@@ -179,7 +189,7 @@ function renderFocus(signal) {
       <div><span>Observed</span><b class="${valueClass(impact)}">${impact}</b></div>
       <div><span>Priority</span><b>${Math.round(signal.priority_score || 0)}</b></div>
     </div>
-    ${signal.decision_id ? `<p class="microcopy">Decision #${signal.decision_id}: ${esc(signal.decision_thesis)}</p>` : ""}
+    ${signal.decision_id ? `<p class="microcopy">Decision #${signal.decision_id}: ${esc(signal.decision_thesis)} · <a href="${esc(tradeJournalUrl({ decision_id: signal.decision_id }))}">Open in Trade Journal</a></p>` : ""}
     <div class="focus-actions">
       ${signal.is_simulation ? "" : `<button class="primary" id="focusDecide">${signal.freshness === "archive" ? "Add retrospective" : signal.decision_id ? "Add another thesis" : "Record decision"}</button>`}
       <button data-status="ignored">Ignore + track</button>
@@ -224,251 +234,19 @@ function renderReasonPicker() {
   }));
 }
 
-function openDecision(signal = null, trade = null, decision = null) {
+function openDecision(signal = null) {
   const form = $("#decisionForm");
   form.reset();
-  state.editingDecisionId = decision?.id || null;
-  state.selectedReasonIds = new Set(decision?.reason_ids || []);
-  $("#decisionSignalId").value = decision?.signal_id || signal?.id || "";
-  $("#decisionTradeId").value = decision ? "" : trade?.id || "";
-  $("#decisionTradeId").dataset.lifecycle = trade?.is_lifecycle ? "1" : "0";
-  $("#dialogEyebrow").textContent = decision ? "Edit journal entry" : trade ? "Fast trade journal" : "Pre-trade record";
-  $("#dialogTitle").textContent = decision
-    ? `Edit decision #${decision.id}`
-    : trade
-    ? `${trade.side.toUpperCase()} ${trade.symbol}`
-    : signal ? signal.title : "New standalone decision";
-  form.elements.direction.value = decision?.direction || trade?.side || signal?.direction || "long";
+  state.selectedReasonIds = new Set();
+  $("#decisionSignalId").value = signal?.id || "";
+  $("#dialogEyebrow").textContent = "Pre-trade record";
+  $("#dialogTitle").textContent = signal ? signal.title : "New standalone decision";
+  form.elements.direction.value = signal?.direction || "long";
   if (signal) form.elements.thesis.value = `${signal.title} — `;
-  if (trade) {
-    form.elements.thesis.value = `${trade.side.toUpperCase()} ${trade.symbol} — `;
-    form.elements.entry.value = trade.entry ?? "";
-    form.elements.notes.value = [
-      `Imported ${trade.source} trade`,
-      trade.exit != null ? `Exit ${trade.exit}` : "",
-      trade.pnl != null ? `Realized P&L ${money(trade.pnl, 2)} (${pct(trade.pnl_pct)})` : "",
-      trade.management_style || "",
-      trade.fill_count ? `${trade.fill_count} fills in ${(trade.entry_batch_count || 0) + (trade.exit_batch_count || 0)} execution batches` : "",
-      trade.partial_exit_count ? `${trade.partial_exit_count} partial exit${trade.partial_exit_count === 1 ? "" : "s"}` : ""
-    ].filter(Boolean).join(" · ");
-  }
-  if (decision) {
-    for (const field of [
-      "thesis", "direction", "confidence", "entry", "invalidation",
-      "target", "max_risk_usd", "notes"
-    ]) {
-      form.elements[field].value = decision[field] ?? "";
-    }
-  }
-  $(".primary-button[type='submit']", form).textContent = decision ? "Save changes" : "Save decision";
+  $(".primary-button[type='submit']", form).textContent = "Save decision";
   renderReasonPicker();
   $("#decisionDialog").showModal();
   form.elements.thesis.focus();
-}
-
-function renderJournal() {
-  const decisions = state.data.decisions || [];
-  const trades = state.data.trades || [];
-  const statusCounts = decisions.reduce((acc, item) => {
-    const status = item.effective_status || item.status;
-    acc[status] = (acc[status] || 0) + 1;
-    return acc;
-  }, {});
-  const linked = trades.filter(item => item.decision_id).length;
-  $("#journalStats").innerHTML = [
-    ["PLANNED", statusCounts.planned || 0],
-    ["ACTIVE", statusCounts.active || 0],
-    ["CLOSED", statusCounts.closed || 0],
-    ["TRADES LINKED", `${linked} / ${trades.length}`],
-    ["DATA QUALITY", state.data.evaluation ? `${state.data.evaluation.score}%` : "—"]
-  ].map(([label, value], index) => `<div class="stat-tone-${index + 1}"><span>${label}</span><b>${value}</b></div>`).join("");
-  renderDecisionTable();
-  const unlinked = trades.filter(item => !item.decision_id);
-  $("#unlinkedCount").textContent = `${unlinked.length} pending`;
-  $("#unlinkedTrades").innerHTML = unlinked.length ? unlinked.map(trade => `
-    <article class="trade-card lifecycle-card ${sideClass(trade.side)}">
-      <header>
-        <div class="trade-badges"><span class="badge neutral">${esc(trade.source)}</span><span class="status-pill ${trade.status === "closed" ? "closed" : "active"}">${esc(trade.status)}</span></div>
-        <b class="${valueClass(trade.pnl)}">${money(trade.pnl, 2)}</b>
-      </header>
-      <h3>${sidePill(trade.side)} <span>${esc(trade.symbol)}</span></h3>
-      <p>${when(trade.opened_at || trade.occurred_at)}${trade.closed_at ? ` → ${when(trade.closed_at)}` : " · still open"} · ${holdTime(trade.opened_at, trade.closed_at)}</p>
-      <div class="lifecycle-metrics">
-        <div><span>AVG ENTRY</span><b>${price(trade.entry)}</b></div>
-        <div><span>AVG EXIT</span><b>${price(trade.exit)}</b></div>
-        <div><span>MAX SIZE</span><b>${compactNumber(trade.max_size)}</b></div>
-        <div><span>RETURN</span><b class="${valueClass(trade.pnl)}">${pct(trade.pnl_pct)}</b></div>
-      </div>
-      <div class="management-tags">
-        <span>${esc(trade.management_style || "Execution grouped")}</span>
-        <span>${trade.fill_count || 1} raw fill${trade.fill_count === 1 ? "" : "s"}</span>
-        <span>${(trade.entry_batch_count || 0) + (trade.exit_batch_count || 0)} execution batch${((trade.entry_batch_count || 0) + (trade.exit_batch_count || 0)) === 1 ? "" : "es"}</span>
-        ${trade.partial_exit_count ? `<span class="profit-tag">${trade.partial_exit_count} partial exit${trade.partial_exit_count === 1 ? "" : "s"}</span>` : ""}
-      </div>
-      ${renderExecutionTimeline(trade)}
-      <div class="trade-card-actions">
-        <button class="row-button primary-journal" data-journal-trade="${trade.id}">Journal trade</button>
-        <button class="row-button" data-link-trade="${trade.id}">Link existing</button>
-      </div>
-    </article>`).join("") : `<div class="blank">Every imported trade is linked. The feedback loop is complete.</div>`;
-  $$("[data-journal-trade]").forEach(button => button.addEventListener("click", () => {
-    const trade = trades.find(item => item.id === Number(button.dataset.journalTrade));
-    openDecision(null, trade);
-  }));
-  $$("[data-link-trade]").forEach(button => button.addEventListener("click", () => openLink(Number(button.dataset.linkTrade))));
-}
-
-function renderExecutionTimeline(trade) {
-  const batches = trade.batches || [];
-  if (!batches.length) return "";
-  return `<details class="execution-details">
-    <summary>Execution timeline <span>${batches.length} steps</span></summary>
-    <div class="execution-timeline">${batches.map((batch, index) => `
-      <div class="execution-step ${batch.family} ${valueClass(batch.pnl)}">
-        <i></i>
-        <div>
-          <header><b>${esc(batch.label)}</b><time>${when(batch.started_at)}</time></header>
-          <p>${compactNumber(batch.size)} @ ${price(batch.price)} · ${batch.fill_count} fill${batch.fill_count === 1 ? "" : "s"}</p>
-        </div>
-        <strong class="${valueClass(batch.pnl)}">${
-          batch.family === "exit" && batch.pnl != null ? money(batch.pnl, 2)
-          : batch.family === "management" ? "TURN"
-          : batch.label === "Entry" ? "OPEN" : "ADD"
-        }</strong>
-      </div>`).join("")}
-    </div>
-  </details>`;
-}
-
-function compactNumber(value) {
-  if (value == null) return "—";
-  return Intl.NumberFormat(undefined, { notation: Math.abs(value) >= 10000 ? "compact" : "standard", maximumFractionDigits: 4 }).format(value);
-}
-
-function price(value) {
-  if (value == null) return "—";
-  const digits = Math.abs(value) < 0.01 ? 6 : Math.abs(value) < 1 ? 4 : 2;
-  return `$${Number(value).toLocaleString(undefined, { maximumFractionDigits: digits })}`;
-}
-
-function holdTime(openedAt, closedAt) {
-  if (!openedAt) return "Unknown duration";
-  const ms = Math.max(0, new Date(closedAt || Date.now()) - new Date(openedAt));
-  const minutes = Math.floor(ms / 60000);
-  if (minutes < 60) return `${minutes}m held`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ${minutes % 60}m held`;
-  return `${Math.floor(hours / 24)}d ${hours % 24}h held`;
-}
-
-function renderDecisionTable() {
-  const query = ($("#journalSearch")?.value || "").toLowerCase();
-  const status = $("#journalStatus")?.value || "all";
-  const direction = $("#journalDirection")?.value || "all";
-  const linkage = $("#journalLinkage")?.value || "all";
-  const items = (state.data.decisions || []).filter(item => {
-    const haystack = `${item.thesis} ${item.signal_title || ""} ${item.signal_symbol || ""} ${item.reason_labels || ""}`.toLowerCase();
-    const effectiveStatus = item.effective_status || item.status;
-    return (!query || haystack.includes(query))
-      && (status === "all" || effectiveStatus === status)
-      && (direction === "all" || item.direction === direction)
-      && (linkage === "all" || (linkage === "linked" ? item.linked_trades > 0 : item.linked_trades === 0));
-  }).sort(compareDecisions);
-  updateDecisionSortHeaders();
-  $("#decisionTable").innerHTML = items.length ? items.map(item => `
-    <tr class="decision-row ${esc(item.effective_status || item.status)} ${sideClass(item.direction)}">
-      <td>${when(item.updated_at)}<small>#${item.id}</small></td>
-      <td><strong>${esc(item.signal_symbol || item.direction.toUpperCase())}</strong><small>${esc(item.signal_source || "standalone")}</small></td>
-      <td>
-        <strong>${esc(item.thesis)}</strong>
-        <small>${esc(item.signal_title || "No linked signal")}</small>
-        ${item.reason_labels ? `<div class="reason-tags">${item.reason_labels.split(" · ").map(reason => `<span>${esc(reason)}</span>`).join("")}</div>` : ""}
-      </td>
-      <td>${sidePill(item.direction)}<small><b class="risk-value">${money(item.max_risk_usd)}</b> risk · ${item.confidence}% confidence</small></td>
-      <td><span class="status-pill ${esc(item.effective_status || item.status)}">${esc(item.effective_status || item.status)}</span></td>
-      <td class="${valueClass(item.display_pnl)}">${money(item.display_pnl, 2)}<small>${item.effective_status === "active" && item.unrealized_pnl != null ? `live incl. ${money(item.unrealized_pnl, 2)} unrealized` : `${item.linked_trades} trade${item.linked_trades === 1 ? "" : "s"}`}</small></td>
-      <td class="decision-actions"><button class="row-button" data-edit="${item.id}">Edit</button>${item.linked_trades ? "" : `<button class="row-button" data-cycle="${item.id}" data-current="${esc(item.status)}">${item.status === "closed" ? "Closed" : "Advance"}</button>`}</td>
-    </tr>`).join("") : `<tr><td colspan="7"><div class="blank">No decisions match this filter.</div></td></tr>`;
-  $$("[data-cycle]").forEach(button => button.addEventListener("click", () => advanceDecision(button)));
-  $$("[data-edit]").forEach(button => button.addEventListener("click", () => {
-    const decision = (state.data.decisions || []).find(item => item.id === Number(button.dataset.edit));
-    if (decision) openDecision(null, null, decision);
-  }));
-}
-
-function decisionSortValue(item, key) {
-  if (key === "updated") return new Date(item.updated_at || 0).getTime();
-  if (key === "asset") return item.signal_symbol || item.direction || "";
-  if (key === "thesis") return item.thesis || "";
-  if (key === "plan") return Number(item.max_risk_usd ?? item.confidence ?? 0);
-  if (key === "status") return item.effective_status || item.status || "";
-  if (key === "result") return item.display_pnl == null ? null : Number(item.display_pnl);
-  return "";
-}
-
-function compareDecisions(a, b) {
-  const { key, direction } = state.decisionSort;
-  const left = decisionSortValue(a, key);
-  const right = decisionSortValue(b, key);
-  if (left == null && right == null) return Number(b.id || 0) - Number(a.id || 0);
-  if (left == null) return 1;
-  if (right == null) return -1;
-  const comparison = typeof left === "number" && typeof right === "number"
-    ? left - right
-    : String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: "base" });
-  return (direction === "asc" ? comparison : -comparison)
-    || Number(b.id || 0) - Number(a.id || 0);
-}
-
-function updateDecisionSortHeaders() {
-  $$("[data-decision-sort]").forEach(header => {
-    const active = header.dataset.decisionSort === state.decisionSort.key;
-    header.classList.toggle("sorted", active);
-    header.setAttribute("aria-sort", active
-      ? (state.decisionSort.direction === "asc" ? "ascending" : "descending")
-      : "none");
-    $(".sort-indicator", header).textContent = active
-      ? (state.decisionSort.direction === "asc" ? "▲" : "▼")
-      : "↕";
-  });
-}
-
-function setDecisionSort(key) {
-  if (state.decisionSort.key === key) {
-    state.decisionSort.direction = state.decisionSort.direction === "asc" ? "desc" : "asc";
-  } else {
-    state.decisionSort = {
-      key,
-      direction: ["updated", "plan", "result"].includes(key) ? "desc" : "asc"
-    };
-  }
-  renderDecisionTable();
-}
-
-async function advanceDecision(button) {
-  const next = { planned: "active", active: "closed", invalidated: "closed", skipped: "planned" }[button.dataset.current];
-  if (!next) return;
-  try {
-    await api(`/api/decisions/${button.dataset.cycle}`, { method: "PATCH", body: JSON.stringify({ status: next }) });
-    await load();
-    toast(`Decision moved to ${next}`);
-  } catch (error) { toast(error.message); }
-}
-
-function openLink(tradeId) {
-  const select = $("#linkDecisionId");
-  const candidates = (state.data.decisions || []).filter(item => item.status !== "closed");
-  if (!candidates.length) {
-    const trade = (state.data.trades || []).find(item => item.id === tradeId);
-    toast("Start a journal entry for this trade");
-    openDecision(null, trade);
-    return;
-  }
-  select.innerHTML = candidates.map(item => `<option value="${item.id}">#${item.id} · ${esc(item.signal_symbol || item.direction)} · ${esc(item.thesis.slice(0, 70))}</option>`).join("");
-  $("#linkTradeId").value = tradeId;
-  const trade = (state.data.trades || []).find(item => item.id === tradeId);
-  $("#linkTradeId").dataset.lifecycle = trade?.is_lifecycle ? "1" : "0";
-  $("#linkDialog").showModal();
 }
 
 function renderEdge() {
@@ -523,7 +301,6 @@ function renderReview() {
 
 const viewCopy = {
   today: ["Decision queue", "What needs your attention"],
-  journal: ["Research ledger", "Every decision, connected"],
   edge: ["Signal intelligence", "Find what actually works"],
   review: ["Seven-day retrospective", "Turn experience into process"]
 };
@@ -548,42 +325,14 @@ $("#decisionForm").addEventListener("submit", async event => {
     if (value !== "") payload[key] = ["signal_id", "confidence"].includes(key) ? Number(value) : ["entry", "invalidation", "target", "max_risk_usd"].includes(key) ? Number(value) : value;
   }
   payload.reason_ids = [...state.selectedReasonIds];
-  const tradeId = Number($("#decisionTradeId").value || 0);
-  const trade = (state.data.trades || []).find(item => item.id === tradeId);
-  if (tradeId) payload.status = trade?.status === "closed" ? "closed" : "active";
   try {
-    const editing = state.editingDecisionId;
-    const decision = await api(
-      editing ? `/api/decisions/${editing}` : "/api/decisions",
-      { method: editing ? "PATCH" : "POST", body: JSON.stringify(payload) }
-    );
-    if (tradeId) {
-      const linkPayload = $("#decisionTradeId").dataset.lifecycle === "1"
-        ? { lifecycle_id: tradeId } : { trade_id: tradeId };
-      await api(`/api/decisions/${decision.id}/trades`, {
-        method: "POST", body: JSON.stringify(linkPayload)
-      });
-    }
+    await api("/api/decisions", { method: "POST", body: JSON.stringify(payload) });
     $("#decisionDialog").close();
     await load();
-    toast(editing ? "Journal entry updated" : tradeId ? "Trade journal saved and linked" : "Decision saved");
+    toast("Decision saved");
   } catch (error) { toast(error.message); }
 });
 
-$("#linkForm").addEventListener("submit", async event => {
-  event.preventDefault();
-  try {
-    const tradeId = Number($("#linkTradeId").value);
-    const linkPayload = $("#linkTradeId").dataset.lifecycle === "1"
-      ? { lifecycle_id: tradeId } : { trade_id: tradeId };
-    await api(`/api/decisions/${$("#linkDecisionId").value}/trades`, {
-      method: "POST", body: JSON.stringify(linkPayload)
-    });
-    $("#linkDialog").close();
-    await load();
-    toast("Trade linked—the feedback loop is complete");
-  } catch (error) { toast(error.message); }
-});
 
 $("#riskForm").addEventListener("submit", async event => {
   event.preventDefault();
@@ -632,28 +381,26 @@ $("#copyReview").addEventListener("click", async () => {
   await navigator.clipboard.writeText(text);
   toast("Weekly review copied");
 });
-$("#journalSearch").addEventListener("input", renderDecisionTable);
-$("#journalStatus").addEventListener("change", renderDecisionTable);
-$("#journalDirection").addEventListener("change", renderDecisionTable);
-$("#journalLinkage").addEventListener("change", renderDecisionTable);
-$$("[data-decision-sort]").forEach(header => {
-  header.addEventListener("click", () => setDecisionSort(header.dataset.decisionSort));
-  header.addEventListener("keydown", event => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    setDecisionSort(header.dataset.decisionSort);
-  });
-});
 $$("[data-dialog-close]").forEach(button => button.addEventListener("click", () => {
   const dialog = document.getElementById(button.dataset.dialogClose);
   if (dialog?.open) dialog.close();
 }));
-$$(".nav-item").forEach(item => item.addEventListener("click", () => switchView(item.dataset.view)));
+$$(".nav-item[data-view]").forEach(item => item.addEventListener("click", () => switchView(item.dataset.view)));
 $$("[data-filter]").forEach(item => item.addEventListener("click", () => {
   state.signalFilter = item.dataset.filter;
   $$("[data-filter]").forEach(button => button.classList.toggle("active", button === item));
   renderSignals();
 }));
-setInterval(() => $("#clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), 1000);
-$("#clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const updateClock = () => { $("#clock").textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); };
+updateClock();
+let clockTimer;
+const scheduleClock = () => {
+  clearTimeout(clockTimer);
+  if (document.hidden) return;
+  const delay = 60_000 - (Date.now() % 60_000) + 50;
+  clockTimer = setTimeout(() => { updateClock(); scheduleClock(); }, delay);
+};
+document.addEventListener("visibilitychange", scheduleClock);
+scheduleClock();
+$$("[data-trade-journal-link]").forEach(link => { link.href = tradeJournalUrl(); });
 load();

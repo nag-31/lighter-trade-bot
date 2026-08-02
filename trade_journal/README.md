@@ -30,6 +30,21 @@ From the repository root:
 
 Open <http://127.0.0.1:8811/>.
 
+## V2 review mode
+
+The V2 consumer is read-only and reversible. Enable it for the Journal with:
+
+```powershell
+$env:JOURNAL_UI_MODE = "v2"
+& ".\.venv\Scripts\python.exe" -B -m trade_journal.app --host 127.0.0.1 --port 8811
+```
+
+Then open <http://127.0.0.1:8811/> and use **V2 review**. The legacy Journal
+remains available through **Legacy view**. For a one-off preview, open
+<http://127.0.0.1:8811/?ui=v2> without changing the environment. The V2 route
+is `GET /api/v2/bootstrap`; it translates lifecycle rows into immutable V2
+chart specs and does not write V2 tables or alter accounting.
+
 Optional explicit paths:
 
 ```powershell

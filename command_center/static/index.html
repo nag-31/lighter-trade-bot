@@ -21,8 +21,8 @@
         <button class="nav-item active" data-view="today"><span>01</span>Today</button>
         <button class="nav-item" data-view="edge"><span>03</span>Edge lab</button>
         <button class="nav-item" data-view="review"><span>04</span>Weekly signal review</button>
-        <small class="nav-group-label journal-group" hidden>TRADING JOURNAL</small>
-        <button class="nav-item" data-view="journal" hidden><span>02</span>Trade journal</button>
+        <small class="nav-group-label journal-group">TRADING JOURNAL</small>
+        <a class="nav-item" data-trade-journal-link href="#"><span>↗</span>Open Trade Journal</a>
       </nav>
       <div class="system-card">
         <div class="system-line"><span class="pulse"></span><b>VM production state</b></div>
@@ -102,59 +102,6 @@
         </div>
       </section>
 
-      <section class="view" id="journalView">
-        <div class="section-intro">
-          <div><p class="overline">Signal → thesis → trade → outcome</p><h2>Decision journal</h2></div>
-          <p>Trades, reasons, and execution reviews live here. TVL drops and market alerts stay in Market Intelligence.</p>
-        </div>
-        <div class="journal-stats" id="journalStats"></div>
-        <section class="panel">
-          <div class="table-tools">
-            <input id="journalSearch" type="search" placeholder="Search thesis, signal, or asset…">
-            <select id="journalStatus" aria-label="Filter decisions by status">
-              <option value="all">All statuses</option>
-              <option value="planned">Planned</option>
-              <option value="active">Active</option>
-              <option value="closed">Closed</option>
-              <option value="invalidated">Invalidated</option>
-              <option value="skipped">Skipped</option>
-            </select>
-            <select id="journalDirection" aria-label="Filter journal by direction">
-              <option value="all">All directions</option>
-              <option value="long">Long</option>
-              <option value="short">Short</option>
-              <option value="neutral">Neutral</option>
-            </select>
-            <select id="journalLinkage" aria-label="Filter journal by trade linkage">
-              <option value="all">Linked &amp; unlinked</option>
-              <option value="linked">Linked trades</option>
-              <option value="unlinked">Unlinked only</option>
-            </select>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr>
-                <th data-decision-sort="updated" tabindex="0" aria-sort="descending">Updated <span class="sort-indicator" aria-hidden="true">▼</span></th>
-                <th data-decision-sort="asset" tabindex="0" aria-sort="none">Asset / signal <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                <th data-decision-sort="thesis" tabindex="0" aria-sort="none">Thesis <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                <th data-decision-sort="plan" tabindex="0" aria-sort="none">Plan <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                <th data-decision-sort="status" tabindex="0" aria-sort="none">Status <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                <th data-decision-sort="result" tabindex="0" aria-sort="none">Result <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                <th><span class="visually-hidden">Actions</span></th>
-              </tr></thead>
-              <tbody id="decisionTable"></tbody>
-            </table>
-          </div>
-        </section>
-        <section class="panel unlinked-panel">
-          <div class="panel-head compact">
-            <div><p class="overline">Close the loop</p><h2>Unlinked trades</h2></div>
-            <span class="badge amber" id="unlinkedCount">0 pending</span>
-          </div>
-          <div id="unlinkedTrades" class="trade-grid"></div>
-        </section>
-      </section>
-
       <section class="view" id="edgeView">
         <div class="section-intro">
           <div><p class="overline">Evidence, not intuition</p><h2>Edge lab</h2></div>
@@ -232,7 +179,6 @@
         <button type="button" class="icon-button" aria-label="Close" data-dialog-close="decisionDialog">×</button>
       </div>
       <input type="hidden" name="signal_id" id="decisionSignalId">
-      <input type="hidden" id="decisionTradeId">
       <label class="full">Thesis<textarea name="thesis" required rows="3" placeholder="What do you believe, and why now?"></textarea></label>
       <div class="form-grid">
         <label>Direction<select name="direction"><option value="long">Long</option><option value="short">Short</option><option value="neutral">Neutral / observe</option></select></label>
@@ -264,21 +210,6 @@
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-dialog-close="decisionDialog">Cancel</button>
         <button type="submit" value="default" class="primary-button">Save decision</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="linkDialog">
-    <form method="dialog" id="linkForm">
-      <div class="dialog-head">
-        <div><p class="overline">Complete the chain</p><h2>Link trade to a decision</h2></div>
-        <button type="button" class="icon-button" aria-label="Close" data-dialog-close="linkDialog">×</button>
-      </div>
-      <input type="hidden" id="linkTradeId">
-      <label class="full">Decision<select id="linkDecisionId" required></select></label>
-      <div class="dialog-actions">
-        <button type="button" class="secondary-button" data-dialog-close="linkDialog">Cancel</button>
-        <button type="submit" value="default" class="primary-button">Link trade</button>
       </div>
     </form>
   </dialog>

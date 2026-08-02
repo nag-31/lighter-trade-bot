@@ -93,6 +93,13 @@ The planned PnL-card execution chart—candles plus buy, sell, entry, scale,
 partial-exit, reversal, and close markers—is described in
 [`architecture_v2/docs/EXECUTION_CHART_DESIGN.md`](architecture_v2/docs/EXECUTION_CHART_DESIGN.md).
 
+The exchange-style chart is an optional presentation plugin. It is enabled by
+default when Plotly/Kaleido are installed; set `CHART_STYLE=classic` (or
+`CHART_STYLE=off`) to unplug it and keep the deterministic Pillow chart. Set
+`CHART_RENDERER=pillow` to force the same fallback independently of style.
+The plug-in changes presentation only—fills, PnL, Telegram delivery, and
+accounting remain untouched.
+
 V2 now has a locally implemented, isolated foundation: immutable executions,
 per-account projection, portfolio composition, fill-time and lifecycle-close
 reporting, additive SQLite storage, checkpoints/outbox, a runtime adapter,

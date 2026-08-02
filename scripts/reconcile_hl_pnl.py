@@ -15,6 +15,9 @@ Apply (writes to DB, regenerates cards):
 Look back N days (default 180):
     python scripts/reconcile_hl_pnl.py --days 30 --apply
 
+Use an explicit calculation cutoff (recommended for repairs):
+    python scripts/reconcile_hl_pnl.py --from-date 2026-07-01 --apply
+
 Skip card regeneration:
     python scripts/reconcile_hl_pnl.py --apply --no-cards
 
@@ -24,10 +27,10 @@ After a successful --apply run, restart the bot to reload corrected stats:
 Safety guarantees
 -----------------
 - DRY-RUN by default; nothing is written without --apply.
-- Back up the DB before any delete: data/events.db.bak-<unix_ts>
-- SCOPED delete: only rows WHERE source=<hl name> AND ts >= T0 are removed,
-  where T0 = min(fill.timestamp) across the fetched window.  Rows OLDER than
-  T0 are preserved untouched (no data loss outside the authoritative window).
+- Back up the DB before any delete: data/events.db.bak-<unix_ts>-<source_id>
+- SCOPED delete: only rows WHERE source=<hl name> and ts >= the authoritative
+  window cutoff are removed. Rows older than the cutoff are preserved untouched
+  (no data loss outside the requested calculation window).
 - Lighter rows are NEVER touched (filter strictly on source == <hl name>).
 - Idempotent: re-running with --apply produces the same result.
 - bootstrap_markets() is called before any fetch so ALL coins are parsed
@@ -40,6 +43,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -57,6 +61,12 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
+from src.account_ledger import (
+    account_db_path,
+    append_trade,
+    init_account_ledger,
+    replace_realizations,
+)
 from src.db import (
     delete_closed_trades_by_identity_since,
     init_db,
@@ -76,6 +86,28 @@ CARDS_DIR = DB_PATH.parent / "cards"
 _DEFAULT_DAYS = 180
 
 log = logging.getLogger("reconcile_hl_pnl")
+
+
+def resolve_start_time_ms(
+    *, now_ms: int, days: int, from_date: str | None = None
+) -> int:
+    """Resolve the explicit exchange-history calculation boundary."""
+    if not from_date:
+        return now_ms - days * 86_400_000
+    from datetime import datetime, timezone
+
+    try:
+        cutoff = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --from-date {from_date!r}; use YYYY-MM-DD or ISO-8601"
+        ) from exc
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    start_time_ms = int(cutoff.astimezone(timezone.utc).timestamp() * 1000)
+    if start_time_ms > now_ms:
+        raise ValueError("--from-date cannot be in the future")
+    return start_time_ms
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +314,9 @@ def _print_report(
     print()
 
     print(f"  Existing HL rows (total)   : {len(existing_rows):>6}")
-    print(f"  Existing HL rows (ts>=T0)  : {rows_replaced:>6}  ← will be replaced")
-    print(f"  Existing HL rows (ts<T0)   : {rows_preserved:>6}  ← preserved untouched")
+    # Keep CLI output cp1252-safe on the Windows host used for local repairs.
+    print(f"  Existing HL rows (ts>=T0)  : {rows_replaced:>6}  -> will be replaced")
+    print(f"  Existing HL rows (ts<T0)   : {rows_preserved:>6}  -> preserved untouched")
     print()
     print(f"  Existing net PnL (all rows) : ${existing_total_pnl:>+,.2f}")
     print(f"  Existing net PnL (window)   : ${existing_window_pnl:>+,.2f}")
@@ -311,6 +344,7 @@ async def main(
     no_cards: bool,
     now_ms: int,
     source_id: str | None = None,
+    from_date: str | None = None,
 ) -> None:
     # 1. Load config + find HL source
     load_dotenv()
@@ -345,6 +379,14 @@ async def main(
         sys.exit(1)
 
     log.info("Using HL source: name=%r  id=%s", hl_source.name, hl_source.id)
+    account_ledger_path = account_db_path(DB_PATH.parent, hl_source.id)
+    if apply:
+        await init_account_ledger(
+            account_ledger_path,
+            account_id=hl_source.id,
+            exchange=hl_source.exchange,
+            display_name=hl_source.name,
+        )
 
     # 2. Build PrivacyParams
     privacy = _build_privacy(settings)
@@ -359,11 +401,29 @@ async def main(
     log.info("Bootstrapping HL markets (required for multi-coin fill parsing)…")
     await hl_source.client.bootstrap_markets()
 
-    # 5. Compute start window and fetch fills.
-    start_time_ms = now_ms - days * 86_400_000
-    log.info(
-        "Fetching fills for the last %d days (start_ms=%d)", days, start_time_ms
-    )
+    # 5. Compute the bounded source window and fetch fills.  A fixed cutoff is
+    # preferable to an implicit "from the beginning" rebuild: rows before it
+    # remain untouched, while the exchange is still queried authoritatively for
+    # every fill at/after the cutoff.  The cutoff is a calculation boundary,
+    # not a request to discard older ledger evidence.
+    from datetime import datetime, timezone
+    if from_date:
+        try:
+            start_time_ms = resolve_start_time_ms(
+                now_ms=now_ms, days=days, from_date=from_date
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        cutoff = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc)
+        log.info(
+            "Fetching authoritative fills from cutoff %s (start_ms=%d)",
+            cutoff.isoformat(), start_time_ms,
+        )
+    else:
+        start_time_ms = now_ms - days * 86_400_000
+        log.info(
+            "Fetching fills for the last %d days (start_ms=%d)", days, start_time_ms
+        )
 
     fills = await hl_source.client.fetch_realizing_fills(
         start_time_ms=start_time_ms,
@@ -381,6 +441,16 @@ async def main(
         f.timestamp,
         -abs(f.start_position) if f.start_position is not None else Decimal(0),
     ))
+    if apply:
+        for fill in fills:
+            await append_trade(
+                account_ledger_path,
+                account_id=hl_source.id,
+                exchange=hl_source.exchange,
+                trade=fill,
+                raw_payload=fill.__dict__ if hasattr(fill, "__dict__") else None,
+                observed_at=None,
+            )
 
     # 6. Reconstruct records (pure logic in hl_pnl_logic.py)
     rebuilt_records = reconstruct_all(fills)
@@ -447,7 +517,17 @@ async def main(
 
     # 10a. Backup DB
     ts_stamp = int(now_ms / 1000)
-    backup_path = DB_PATH.with_name(f"events.db.bak-{ts_stamp}")
+    # Include the account ID and avoid collisions when two account repairs run
+    # in parallel; a timestamp-only backup can otherwise be overwritten by the
+    # second scoped repair.
+    safe_source_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", hl_source.id)
+    backup_path = DB_PATH.with_name(f"events.db.bak-{ts_stamp}-{safe_source_id}")
+    suffix = 1
+    while backup_path.exists():
+        backup_path = DB_PATH.with_name(
+            f"events.db.bak-{ts_stamp}-{safe_source_id}-{suffix}"
+        )
+        suffix += 1
     try:
         shutil.copy2(DB_PATH, backup_path)
         log.info("DB backed up to %s", backup_path)
@@ -518,6 +598,20 @@ async def main(
 
         await save_closed_trade(DB_PATH, rec)
 
+    projection_cutoff = datetime.fromtimestamp(
+        start_time_ms / 1000, tz=timezone.utc
+    ).isoformat()
+    projection_result = await replace_realizations(
+        account_ledger_path,
+        records=rebuilt_records,
+        cutoff_utc=projection_cutoff,
+        run_id=f"{hl_source.id}:{projection_cutoff}",
+    )
+    log.info(
+        "Account projection rebuilt: deleted=%d inserted=%d cutoff=%s",
+        projection_result["deleted"], projection_result["inserted"], projection_cutoff,
+    )
+
     log.info("Inserted %d records", len(rebuilt_records))
     if not no_cards:
         log.info("Cards: %d written, %d failed", cards_written, cards_failed)
@@ -572,6 +666,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--from-date",
+        default=None,
+        metavar="DATE",
+        help=(
+            "Authoritative calculation cutoff in UTC (YYYY-MM-DD or ISO-8601). "
+            "Only fills at/after this date are rebuilt; older rows are preserved. "
+            "Overrides --days."
+        ),
+    )
+    parser.add_argument(
         "--no-cards",
         action="store_true",
         default=False,
@@ -601,5 +705,6 @@ if __name__ == "__main__":
             no_cards=args.no_cards,
             now_ms=_now_ms,
             source_id=args.source_id,
+            from_date=args.from_date,
         )
     )

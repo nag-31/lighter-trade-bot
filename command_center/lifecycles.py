@@ -190,10 +190,21 @@ def _execution(row: dict[str, Any]) -> dict[str, Any] | None:
     realized = _number(trade.get("realized_pnl"))
     if realized is None:
         realized = _number(trade.get("closed_pnl"))
+    price = _number(trade.get("price"))
+    position_entry = _number(position.get("avg_entry_price"))
+    pnl_basis = "exchange_reported" if realized is not None else "unavailable"
     if action == "entry":
         realized = 0.0
+        pnl_basis = "entry"
+    elif action == "exit" and realized is None and position_entry is not None:
+        # Lighter does not send closedPnl. Its position snapshot immediately
+        # before the fill is the authoritative cost basis, especially after
+        # scale-ins change the average entry. Never substitute a lifecycle-wide
+        # VWAP at this boundary; that basis can be wrong for every later exit.
+        direction = -1 if side == "short" else 1
+        realized = (price - position_entry) * size * direction if price is not None else None
+        pnl_basis = "exchange_position_before" if realized is not None else "unavailable"
     implied_entry = None
-    price = _number(trade.get("price"))
     if action == "exit" and realized not in (None, 0) and price is not None:
         direction = -1 if side == "short" else 1
         implied_entry = price - (float(realized) / size) * direction
@@ -209,10 +220,11 @@ def _execution(row: dict[str, Any]) -> dict[str, Any] | None:
         "price": price,
         "size": size,
         "pnl": realized,
+        "pnl_basis": pnl_basis,
         "implied_entry": implied_entry,
         "position_before": before_size,
         "position_after": after_size,
-        "position_entry": _number(position.get("avg_entry_price")),
+        "position_entry": position_entry,
         "native_trade_id": str(native_id) if native_id not in (None, "") else None,
         "transaction_id": trade.get("tx_hash"),
         "event_kind": payload.get("kind"),
@@ -393,13 +405,19 @@ def reconstruct_lifecycles(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any
         )
         closed_size = sum(float(item.get("size") or 0) for item in exits)
         for item in exits:
-            if item.get("pnl") is None and entry_vwap is not None and item.get("price") is not None:
-                direction = -1 if lifecycle["side"] == "short" else 1
-                item["pnl"] = (
-                    (float(item["price"]) - float(entry_vwap))
-                    * float(item["size"])
-                    * direction
-                )
+            if item.get("pnl") is None and item.get("price") is not None:
+                # Historical rows may lack the exchange's before-position
+                # basis. Keep the fallback explicit and auditable rather than
+                # silently presenting it as exchange truth.
+                fallback_entry = entry_vwap
+                if fallback_entry is not None:
+                    direction = -1 if lifecycle["side"] == "short" else 1
+                    item["pnl"] = (
+                        (float(item["price"]) - float(fallback_entry))
+                        * float(item["size"])
+                        * direction
+                    )
+                    item["pnl_basis"] = "lifecycle_entry_fallback"
         pnl_values = [item.get("pnl") for item in exits if item.get("pnl") is not None]
         pnl = sum(float(value) for value in pnl_values) if pnl_values else None
         entry_repaired = False

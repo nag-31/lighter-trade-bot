@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from aiohttp import web
 
 from command_center.ingest import WorkspaceIngestor
 from command_center.store import CommandStore
+from trade_journal.v2_consumer import build_v2_lifecycles
 
 
 HERE = Path(__file__).resolve().parent
@@ -94,6 +96,22 @@ async def bootstrap(request: web.Request) -> web.Response:
             "positions": store.list_positions(),
             "reasons": store.list_reasons(),
             "evaluation": store.lifecycle_evaluation(),
+        }
+    )
+
+
+async def v2_bootstrap(request: web.Request) -> web.Response:
+    """Serve the opt-in V2 read model without changing the legacy payload."""
+    enabled = os.getenv("JOURNAL_UI_MODE", "legacy").strip().lower() in {
+        "v2",
+        "v2-preview",
+    }
+    trades = _store(request).list_trades(limit=500)
+    return web.json_response(
+        {
+            "enabled": enabled,
+            "version": "v2",
+            "lifecycles": build_v2_lifecycles(trades),
         }
     )
 
@@ -220,6 +238,7 @@ def create_app(
     app.router.add_static("/static/", STATIC, show_index=False)
     app.router.add_get("/health", health)
     app.router.add_get("/api/bootstrap", bootstrap)
+    app.router.add_get("/api/v2/bootstrap", v2_bootstrap)
     app.router.add_post("/api/sync", sync_now)
     app.router.add_post("/api/decisions", create_decision)
     app.router.add_patch("/api/decisions/{decision_id:\\d+}", update_decision)

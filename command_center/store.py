@@ -688,6 +688,8 @@ class CommandStore:
                                     "transaction_id": execution.get("transaction_id"),
                                     "event_kind": execution.get("event_kind"),
                                     "event_id": execution.get("event_id"),
+                                    "pnl_basis": execution.get("pnl_basis"),
+                                    "position_entry": execution.get("position_entry"),
                                 }
                             ),
                         ),
@@ -1218,7 +1220,29 @@ class CommandStore:
                 FROM journal.current_positions ORDER BY ABS(size * COALESCE(entry,0)) DESC
                 """
             ).fetchall()
-            return [self._row(row) for row in rows]  # type: ignore[list-item]
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = self._row(row)
+                if item is None:
+                    continue
+                size = float(item.get("size") or 0)
+                entry = float(item.get("entry") or 0)
+                live_pnl = item.get("unrealized_pnl")
+                side = str(item.get("side") or "").lower()
+                # For linear perpetuals, an exchange unrealized mark lets us
+                # derive the current mark without exposing contract quantity.
+                # If no live mark exists, keep current_price null and retain
+                # the entry-based notional only as a fallback value.
+                current_price = None
+                if size and entry and live_pnl is not None:
+                    direction = 1 if side == "long" else -1
+                    current_price = entry + float(live_pnl) / (size * direction)
+                item["current_price"] = current_price
+                item["position_value"] = (
+                    abs(size * current_price) if current_price is not None else None
+                )
+                result.append(item)
+            return result
 
     def link_trade(self, decision_id: int, trade_id: int) -> dict[str, Any]:
         with self.connect() as con:

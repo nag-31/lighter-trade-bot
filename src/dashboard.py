@@ -31,12 +31,20 @@ from dotenv import load_dotenv
 
 from pathlib import Path
 
+from .account_ledger import (
+    account_db_path,
+    append_realization,
+    append_trade,
+    load_all_realizations,
+    migrate_shared_db,
+)
 from .canonical_pnl import (
     backfill_canonical_ledger,
     load_canonical_realizations,
     project_portfolio,
     sync_portfolio_membership,
 )
+from .candle_provider import CandleProvider
 from .db import (
     backfill_closed_trades_from_events,
     enqueue_notification,
@@ -550,8 +558,15 @@ INDEX_HTML = """<!doctype html>
   .oo-flash { animation: ooFlash 1.2s ease-out; }
   @keyframes ooPulse { 0%,100% { box-shadow: none; } 40% { box-shadow: 0 0 0 3px rgba(34,197,94,0.35); } }
   .oo-pulse { animation: ooPulse 0.6s ease-out; }
-  .filters { display:flex; gap:8px; margin:0 0 16px; }
+  .filters { display:flex; align-items:flex-start; gap:10px; margin:0 0 16px; flex-wrap:wrap; }
   .filters select { background:#13161b; color:#d8dbe0; border:1px solid #374151; border-radius:5px; padding:6px 8px; font:inherit; font-size:11px; }
+  .wallet-picker { display:flex; align-items:center; gap:7px; flex-wrap:wrap; max-width:min(760px,100%); }
+  .wallet-picker-label { color:#9ca3af; font-size:10px; text-transform:uppercase; letter-spacing:.55px; }
+  .wallet-chip { display:inline-flex; align-items:center; gap:5px; background:#13161b; color:#d8dbe0; border:1px solid #374151; border-radius:999px; padding:5px 9px; font-size:11px; cursor:pointer; user-select:none; }
+  .wallet-chip:has(input:checked) { border-color:#60a5fa; color:#fff; background:#172337; }
+  .wallet-chip input { accent-color:#60a5fa; }
+  .wallet-picker button { background:#13161b; color:#9ca3af; border:1px solid #374151; border-radius:5px; padding:5px 8px; font:inherit; font-size:10px; cursor:pointer; }
+  .wallet-picker button:hover { color:#fff; border-color:#60a5fa; }
   .live-pnl-strip { display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; margin:0 0 16px; }
   .live-pnl-card { background:#13161b; border:1px solid #1f242c; border-radius:8px; padding:11px 14px; }
   .live-pnl-card span { display:block; color:#6b7280; font-size:9px; text-transform:uppercase; letter-spacing:.7px; }
@@ -569,7 +584,10 @@ INDEX_HTML = """<!doctype html>
 <div class="meta"><span id="status"><span class="dot off"></span>connecting</span> &middot; <span id="sources">no sources</span> &middot; <span id="last">no events yet</span></div>
 <div class="filters">
   <select id="exchange-filter"><option value="">All exchanges</option></select>
-  <select id="source-filter"><option value="">All accounts</option></select>
+  <div class="wallet-picker" id="source-filter" role="group" aria-label="Wallets">
+    <span class="wallet-picker-label">Wallets</span>
+  </div>
+  <span id="stats-cutoff-note" style="align-self:center;color:#6b7280;font-size:10px">PnL window: 2026-06-01 UTC</span>
 </div>
 <div class="live-pnl-strip" aria-label="Filtered live portfolio totals">
   <div class="live-pnl-card"><span>Aggregate live P&amp;L</span><b id="live-pnl-total">â€”</b><small id="live-pnl-note">fresh open positions</small></div>
@@ -680,6 +698,9 @@ const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;"
 let _latestPayload = null;
 const _exchangeFilter = document.getElementById("exchange-filter");
 const _sourceFilter = document.getElementById("source-filter");
+// null means all wallets; a Set means the explicitly selected wallet IDs.
+let _walletSelection = null;
+const selectedWalletIds = () => _walletSelection;
 function initSortableTables() {
   document.querySelectorAll("table").forEach(table => {
     table.querySelectorAll("thead th").forEach((header, index) => {
@@ -756,7 +777,7 @@ initSortableTables();
 const filterRows = rows => (rows || []).filter(row => {
   const identity = row && row.trade ? row.trade : row;
   return (!_exchangeFilter.value || identity.exchange === _exchangeFilter.value) &&
-    (!_sourceFilter.value || identity.source_id === _sourceFilter.value);
+    (_walletSelection === null || _walletSelection.has(identity.source_id));
 });
 const fmtPnl = v => {
   if (v == null || v === "") return "—";
@@ -848,18 +869,81 @@ function renderSources(sources) {
 }
 function renderSourceFilters(details) {
   const rows = details || [];
-  const currentSource = _sourceFilter.value;
   const currentExchange = _exchangeFilter.value;
   const exchanges = [...new Set(rows.map(x => x.exchange).filter(Boolean))].sort();
   _exchangeFilter.innerHTML = '<option value="">All exchanges</option>' +
     exchanges.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("");
-  _sourceFilter.innerHTML = '<option value="">All accounts</option>' +
-    rows.map(x => `<option value="${esc(x.id)}">${esc(x.name)} (${esc(x.exchange)})</option>`).join("");
+  const validIds = new Set(rows.map(x => x.id));
+  if (_walletSelection !== null) {
+    _walletSelection = new Set([..._walletSelection].filter(id => validIds.has(id)));
+  }
+  _sourceFilter.innerHTML = '<span class="wallet-picker-label">Wallets</span>' +
+    '<button type="button" data-wallet-action="all">All</button>' +
+    '<button type="button" data-wallet-action="clear">Clear</button>' +
+    rows.map(x => `<label class="wallet-chip"><input type="checkbox" data-wallet-id="${esc(x.id)}" ${_walletSelection === null || _walletSelection.has(x.id) ? "checked" : ""}>${esc(x.name)} <span style="color:#6b7280">(${esc(x.exchange)})</span></label>`).join("");
   if (exchanges.includes(currentExchange)) _exchangeFilter.value = currentExchange;
-  if (rows.some(x => x.id === currentSource)) _sourceFilter.value = currentSource;
+  _sourceFilter.querySelectorAll("input[data-wallet-id]").forEach(input => {
+    input.addEventListener("change", () => {
+      if (_walletSelection === null) {
+        _walletSelection = new Set(rows.map(x => x.id));
+      }
+      if (input.checked) _walletSelection.add(input.dataset.walletId);
+      else _walletSelection.delete(input.dataset.walletId);
+      renderPayload(_latestPayload);
+    });
+  });
+  _sourceFilter.querySelector('[data-wallet-action="all"]').addEventListener("click", () => {
+    _walletSelection = null;
+    renderPayload(_latestPayload);
+  });
+  _sourceFilter.querySelector('[data-wallet-action="clear"]').addEventListener("click", () => {
+    _walletSelection = new Set();
+    renderPayload(_latestPayload);
+  });
+}
+function computeClientStats(rows) {
+  const records = (rows || []).map(row => ({ row, pnl: Number(row.pnl) }))
+    .filter(item => Number.isFinite(item.pnl));
+  const empty = { n_trades:0, wins:0, losses:0, win_rate:0, total_pnl:0, gross_profit:0, gross_loss:0,
+    profit_factor:null, avg_win:0, avg_loss:0, avg_pnl:0, largest_win:0, largest_loss:0,
+    max_drawdown:0, by_symbol:[], by_source:[], long:{n:0,pnl:0,win_rate:0}, short:{n:0,pnl:0,win_rate:0}, equity_curve:[], pnl_series:[] };
+  if (!records.length) return empty;
+  const wins = records.filter(x => x.pnl > 0), losses = records.filter(x => x.pnl <= 0);
+  const total = records.reduce((s,x) => s + x.pnl, 0);
+  const grossProfit = wins.reduce((s,x) => s + x.pnl, 0);
+  const grossLoss = records.filter(x => x.pnl < 0).reduce((s,x) => s + Math.abs(x.pnl), 0);
+  const ordered = [...records].sort((a,b) => new Date(a.row.ts || 0) - new Date(b.row.ts || 0));
+  let cum = 0, peak = 0, maxDd = 0;
+  const equity = [], series = [];
+  ordered.forEach((item, i) => {
+    cum += item.pnl; peak = Math.max(peak, cum); maxDd = Math.min(maxDd, cum - peak);
+    equity.push({i, ts:item.row.ts || "", cum_pnl:Number(cum.toFixed(8))});
+    series.push({i, ts:item.row.ts || "", pnl:Number(item.pnl.toFixed(8)), symbol:item.row.market_symbol || "", side:item.row.side || "", is_win:item.pnl > 0});
+  });
+  const bySymbol = {};
+  records.forEach(item => { const key = item.row.market_symbol || "?"; bySymbol[key] ||= {n:0,pnl:0,wins:0}; bySymbol[key].n++; bySymbol[key].pnl += item.pnl; if (item.pnl > 0) bySymbol[key].wins++; });
+  const symbolRows = Object.entries(bySymbol).map(([symbol,d]) => ({symbol,n:d.n,pnl:Number(d.pnl.toFixed(8)),win_rate:d.wins/d.n*100})).sort((a,b)=>b.pnl-a.pnl);
+  const sideStats = side => { const xs = records.filter(x => String(x.row.side || "").toLowerCase() === side); const p = xs.reduce((s,x)=>s+x.pnl,0); return {n:xs.length,pnl:Number(p.toFixed(8)),win_rate:xs.length ? xs.filter(x=>x.pnl>0).length/xs.length*100 : 0}; };
+  return { n_trades:records.length, wins:wins.length, losses:losses.length, win_rate:wins.length/records.length*100,
+    total_pnl:Number(total.toFixed(8)), gross_profit:Number(grossProfit.toFixed(8)), gross_loss:Number(grossLoss.toFixed(8)),
+    profit_factor:grossLoss ? Number((grossProfit/grossLoss).toFixed(4)) : null,
+    avg_win:wins.length ? Number((grossProfit/wins.length).toFixed(8)) : 0,
+    avg_loss:records.filter(x=>x.pnl<0).length ? Number((records.filter(x=>x.pnl<0).reduce((s,x)=>s+x.pnl,0)/records.filter(x=>x.pnl<0).length).toFixed(8)) : 0,
+    avg_pnl:Number((total/records.length).toFixed(8)), largest_win:wins.length ? Math.max(...wins.map(x=>x.pnl)) : 0,
+    largest_loss:records.filter(x=>x.pnl<0).length ? Math.min(...records.filter(x=>x.pnl<0).map(x=>x.pnl)) : 0,
+    max_drawdown:Number(maxDd.toFixed(8)), by_symbol:symbolRows, by_source:[], long:sideStats("long"), short:sideStats("short"), equity_curve:equity, pnl_series:series };
+}
+function statsForSelection(data) {
+  const rows = data && data.analytics_trades;
+  if (!rows) return data.stats;
+  return computeClientStats(filterRows(rows));
 }
 function renderPayload(data) {
   _latestPayload = data;
+  const cutoffNote = document.getElementById("stats-cutoff-note");
+  if (cutoffNote) cutoffNote.textContent = data.stats_cutoff
+    ? "PnL window from " + data.stats_cutoff + " UTC"
+    : "PnL window: all dates";
   renderSources(data.sources);
   renderSourceFilters(data.source_details);
   renderLivePnl(data.positions);
@@ -868,12 +952,12 @@ function renderPayload(data) {
   renderEvents(filterRows(data.recent_events));
   renderAlerts(data.tg_alerts);
   renderClosedTrades(data.closed_trades);
-  if (data.stats) renderStats(data.stats);
+  if (data.stats) renderStats(statsForSelection(data));
   if (data.health) renderHealth(data.health);
 }
-[_exchangeFilter, _sourceFilter].forEach(el => el.addEventListener("change", () => {
+_exchangeFilter.addEventListener("change", () => {
   if (_latestPayload) renderPayload(_latestPayload);
-}));
+});
 function renderClosedTrades(trades) {
   const grid = document.getElementById("history-grid");
   const arr = filterRows(trades);
@@ -1397,6 +1481,31 @@ async def _run() -> None:
     await init_db(DB_PATH)
     health.mark_up("database")
 
+    # Per-account ledgers are the immutable source for exchange fills.  The
+    # shared DB remains a compatibility/archive store while the account files
+    # become the read model's primary input.  Migration is idempotent and never
+    # deletes or updates an exchange fill already present in an account ledger.
+    account_ledger_paths = {
+        source.id: account_db_path(DATA_DIR, source.id) for source in sources
+    }
+    account_metadata = {
+        source.id: {"exchange": source.exchange, "display_name": source.name}
+        for source in sources
+    }
+    account_aliases = {
+        (source.name, source.exchange): source.id for source in sources
+    }
+    account_aliases.update({(source.name, ""): source.id for source in sources})
+    ledger_migration = await migrate_shared_db(
+        DB_PATH,
+        account_paths=account_ledger_paths,
+        aliases=account_aliases,
+        metadata=account_metadata,
+    )
+    migrated_fills = sum(ledger_migration.values())
+    if migrated_fills:
+        log.info("account ledgers: migrated %d legacy event fills", migrated_fills)
+
     # Backfill closed_trades from events (idempotent — no-op if already populated)
     backfill_count = await backfill_closed_trades_from_events(DB_PATH)
     if backfill_count:
@@ -1470,9 +1579,14 @@ async def _run() -> None:
     recent_events: list[Any] = list(await load_recent_events(DB_PATH, cfg.max_recent_events))
     log.info("loaded %d persisted events from db", len(recent_events))
 
+    # Load the immutable account projections for stats/history.  If a ledger is
+    # empty (for example a newly configured account), fall back to the shared
+    # compatibility table until its first fill arrives.
+    account_realizations = await load_all_realizations(account_ledger_paths.values())
+
     # Load full history for stats when cfg.stats_full_history; cap the UI payload slice.
     if cfg.stats_full_history:
-        _all_closed_trades: list[dict] = list(
+        _all_closed_trades: list[dict] = list(account_realizations) if account_realizations else list(
             await (
                 load_canonical_realizations(DB_PATH, None)
                 if canonical_reads_enabled
@@ -1486,7 +1600,7 @@ async def _run() -> None:
             "canonical" if canonical_reads_enabled else "legacy",
         )
     else:
-        closed_trades: list[dict] = list(
+        closed_trades: list[dict] = list(account_realizations[:cfg.max_closed_trades]) if account_realizations else list(
             await (
                 load_canonical_realizations(DB_PATH, cfg.max_closed_trades)
                 if canonical_reads_enabled
@@ -1655,6 +1769,10 @@ async def _run() -> None:
     # Directory for PnL card PNG files — must exist before static route is added.
     cards_dir = DB_PATH.parent / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
+    # Public OHLC data is best-effort. A provider outage must never suppress a
+    # close record or Telegram card; the chart renderer falls back to its
+    # deterministic execution-only view.
+    candle_provider = CandleProvider()
 
     # Dashboard-level position view: API truth, updated by the reconciler.
     # Kept separate from src.tracker (fill-based classifier) so the reconciler
@@ -2446,8 +2564,40 @@ async def _run() -> None:
         # V2 execution chart: keep it separate from the accounting/card path so
         # a chart failure can never block the PnL record or its existing alert.
         chart_bytes: bytes | None = None
+        chart_candles = ()
+        chart_candle_provenance = "execution-only"
         if kind == "FULL" and card_bytes:
             try:
+                # Prefer the actual opening fill and scale-out timestamps for
+                # the OHLC window. If the opening fill is unavailable after a
+                # restart, use a bounded lookback rather than failing the
+                # close alert on incomplete history.
+                chart_opened_at = (
+                    chart_opening_trade.timestamp
+                    if chart_opening_trade is not None
+                    else trade.timestamp - timedelta(hours=6)
+                )
+                for _row in chart_partial_rows or ():
+                    try:
+                        _row_ts = datetime.fromisoformat(
+                            str(_row.get("ts", "")).replace("Z", "+00:00")
+                        )
+                        if _row_ts.tzinfo is None:
+                            _row_ts = _row_ts.replace(tzinfo=timezone.utc)
+                        chart_opened_at = min(chart_opened_at, _row_ts)
+                    except (TypeError, ValueError):
+                        continue
+                if chart_opened_at >= trade.timestamp:
+                    chart_opened_at = trade.timestamp - timedelta(seconds=1)
+                chart_candles, chart_candle_provenance = (
+                    await candle_provider.fetch_for_lifecycle(
+                        src,
+                        market_id=trade.market_id,
+                        market_symbol=trade.market_symbol,
+                        opened_at=chart_opened_at,
+                        closed_at=trade.timestamp,
+                    )
+                )
                 chart_bytes = await asyncio.to_thread(
                     render_legacy_execution_chart,
                     source_id=src.id,
@@ -2462,6 +2612,8 @@ async def _run() -> None:
                     pnl_override=card_pnl_override,
                     partial_rows=chart_partial_rows or (),
                     opening_trade=chart_opening_trade,
+                    candles=chart_candles,
+                    candle_provenance=chart_candle_provenance,
                 )
             except Exception:
                 log.exception(
@@ -2531,6 +2683,13 @@ async def _run() -> None:
             "event_uid": realization_keys[-1],
         }
         await save_closed_trade(DB_PATH, record)
+        ledger_path = account_ledger_paths.get(src.id)
+        if ledger_path is not None:
+            await append_realization(
+                ledger_path,
+                record=record,
+                fill_uid=realization_keys[-1] if realization_keys else None,
+            )
         _recorded_realizations.update(realization_keys)
 
         # ── Add in-memory display fields (HL only, never persisted) ───────────
@@ -2896,6 +3055,17 @@ async def _run() -> None:
         return out
 
     def snapshot_payload(type_: str, extra: dict | None = None) -> dict:
+        analytics_rows = [
+            {
+                "ts": row.get("ts"),
+                "pnl": row.get("pnl"),
+                "market_symbol": row.get("market_symbol"),
+                "side": row.get("side"),
+                "source": row.get("source"),
+                "source_id": row.get("source_id"),
+            }
+            for row in display_trades(include_open=False)
+        ]
         payload = {
             "type": type_,
             "sources": [s.name for s in sources],
@@ -2916,6 +3086,11 @@ async def _run() -> None:
             # included, flagged OPEN) + filtered to the display window, so the grid
             # matches the analytics (one card per trade, only existing coins/dates).
             "closed_trades": display_trades(include_open=True)[:cfg.max_closed_trades],
+            # Minimal, privacy-safe analytics rows let the browser recompute
+            # KPIs/charts for any combination of selected wallets without
+            # another server request or a second accounting implementation.
+            "analytics_trades": analytics_rows,
+            "stats_cutoff": cfg.stats_start_date or "",
             "stats": stats_state,
             "health": health.snapshot(),
         }
@@ -3351,6 +3526,19 @@ async def _run() -> None:
             src.seen_tids.add(trade_key)
             trade_cursor = src.cursor_for_trade(trade)
             src.last_trade_id = max(src.last_trade_id or 0, trade_cursor)
+            # Raw exchange facts are persisted before startup/backfill
+            # suppression or event classification. Historical fills update the
+            # account ledger/PnL only and never create Telegram alerts.
+            ledger_path = account_ledger_paths.get(src.id)
+            if ledger_path is not None:
+                await append_trade(
+                    ledger_path,
+                    account_id=src.id,
+                    exchange=src.exchange,
+                    trade=trade,
+                    raw_payload=_to_jsonable(trade),
+                    observed_at=datetime.now(timezone.utc).isoformat(),
+                )
             await save_source_cursor(
                 DB_PATH,
                 src.id,

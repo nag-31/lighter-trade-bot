@@ -84,6 +84,15 @@ def test_address_tracker_shows_filter_aware_aggregate_live_pnl():
     assert "renderLivePnl(data.positions);" in INDEX_HTML
 
 
+def test_dashboard_wallet_filter_supports_multiple_accounts_and_cutoff_analytics():
+    assert 'id="source-filter"' in INDEX_HTML
+    assert 'data-wallet-action="all"' in INDEX_HTML
+    assert 'data-wallet-action="clear"' in INDEX_HTML
+    assert "let _walletSelection = null;" in INDEX_HTML
+    assert "analytics_trades" in INDEX_HTML
+    assert "stats_cutoff" in INDEX_HTML
+
+
 def test_telegram_alert_paths_never_append_configured_source_website():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
@@ -93,6 +102,28 @@ def test_telegram_alert_paths_never_append_configured_source_website():
     assert "ev, src.url, src.name" not in source
     assert "_fallback_event, src.url, src.name" not in source
     assert '_caption += f"\\n{src.url}"' not in source
+
+
+def test_full_close_chart_alert_uses_media_group_with_card_fallback():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    # The chart is an album companion to the existing PnL card. Telegram's
+    # attach:// names must match the multipart file keys, and failures must
+    # preserve the card alert through the existing photo sender.
+    required_fragments = (
+        'if kind == "FULL" and card_bytes:',
+        'await tg_send_media_group(',
+        '"sendMediaGroup"',
+        '"attach://pnl_card"',
+        '"attach://execution_chart"',
+        '"pnl_card": ("pnl-card.png"',
+        '"execution_chart": ("execution-chart.png"',
+        'event_uid=f"{outbox_uid}:card-fallback"',
+    )
+    for fragment in required_fragments:
+        assert fragment in source
 
 
 def test_discussion_commands_reply_in_place_with_shared_anti_spam_gate():

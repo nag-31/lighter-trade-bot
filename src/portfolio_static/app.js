@@ -58,6 +58,9 @@
   ];
 
   var LS = "pf:"; // localStorage namespace
+  var API_TIMEOUT_MS = 25000;
+  var ADDR_HISTORY_PREFETCH_LIMIT = 12;
+  var ADDR_HISTORY_PREFETCH_CONCURRENCY = 3;
   var TOTAL_KEYS = [
     "total_usd", "chains_usd", "lighter_usd", "hyperliquid_usd",
     "defi_usd", "defi_gross_assets_usd", "defi_supplied_usd",
@@ -228,18 +231,69 @@
     activeTab: {},             // id -> tab name
     addrHistory: {},           // id -> [{ts,total_usd,...}] ascending (session cache)
     addrHistoryPending: {},    // id -> true while fetching
+    addrHistoryRequests: {},   // id -> request token; ignores stale completions
+    addrHistoryControllers: {},
+    addrHistoryPrefetchToken: null,
     countUpDone: false,
     refreshTimer: null,
+    refreshPollActive: false,
+    refreshPollInFlight: false,
+    dataState: "live",        // live | stale | offline; preserves last successful data on retry
+    dataError: null,
+    historyStale: false,
     uplot: null
   };
 
   /* ===================== 4. DATA LAYER ===================== */
 
   function api(path, opts) {
-    return fetch(path, opts).then(function (r) {
+    opts = opts || {};
+    var timeout = opts.timeout === undefined ? API_TIMEOUT_MS : Number(opts.timeout);
+    var externalSignal = opts.signal;
+    var controller = window.AbortController ? new AbortController() : null;
+    var timedOut = false;
+    var timer = null;
+    var abortExternal = null;
+    var fetchOpts = {};
+    Object.keys(opts).forEach(function (key) {
+      if (key !== "timeout" && key !== "signal") fetchOpts[key] = opts[key];
+    });
+    if (controller) {
+      fetchOpts.signal = controller.signal;
+      if (externalSignal) {
+        abortExternal = function () { controller.abort(); };
+        if (externalSignal.aborted) abortExternal();
+        else externalSignal.addEventListener("abort", abortExternal, { once: true });
+      }
+      if (isFinite(timeout) && timeout > 0) {
+        timer = setTimeout(function () { timedOut = true; controller.abort(); }, timeout);
+      }
+    } else if (externalSignal) {
+      fetchOpts.signal = externalSignal;
+    }
+    function cleanup() {
+      if (timer) clearTimeout(timer);
+      if (externalSignal && abortExternal) externalSignal.removeEventListener("abort", abortExternal);
+    }
+    var request = fetch(path, fetchOpts).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (body) {
         return { status: r.status, ok: r.ok, body: body };
       });
+    });
+    // Older browsers cannot abort fetches, but callers should still get a bounded
+    // response time instead of leaving refresh UI permanently busy.
+    if (!controller && isFinite(timeout) && timeout > 0) {
+      request = Promise.race([request, new Promise(function (resolve, reject) {
+        timer = setTimeout(function () { timedOut = true; reject(new Error("Request timed out")); }, timeout);
+      })]);
+    }
+    return request.then(function (result) {
+      cleanup();
+      return result;
+    }, function (error) {
+      cleanup();
+      if (timedOut) throw new Error("Request timed out");
+      throw error;
     });
   }
 
@@ -343,8 +397,20 @@
         });
     return task.then(function (summary) {
       state.summary = summary;
+      state.dataState = (summary.addresses || []).some(function (address) {
+        return !!(address.latest && address.latest.stale);
+      }) ? "stale" : "live";
+      state.dataError = null;
       normalizeScope();
       return summary;
+    }).catch(function (error) {
+      // Do not blank a working dashboard for a temporary network/server failure.
+      if (state.summary) {
+        state.dataState = navigator.onLine === false ? "offline" : "stale";
+        state.dataError = error && error.message || "Could not update portfolio";
+        return state.summary;
+      }
+      throw error;
     });
   }
 
@@ -353,43 +419,85 @@
     var task = state.storageMode === "guest"
       ? guestStore().aggregateHistory(ids, 1000)
       : api("/api/history?limit=1000&address_ids=" + encodeURIComponent(ids.join(","))).then(function (res) {
+          if (!res.ok) throw new Error("history failed");
           return (res.body && res.body.history) || [];
         });
     return task.then(function (history) {
       state.history = history || [];
+      state.historyStale = false;
       return state.history;
-    }).catch(function () { state.history = []; });
+    }).catch(function () {
+      // Keep the last chart visible if a scope refresh fails mid-session.
+      state.historyStale = true;
+      return state.history || [];
+    });
   }
 
   function loadAddrHistory(id) {
-    if (id == null || state.addrHistory[id] || state.addrHistoryPending[id]) return;
+    if (id == null || state.addrHistory[id]) return Promise.resolve(state.addrHistory[id]);
+    if (state.addrHistoryPending[id]) return Promise.resolve(null);
+    var requestToken = {};
     state.addrHistoryPending[id] = true;
+    state.addrHistoryRequests[id] = requestToken;
+    var controller = window.AbortController ? new AbortController() : null;
+    if (controller) state.addrHistoryControllers[id] = controller;
     var task = state.storageMode === "guest"
       ? guestStore().addressHistory(id, 300)
-      : api("/api/addresses/" + id + "/history?limit=300").then(function (res) {
+      : api("/api/addresses/" + id + "/history?limit=300", { signal: controller && controller.signal }).then(function (res) {
+          if (!res.ok) throw new Error("address history failed");
           return (res.body && res.body.history) || [];
         });
-    task.then(function (history) {
+    return task.then(function (history) {
+      if (state.addrHistoryRequests[id] !== requestToken) return;
       state.addrHistoryPending[id] = false;
+      delete state.addrHistoryControllers[id];
       state.addrHistory[id] = history || [];
       renderAddresses();
+      return state.addrHistory[id];
     }).catch(function () {
+      if (state.addrHistoryRequests[id] !== requestToken) return;
       state.addrHistoryPending[id] = false;
+      delete state.addrHistoryControllers[id];
       state.addrHistory[id] = [];
+      return state.addrHistory[id];
     });
   }
-  // Prefetch per-address history for all known addresses so per-card/row deltas
-  // populate without needing an expand. Cheap (last-N points, no payloads) and cached.
+  // Keep initial load bounded. Detailed history still loads immediately when a card opens.
   function prefetchAddrHistories() {
-    var addrs = (state.summary && state.summary.addresses) || [];
-    addrs.forEach(function (a) { loadAddrHistory(a.id); });
+    var addrs = includedAddresses().slice(0, ADDR_HISTORY_PREFETCH_LIMIT);
+    var token = {};
+    var next = 0;
+    state.addrHistoryPrefetchToken = token;
+    function worker() {
+      if (state.addrHistoryPrefetchToken !== token || next >= addrs.length) return Promise.resolve();
+      var address = addrs[next++];
+      return loadAddrHistory(address.id).then(worker);
+    }
+    var workers = [];
+    for (var i = 0; i < Math.min(ADDR_HISTORY_PREFETCH_CONCURRENCY, addrs.length); i++) workers.push(worker());
+    return Promise.all(workers);
   }
 
   // Drop cached history for an address so the next expand refetches (after a refresh).
   function invalidateAddrHistory(id) {
     if (id == null) return;
+    var controller = state.addrHistoryControllers[id];
+    if (controller) controller.abort();
     delete state.addrHistory[id];
     delete state.addrHistoryPending[id];
+    delete state.addrHistoryRequests[id];
+    delete state.addrHistoryControllers[id];
+  }
+
+  function clearAddrHistoryCache() {
+    state.addrHistoryPrefetchToken = null;
+    Object.keys(state.addrHistoryControllers).forEach(function (id) {
+      state.addrHistoryControllers[id].abort();
+    });
+    state.addrHistory = {};
+    state.addrHistoryPending = {};
+    state.addrHistoryRequests = {};
+    state.addrHistoryControllers = {};
   }
 
   /* ===================== 5. DERIVATIONS ===================== */
@@ -690,6 +798,11 @@
 
     var spark = sparkline(state.history);
     var asOf = relTime(sum && sum.last_refresh);
+    var freshness = state.dataState === "offline"
+      ? "Offline — showing last loaded data"
+      : state.dataState === "stale"
+        ? "Stale — showing last good data"
+        : "Data as of " + asOf;
 
     host.innerHTML =
       '<div class="hero-card">' +
@@ -700,7 +813,7 @@
             ? '<span class="delta ' + deltaClass(d.abs) + '"><span class="num sensitive">' + fmtUsdSigned(d.abs) + '</span>' +
               '<span class="delta-pct num">' + fmtPct(d.pct) + '</span></span>'
             : '<span class="muted">No 24h data yet</span>') +
-          '<span class="hero-asof">Data as of ' + esc(asOf) + '</span>' +
+          '<span class="hero-asof"' + (state.dataError ? ' title="' + attr(state.dataError) + '"' : '') + '>' + esc(freshness) + '</span>' +
         '</div>' + spark +
       '</div>' +
       statCard("24h change", d.has ? fmtUsdSigned(d.abs) : "—", d.has ? fmtPct(d.pct) : "Refresh twice for history", d.has ? deltaClass(d.abs) : "muted") +
@@ -1060,7 +1173,7 @@
       '</div>' +
       '<div class="addr-figures">' +
         '<div><div class="addr-total num sensitive">' + fmtUsd(total) + '</div>' + deltaSpan(addrDelta(a)) + '</div>' +
-        statusPill(st) +
+        statusPill(st, a.latest && a.latest.stale) +
       '</div>' +
       '<div class="addr-foot">' +
         '<div class="venue-dots">' + venueDots(v) + '</div>' +
@@ -1077,9 +1190,11 @@
     '</div>';
   }
 
-  function statusPill(st) {
+  function statusPill(st, isStale) {
     var labels = { ok: "OK", degraded: "Degraded", error: "Error", idle: "Idle" };
-    return '<span class="status-pill status-' + esc(st) + '"><span class="dot dot-' + esc(st) + '"></span>' + esc(labels[st] || st) + '</span>';
+    var visualStatus = isStale ? "degraded" : st;
+    var label = isStale ? "Stale" : (labels[st] || st);
+    return '<span class="status-pill status-' + esc(visualStatus) + '"><span class="dot dot-' + esc(visualStatus) + '"></span>' + esc(label) + '</span>';
   }
   function venueDots(v) {
     var out = "";
@@ -1741,7 +1856,7 @@
       var card = document.querySelector('.addr-card[data-id="' + id + '"]');
       if (card) card.classList.add("busy");
       invalidateAddrHistory(numOrStr(id));
-      return api("/api/addresses/" + id + "/refresh", { method: "POST" }).then(function (res) {
+      return api("/api/addresses/" + id + "/refresh", { method: "POST", timeout: 120000 }).then(function (res) {
         if (!res.ok || (res.body && res.body.ok === false)) {
           toast((res.body && res.body.error) || "Added, but refresh failed", "warn");
         }
@@ -1776,7 +1891,7 @@
     chunks.forEach(function (chunk) {
       chain = chain.then(function () {
         return api("/api/guest/refresh", {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { "Content-Type": "application/json" }, timeout: 120000,
           body: JSON.stringify({ addresses: chunk.map(function (wallet) { return wallet.address; }) })
         }).then(function (res) {
           if (!res.ok || !res.body || res.body.ok === false) {
@@ -1814,7 +1929,7 @@
         toast(error.message || "Refresh failed", "error");
       }).then(function () { if (card) card.classList.remove("busy"); });
     }
-    return api("/api/addresses/" + id + "/refresh", { method: "POST" }).then(function (res) {
+    return api("/api/addresses/" + id + "/refresh", { method: "POST", timeout: 120000 }).then(function (res) {
       if (res.ok) {
         toast("Address refreshed", "success");
         invalidateAddrHistory(numOrStr(id));
@@ -1880,8 +1995,7 @@
       btn.classList.add("busy");
       setRing(0, wallets.length);
       refreshGuestWallets(wallets, setRing).then(function (result) {
-        state.addrHistory = {};
-        state.addrHistoryPending = {};
+        clearAddrHistoryCache();
         return loadSummary().then(function () { return loadHistory(); }).then(function () {
           renderAll();
           prefetchAddrHistories();
@@ -1897,7 +2011,7 @@
       });
       return;
     }
-    api("/api/refresh", { method: "POST" }).then(function (res) {
+    api("/api/refresh", { method: "POST", timeout: 120000 }).then(function (res) {
       if (res.status === 409 || (res.body && res.body.ok === false)) {
         // already running: attach to poll anyway
         toast("Refresh already running", "warn");
@@ -1916,30 +2030,56 @@
     if (ring) { ring.style.strokeDasharray = circ.toFixed(1); ring.style.strokeDashoffset = (circ * (1 - frac)).toFixed(1); }
   }
 
+  function stopRefreshPolling() {
+    state.refreshPollActive = false;
+    state.refreshPollInFlight = false;
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
   function pollRefresh() {
-    if (state.refreshTimer) clearInterval(state.refreshTimer);
-    state.refreshTimer = setInterval(function () {
-      api("/api/refresh/status").then(function (res) {
+    if (state.refreshPollActive) return;
+    state.refreshPollActive = true;
+
+    function scheduleNext() {
+      if (!state.refreshPollActive) return;
+      state.refreshTimer = setTimeout(checkStatus, document.hidden ? 5000 : 1000);
+    }
+
+    function checkStatus() {
+      state.refreshTimer = null;
+      if (!state.refreshPollActive) return;
+      // A slow response must not create a second overlapping status request.
+      if (state.refreshPollInFlight) { scheduleNext(); return; }
+      state.refreshPollInFlight = true;
+      api("/api/refresh/status", { timeout: 10000 }).then(function (res) {
+        if (!res.ok) throw new Error("refresh status failed");
         var st = res.body || {};
         setRing(num(st.completed), num(st.total) || 1);
-        if (!st.running) {
-          clearInterval(state.refreshTimer); state.refreshTimer = null;
-          $("#btn-refresh").classList.remove("busy");
-          var results = st.results || [];
-          var degraded = results.filter(function (r) { return r.status === "degraded" || r.status === "error"; }).length;
-          state.addrHistory = {}; state.addrHistoryPending = {};
-          loadSummary().then(function () { return loadHistory(); }).then(function () {
-            renderAll();
-            prefetchAddrHistories();
-            toast("Refreshed " + (num(st.completed) || results.length) + " addresses" + (degraded ? " — " + degraded + " degraded" : ""), degraded ? "warn" : "success");
-          });
-        }
+        if (st.running) return true;
+
+        stopRefreshPolling();
+        $("#btn-refresh").classList.remove("busy");
+        var results = st.results || [];
+        var degraded = results.filter(function (r) { return r.status === "degraded" || r.status === "error"; }).length;
+        clearAddrHistoryCache();
+        return loadSummary().then(function () { return loadHistory(); }).then(function () {
+          renderAll();
+          prefetchAddrHistories();
+          toast("Refreshed " + (num(st.completed) || results.length) + " addresses" + (degraded ? " — " + degraded + " degraded" : ""), degraded ? "warn" : "success");
+          return false;
+        });
+      }).then(function (keepPolling) {
+        state.refreshPollInFlight = false;
+        if (keepPolling && state.refreshPollActive) scheduleNext();
       }).catch(function () {
-        clearInterval(state.refreshTimer); state.refreshTimer = null;
+        stopRefreshPolling();
         $("#btn-refresh").classList.remove("busy");
         toast("Lost refresh status", "error");
       });
-    }, 1000);
+    }
+
+    checkStatus();
   }
 
   /* ---- Exports ---- */
@@ -2103,7 +2243,11 @@
   function toggleDetail(id) {
     var real = findAddr(id);
     var key = real ? real.id : id;
-    if (state.openDetails.has(key)) state.openDetails.delete(key);
+    if (state.openDetails.has(key)) {
+      state.openDetails.delete(key);
+      // A collapsed detail has no use for an outstanding per-address history request.
+      if (state.addrHistoryPending[key]) invalidateAddrHistory(key);
+    }
     else state.openDetails.add(key);
     renderAddresses();
   }

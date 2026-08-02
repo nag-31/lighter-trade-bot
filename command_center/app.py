@@ -55,10 +55,6 @@ async def bootstrap(request: web.Request) -> web.Response:
         {
             "summary": store.summary(),
             "signals": store.list_signals(limit=80),
-            "decisions": store.list_decisions(),
-            "trades": store.list_trades(),
-            "evaluation": store.lifecycle_evaluation(),
-            "positions": store.list_positions(),
             "reasons": store.list_reasons(),
             "edge": store.edge_report(),
             "weekly": store.weekly_review(),

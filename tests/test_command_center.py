@@ -15,11 +15,12 @@ def test_dialog_cancel_controls_never_submit_forms() -> None:
     static = Path(__file__).parents[1] / "command_center" / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     script = (static / "app.js").read_text(encoding="utf-8")
-    assert html.count('type="button" class="secondary-button" data-dialog-close=') == 3
-    assert html.count('type="button" class="icon-button" aria-label="Close" data-dialog-close=') == 3
+    assert html.count('type="button" class="secondary-button" data-dialog-close=') == 2
+    assert html.count('type="button" class="icon-button" aria-label="Close" data-dialog-close=') == 2
     assert '$$("[data-dialog-close]")' in script
     assert 'id="reasonGroups"' in html
-    assert 'data-journal-trade' in script
+    assert 'data-journal-trade' not in script
+    assert 'data-trade-journal-link' in html
 
 
 def test_bootstrap_page_load_is_read_only() -> None:
@@ -30,18 +31,16 @@ def test_bootstrap_page_load_is_read_only() -> None:
     assert "store.summary()" in source
 
 
-def test_decision_journal_columns_are_click_sortable() -> None:
+def test_signal_research_does_not_ship_duplicate_journal_surface() -> None:
     static = Path(__file__).parents[1] / "command_center" / "static"
     html = (static / "index.html").read_text(encoding="utf-8")
     script = (static / "app.js").read_text(encoding="utf-8")
-    style = (static / "style.css").read_text(encoding="utf-8")
-    for key in ("updated", "asset", "thesis", "plan", "status", "result"):
-        assert f'data-decision-sort="{key}"' in html
-    assert 'decisionSort: { key: "updated", direction: "desc" }' in script
-    assert "function compareDecisions" in script
-    assert "function setDecisionSort" in script
-    assert 'header.addEventListener("keydown"' in script
-    assert "th[data-decision-sort].sorted" in style
+    assert 'id="journalView"' not in html
+    assert 'id="linkDialog"' not in html
+    assert "function renderJournal" not in script
+    assert "function renderDecisionTable" not in script
+    assert "data-decision-sort" not in html
+    assert "Open Trade Journal" in html
 
 
 def test_store_links_signal_decision_trade_and_reports_edge(tmp_path: Path) -> None:
@@ -796,7 +795,9 @@ async def test_command_center_api_bootstrap(tmp_path: Path) -> None:
         response = await client.get("/api/bootstrap")
         assert response.status == 200
         payload = await response.json()
-        assert {"summary", "signals", "decisions", "trades", "reasons", "edge", "weekly"} <= payload.keys()
+        assert {"summary", "signals", "reasons", "edge", "weekly", "settings"} <= payload.keys()
+        assert "decisions" not in payload
+        assert "trades" not in payload
         custom = await client.post(
             "/api/reasons",
             json={"category": "Psychology", "label": "Patient execution"},
@@ -815,3 +816,24 @@ async def test_command_center_api_bootstrap(tmp_path: Path) -> None:
         created = await decision.json()
         assert created["thesis"] == "Standalone research thesis"
         assert created["reasons"][0]["label"] == "Patient execution"
+def test_positions_expose_current_mark_and_usd_value_without_changing_accounting_size(
+    tmp_path: Path,
+) -> None:
+    store = CommandStore(tmp_path / "command.db")
+    store.init()
+    store.replace_positions([
+        {
+            "position_key": "hl:btc:long",
+            "source": "HL",
+            "symbol": "BTC",
+            "side": "long",
+            "size": 2,
+            "entry": 100,
+            "unrealized_pnl": 20,
+            "liquidation_price": 60,
+            "updated_at": "2026-07-20T10:05:00+00:00",
+        }
+    ])
+    listed = store.list_positions()[0]
+    assert listed["current_price"] == pytest.approx(110)
+    assert listed["position_value"] == pytest.approx(220)

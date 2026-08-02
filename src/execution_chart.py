@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import os
 import re
 from typing import Mapping, Sequence
 
-from architecture_v2.domain.charts import build_trade_chart_spec, select_interval_seconds
+from architecture_v2.domain.charts import (
+    Candle,
+    build_trade_chart_spec,
+    select_interval_seconds,
+)
 from architecture_v2.domain.models import (
     AccountProjection,
     Execution,
@@ -69,12 +74,15 @@ def render_legacy_execution_chart(
     pnl_override: Decimal | None = None,
     partial_rows: Sequence[Mapping[str, object]] = (),
     opening_trade: Trade | None = None,
+    candles: Sequence[Candle] = (),
+    candle_provenance: str = "execution-only",
 ) -> bytes:
     """Render one lifecycle chart using the legacy close-card data.
 
-    This first integration intentionally has no candle provider. The V2
-    renderer still shows the entry, partial exits, and final close on a truthful
-    execution timeline, and labels the footer ``execution-only``.
+    When a public candle provider is available, its normalized OHLC rows are
+    included in the same chart spec. If it is unavailable, the V2 renderer
+    still shows the entry, partial exits, and final close on a truthful
+    execution timeline and labels the footer ``execution-only``.
     """
     direction = (
         PositionDirection.LONG
@@ -258,8 +266,25 @@ def render_legacy_execution_chart(
     spec = build_trade_chart_spec(
         lifecycle,
         projection,
-        candles=(),
+        candles=tuple(candles),
         interval_seconds=interval,
-        candle_provenance="execution-only",
+        candle_provenance=candle_provenance,
     )
+    # The exchange-style chart is a detachable presentation plugin.  Set
+    # CHART_STYLE=classic (or CHART_STYLE=off) to unplug it and retain the
+    # deterministic Pillow renderer without changing accounting or delivery.
+    chart_style = os.getenv("CHART_STYLE", "exchange").strip().lower()
+    renderer = os.getenv("CHART_RENDERER", "auto").strip().lower()
+    if chart_style in {"classic", "legacy", "off", "disabled"}:
+        return render_trade_chart_png(spec)
+    if renderer in {"auto", "plotly"}:
+        try:
+            from architecture_v2.tracker.plotly_chart import (
+                render_plotly_chart_png,
+            )
+
+            return render_plotly_chart_png(spec)
+        except Exception:
+            if renderer == "plotly":
+                raise
     return render_trade_chart_png(spec)

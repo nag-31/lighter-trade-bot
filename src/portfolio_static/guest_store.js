@@ -211,9 +211,13 @@
         return byTime || Number(a.id) - Number(b.id);
       });
       var lastKnown = {};
+      var total = 0;
       var points = rows.map(function (row) {
-        lastKnown[Number(row.address_id)] = Number(row.total_usd || 0);
-        var total = Object.keys(lastKnown).reduce(function (sum, id) { return sum + lastKnown[id]; }, 0);
+        var id = Number(row.address_id);
+        var value = Number(row.total_usd || 0);
+        // Updating a running total avoids rebuilding it for every snapshot.
+        total += value - (lastKnown[id] || 0);
+        lastKnown[id] = value;
         return { ts: row.ts, total_usd: total };
       });
       return limit >= 0 ? points.slice(-limit) : points;
