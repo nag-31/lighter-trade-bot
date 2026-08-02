@@ -868,6 +868,23 @@ def test_journal_positions_merge_fresh_exchange_marks_from_dashboard_snapshot(
                 ),
             ),
         )
+        con.execute(
+            "INSERT INTO events VALUES (?, ?, ?)",
+            (
+                2,
+                timestamp,
+                json.dumps(
+                    {
+                        "kind": "OPEN",
+                        "trade": {"source": "HL", "market_symbol": "ETH"},
+                        "position_after": {
+                            "source": "HL", "market_symbol": "ETH",
+                            "side": "short", "size": "2", "avg_entry_price": "2000",
+                        },
+                    }
+                ),
+            ),
+        )
 
     (events_path.parent / "live_positions.json").write_text(
         json.dumps(

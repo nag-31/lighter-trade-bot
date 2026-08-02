@@ -340,25 +340,16 @@ class WorkspaceIngestor:
                 "metadata": {"event_id": row["id"], "event_kind": payload.get("kind")},
             }
 
-        for key, live in self._read_live_positions().items():
-            current = latest.get(key)
-            if current is None:
-                latest[key] = live
-                continue
-            current.update(
-                {
-                    "size": live["size"],
-                    "entry": live.get("entry"),
-                    "unrealized_pnl": live.get("unrealized_pnl"),
-                    "liquidation_price": live.get("liquidation_price"),
-                    "updated_at": live["updated_at"],
-                }
-            )
-            current["metadata"].update(live.get("metadata") or {})
+        live_positions, live_snapshot_fresh = self._read_live_positions()
+        if live_snapshot_fresh:
+            # The exchange reconciler is authoritative for what is currently
+            # held. Do not retain event-only positions: those rows can be
+            # months old after a close that occurred outside the fill stream.
+            latest = live_positions
 
         mark_rows = [
             row for row in latest.values()
-            if row.get("unrealized_pnl") is None
+            if live_snapshot_fresh and row.get("unrealized_pnl") is None
         ]
         for key, mark in self.public_marks.fetch(mark_rows).items():
             row = latest.get(key)
@@ -380,22 +371,22 @@ class WorkspaceIngestor:
             )
         return self.store.replace_positions(latest.values())
 
-    def _read_live_positions(self) -> dict[str, dict[str, Any]]:
+    def _read_live_positions(self) -> tuple[dict[str, dict[str, Any]], bool]:
         """Read a fresh local exchange snapshot published by the dashboard."""
         path = self.lighter / "data" / "live_positions.json"
         if not path.exists():
-            return {}
+            return {}, False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             captured_at = parse_time(payload["captured_at"])
             age = (datetime.now(timezone.utc) - captured_at).total_seconds()
             if age > LIVE_POSITION_MAX_AGE_SECONDS:
-                return {}
+                return {}, False
             if age < -30:
-                return {}
+                return {}, False
             rows = payload.get("positions") or []
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return {}
+            return {}, False
 
         result: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -423,7 +414,7 @@ class WorkspaceIngestor:
                     "mark_captured_at": payload["captured_at"],
                 },
             }
-        return result
+        return result, True
 
     def _market_outcomes(self) -> int:
         db = self.speculation / "data" / "candles.db"

@@ -180,6 +180,9 @@ class PublicMarkProvider:
                         continue
                     mark = _positive(context.get("markPx"))
                     coin = str(market.get("name") or "").upper()
+                    prefix = f"{dex.upper()}:"
+                    if dex and coin.startswith(prefix):
+                        coin = coin[len(prefix):]
                     if mark is not None and coin:
                         prices[(dex, coin)] = (
                             mark, "hyperliquid_metaAndAssetCtxs.markPx"
