@@ -55,6 +55,7 @@ from .db import (
     save_tg_alert,
 )
 from .display_transform import PrivacyParams, disp_notional, disp_price, disp_size, disp_time, disp_view, footnote, price_factor
+from .execution_chart import render_legacy_execution_chart
 from .filters import passes_min_notional
 from .formatter import format_aggregate, format_event, format_reduce_aggregate, format_sl_tp_set
 from .health import HealthRegistry
@@ -318,6 +319,7 @@ def _roundtrip_partial_context(
     oldest_ts: str | None = None
     pnl_unknown = False
     count = 0
+    partial_rows: list[dict] = []
 
     matching_rows: list[dict] = []
     for row in rows:
@@ -362,6 +364,7 @@ def _roundtrip_partial_context(
     for row in matching_rows:
         if (row.get("realization_kind") or "").upper() != "PARTIAL":
             break
+        partial_rows.append(row)
         count += 1
         if row.get("ts"):
             oldest_ts = str(row["ts"])
@@ -396,6 +399,7 @@ def _roundtrip_partial_context(
         "cost_basis": total_cost_basis,
         "exit_notional": total_exit_notional,
         "oldest_ts": oldest_ts,
+        "rows": partial_rows,
     }
 
 
@@ -2088,6 +2092,103 @@ async def _run() -> None:
                 await tg_send(caption, event_uid=f"{outbox_uid}:fallback")
         await hub.broadcast(snapshot_payload("snapshot"))
 
+    async def tg_send_media_group(
+        card_bytes: bytes,
+        chart_bytes: bytes,
+        *,
+        caption: str = "",
+        log_text: str = "",
+        event_uid: str = "",
+    ) -> None:
+        """Send a PnL card and its execution chart as one Telegram album.
+
+        The existing single-card sender remains the fallback for API errors, so
+        chart delivery can never suppress a real close alert.
+        """
+        outbox_uid = event_uid or (
+            "tg:media-group:"
+            + hashlib.sha256(
+                f"{tg_channel}|{caption}|".encode()
+                + card_bytes
+                + chart_bytes
+            ).hexdigest()
+        )
+        if await notification_status(DB_PATH, outbox_uid) == "sent":
+            return
+        claimed = await enqueue_notification(
+            DB_PATH,
+            outbox_uid,
+            f"telegram:{tg_channel}",
+            log_text or caption or "PnL card and execution chart",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if not claimed and await notification_status(DB_PATH, outbox_uid) == "pending":
+            log.info("tg_send_media_group: another sender owns pending alert %s", outbox_uid)
+            return
+        try:
+            first_media = {
+                "type": "photo",
+                "media": "attach://pnl_card",
+                "caption": caption,
+            }
+            if _uses_telegram_html(caption):
+                first_media["parse_mode"] = "HTML"
+            media = [
+                first_media,
+                {"type": "photo", "media": "attach://execution_chart"},
+            ]
+            r, body = await _tg_channel_post(
+                "sendMediaGroup",
+                data={"chat_id": tg_channel, "media": json.dumps(media)},
+                files={
+                    "pnl_card": ("pnl-card.png", card_bytes, "image/png"),
+                    "execution_chart": ("execution-chart.png", chart_bytes, "image/png"),
+                },
+            )
+            if not body.get("ok"):
+                log.warning(
+                    "tg sendMediaGroup failed: error_code=%s; falling back to card",
+                    body.get("error_code", "unknown"),
+                )
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "failed",
+                    datetime.now(timezone.utc).isoformat(),
+                    f"Telegram API rejected sendMediaGroup ({body.get('error_code', 'unknown')})",
+                )
+                await tg_send_photo(
+                    card_bytes,
+                    caption=caption,
+                    log_text=log_text,
+                    event_uid=f"{outbox_uid}:card-fallback",
+                )
+            else:
+                health.mark_up("telegram")
+                await _record_tg_alert("card", log_text or caption or "PnL card")
+                await mark_notification(
+                    DB_PATH,
+                    outbox_uid,
+                    "sent",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception as exc:
+            log.error("tg_send_media_group failed (%s); falling back to card", type(exc).__name__)
+            await mark_notification(
+                DB_PATH,
+                outbox_uid,
+                "failed",
+                datetime.now(timezone.utc).isoformat(),
+                _safe_telegram_error(exc),
+            )
+            await tg_send_photo(
+                card_bytes,
+                caption=caption,
+                log_text=log_text,
+                event_uid=f"{outbox_uid}:card-fallback",
+            )
+        await hub.broadcast(snapshot_payload("snapshot"))
+
     async def tg_dm_owner(text: str) -> None:
         """Send a PRIVATE message to the owner (TELEGRAM_OWNER_USER_ID).
 
@@ -2252,7 +2353,9 @@ async def _run() -> None:
         anchor_entry: Decimal,
         card_pnl_override: "Decimal | None" = None,
         card_position_before: "Position | None" = None,
-    ) -> None:
+        chart_partial_rows: "list[dict] | None" = None,
+        chart_opening_trade: "Trade | None" = None,
+    ) -> dict[str, Any] | None:
         """Record a single realization event (partial close or full close).
 
         Writes a closed_trades DB row, a PnL card PNG, and broadcasts a snapshot.
@@ -2277,7 +2380,7 @@ async def _run() -> None:
                     "[%s] record_realization: all fill_ids already recorded, skipping %s %s",
                     src.name, kind, trade.market_symbol,
                 )
-                return
+                return None
 
         # ── Build a synthetic Event-like for generate_pnl_card ────────────────
         # We need an Event whose position_before is the pre-reduce/pre-close
@@ -2339,6 +2442,33 @@ async def _run() -> None:
             anchor_entry=anchor_entry,
             source_id=src.id,
         )
+
+        # V2 execution chart: keep it separate from the accounting/card path so
+        # a chart failure can never block the PnL record or its existing alert.
+        chart_bytes: bytes | None = None
+        if kind == "FULL" and card_bytes:
+            try:
+                chart_bytes = await asyncio.to_thread(
+                    render_legacy_execution_chart,
+                    source_id=src.id,
+                    source_name=src.name,
+                    exchange=src.exchange,
+                    market_symbol=trade.market_symbol,
+                    position=card_position_before or position_before,
+                    close_trade=trade,
+                    reduced_size=reduced_size,
+                    fill_price=fill_price,
+                    realized_pnl=realized_pnl,
+                    pnl_override=card_pnl_override,
+                    partial_rows=chart_partial_rows or (),
+                    opening_trade=chart_opening_trade,
+                )
+            except Exception:
+                log.exception(
+                    "[%s] execution chart generation failed for %s; sending card only",
+                    src.name,
+                    trade.market_symbol,
+                )
 
         # Write PNG to disk
         card_path = None
@@ -2420,6 +2550,7 @@ async def _run() -> None:
             del closed_trades[cfg.max_closed_trades:]
         refresh_stats()
         await hub.broadcast(snapshot_payload("snapshot"))
+        return {"card_path": card_path, "chart_bytes": chart_bytes}
 
     async def flush_aggregate(key: tuple[str, int]) -> None:
         buf = _pending.pop(key, None)
@@ -3508,7 +3639,19 @@ async def _run() -> None:
                     )
 
                     # Record the FULL close realization (card + DB + broadcast)
-                    await record_realization(
+                    _chart_open_trade = next(
+                        (
+                            _recent.trade
+                            for _recent in recent_events
+                            if isinstance(_recent, Event)
+                            and _recent.kind is EventKind.OPEN
+                            and _recent.trade.market_id == ev.trade.market_id
+                            and _recent.trade.source_id == ev.trade.source_id
+                            and _recent.trade.position_side == ev.trade.position_side
+                        ),
+                        None,
+                    )
+                    _close_result = await record_realization(
                         src=src,
                         kind="FULL",
                         trade=ev.trade,
@@ -3522,12 +3665,17 @@ async def _run() -> None:
                         anchor_entry=_close_anchor,
                         card_pnl_override=_card_total,
                         card_position_before=_card_position,
+                        chart_partial_rows=_rt_context.get("rows", []),
+                        chart_opening_trade=_chart_open_trade,
                     )
 
                     if cfg.alert_on_close:
                         # Find the record just inserted (newest-first, index 0)
                         _close_record = closed_trades[0] if closed_trades else {}
                         _close_card_path = _close_record.get("card_path")
+                        _execution_chart_bytes = (
+                            _close_result or {}
+                        ).get("chart_bytes")
                         if _close_card_path:
                             # Re-read the bytes from disk for Telegram send
                             # card_path is "/cards/<filename>" — strip the web prefix
@@ -3573,15 +3721,25 @@ async def _run() -> None:
                                 f"{side_marker} <b>{side_txt} CLOSED</b>\n"
                                 f"{pnl_marker} P&amp;L: <b>{pnl_txt}</b>"
                             )
-                            await tg_send_photo(
-                                card_bytes,
-                                caption=_caption,
-                                log_text=log_text,
-                                event_uid=(
-                                    f"tg:card:{ev.trade.event_uid(src.id)}:"
-                                    f"{ev.kind.value}"
-                                ),
+                            _card_event_uid = (
+                                f"tg:card:{ev.trade.event_uid(src.id)}:"
+                                f"{ev.kind.value}"
                             )
+                            if _execution_chart_bytes:
+                                await tg_send_media_group(
+                                    card_bytes,
+                                    _execution_chart_bytes,
+                                    caption=_caption,
+                                    log_text=log_text,
+                                    event_uid=_card_event_uid,
+                                )
+                            else:
+                                await tg_send_photo(
+                                    card_bytes,
+                                    caption=_caption,
+                                    log_text=log_text,
+                                    event_uid=_card_event_uid,
+                                )
                         else:
                             ae = _close_anchor
                             _fallback_event = (
