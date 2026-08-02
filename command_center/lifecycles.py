@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from holding_time import holding_duration_ms
 import json
 from datetime import datetime
 from typing import Any, Iterable
@@ -482,6 +483,16 @@ def reconstruct_lifecycles(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any
                 "partial_exit_count": partials,
                 "management_style": style,
                 "entry_repaired": entry_repaired,
+                "holding_duration_ms": holding_duration_ms(
+                    lifecycle["opened_at"], lifecycle.get("closed_at")
+                ),
+                "holding_duration_basis": (
+                    "inferred_lower_bound"
+                    if lifecycle.get("inferred_open") and lifecycle.get("closed_at")
+                    else "exact"
+                    if lifecycle.get("closed_at")
+                    else "unavailable"
+                ),
                 "batches": batches,
             }
         )

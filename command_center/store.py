@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from holding_time import holding_duration_ms
+
 
 HORIZONS_MINUTES = (60, 360, 1440, 10080)
 REASON_PRESETS = {
@@ -180,10 +182,16 @@ class CommandStore:
                     exit_batch_count INTEGER NOT NULL DEFAULT 0,
                     partial_exit_count INTEGER NOT NULL DEFAULT 0,
                     management_style TEXT NOT NULL DEFAULT '',
+                    holding_duration_ms INTEGER,
+                    holding_duration_basis TEXT NOT NULL DEFAULT 'unavailable',
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_trade_lifecycles_time
                 ON trade_lifecycles(opened_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_lifecycles_holding
+                ON trade_lifecycles(status, holding_duration_ms, closed_at);
+                CREATE INDEX IF NOT EXISTS idx_trade_lifecycles_analysis
+                ON trade_lifecycles(source, symbol, side, status, closed_at);
 
                 CREATE TABLE IF NOT EXISTS trade_executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -429,6 +437,26 @@ class CommandStore:
                 );
                 """
             )
+            # Additive lifecycle-duration migration for existing databases.
+            for schema in ("main", "journal"):
+                columns = {
+                    row["name"] for row in con.execute(
+                        f"PRAGMA {schema}.table_info(trade_lifecycles)"
+                    ).fetchall()
+                }
+                if "holding_duration_ms" not in columns:
+                    con.execute(f"ALTER TABLE {schema}.trade_lifecycles ADD COLUMN holding_duration_ms INTEGER")
+                if "holding_duration_basis" not in columns:
+                    con.execute(f"ALTER TABLE {schema}.trade_lifecycles ADD COLUMN holding_duration_basis TEXT NOT NULL DEFAULT 'unavailable'")
+                con.execute(f"CREATE INDEX IF NOT EXISTS {schema}.idx_trade_lifecycles_holding ON trade_lifecycles(status, holding_duration_ms, closed_at)")
+                con.execute(f"CREATE INDEX IF NOT EXISTS {schema}.idx_trade_lifecycles_analysis ON trade_lifecycles(source, symbol, side, status, closed_at)")
+                con.execute(
+                    f"UPDATE {schema}.trade_lifecycles SET holding_duration_ms = "
+                    "CAST(MAX(0, (julianday(closed_at)-julianday(opened_at))*86400000) AS INTEGER), "
+                    "holding_duration_basis = CASE WHEN json_extract(metadata_json, '$.inferred_open')=1 "
+                    "THEN 'inferred_lower_bound' ELSE 'exact' END "
+                    "WHERE closed_at IS NOT NULL AND holding_duration_ms IS NULL"
+                )
             for table in (
                 "decisions", "journal_reasons", "decision_reasons",
                 "trades", "trade_lifecycles", "trade_executions",
@@ -628,8 +656,9 @@ class CommandStore:
                         status, entry_vwap, exit_vwap, max_size, closed_size,
                         notional, pnl, pnl_pct, is_win, fill_count,
                         entry_batch_count, exit_batch_count, partial_exit_count,
-                        management_style, metadata_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        management_style, holding_duration_ms, holding_duration_basis,
+                        metadata_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(lifecycle_key) DO UPDATE SET
                         source=excluded.source, symbol=excluded.symbol,
                         side=excluded.side, opened_at=excluded.opened_at,
@@ -643,6 +672,8 @@ class CommandStore:
                         exit_batch_count=excluded.exit_batch_count,
                         partial_exit_count=excluded.partial_exit_count,
                         management_style=excluded.management_style,
+                        holding_duration_ms=excluded.holding_duration_ms,
+                        holding_duration_basis=excluded.holding_duration_basis,
                         metadata_json=excluded.metadata_json
                     """,
                     (
@@ -656,7 +687,14 @@ class CommandStore:
                         int(item.get("entry_batch_count") or 0),
                         int(item.get("exit_batch_count") or 0),
                         int(item.get("partial_exit_count") or 0),
-                        item.get("management_style") or "", self._json(metadata),
+                        item.get("management_style") or "",
+                        item.get("holding_duration_ms") if item.get("holding_duration_ms") is not None
+                        else holding_duration_ms(item.get("opened_at"), item.get("closed_at")),
+                        item.get("holding_duration_basis") or (
+                            "inferred_lower_bound" if item.get("inferred_open") and item.get("closed_at")
+                            else "exact" if item.get("closed_at") else "unavailable"
+                        ),
+                        self._json(metadata),
                     ),
                 )
                 lifecycle_id = int(
@@ -1150,6 +1188,13 @@ class CommandStore:
                     item["exit"] = item.get("exit_vwap")
                     item["size"] = item.get("max_size")
                     item["occurred_at"] = item.get("closed_at") or item.get("opened_at")
+                    if item.get("closed_at") is None:
+                        from holding_time import parse_timestamp
+                        item["holding_duration_ms"] = max(
+                            0,
+                            int((utc_now() - parse_timestamp(item["opened_at"])).total_seconds() * 1000),
+                        )
+                        item["holding_as_of"] = iso()
                     item["is_lifecycle"] = True
                     item["batches"] = item.get("metadata", {}).get("batches", [])
                     item["executions"] = [

@@ -333,6 +333,12 @@ def _collapse_segment(rows: list[dict], *, closed: bool) -> dict:
         "leverage": last.get("leverage"),
         "card_path": last.get("card_path"),
         "trade_id": last.get("trade_id"),
+        "lifecycle_opened_at": next(
+            (r.get("lifecycle_opened_at") for r in rows if r.get("lifecycle_opened_at")),
+            None,
+        ),
+        "holding_duration_ms": last.get("holding_duration_ms"),
+        "holding_duration_basis": last.get("holding_duration_basis") or "unavailable",
         "realization_kind": "FULL" if closed else "OPEN",
         "n_fills": len(rows),
     }

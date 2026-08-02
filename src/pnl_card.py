@@ -21,6 +21,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 from .types import Event, Position
+from holding_time import format_holding_duration, holding_duration_ms as _holding_duration_ms
 
 # ---------------------------------------------------------------------------
 # Psychology quotes
@@ -196,6 +197,9 @@ def generate_pnl_card(
     source_id: str = "",
     pnl_override: Optional[Decimal] = None,
     is_partial: bool = False,
+    opened_at=None,
+    holding_duration_ms: Optional[int] = None,
+    holding_duration_basis: str = "unavailable",
 ) -> Optional[bytes]:
     """Return PNG bytes for the PnL card, or None if Pillow is unavailable.
 
@@ -215,6 +219,12 @@ def generate_pnl_card(
     t = event.trade
     if pos is None:
         return None
+
+    if holding_duration_ms is None:
+        holding_duration_ms = _holding_duration_ms(opened_at, t.timestamp)
+    holding_label = format_holding_duration(holding_duration_ms)
+    if is_partial and holding_duration_ms is not None:
+        holding_label = f"{holding_label} so far"
 
     # PnL and % are ALWAYS computed from real (un-transformed) values.
     pnl = calculate_pnl(event, accumulated_pnl=accumulated_pnl, pnl_override=pnl_override)
@@ -307,6 +317,7 @@ def generate_pnl_card(
         ("EXIT",     _fmt_px(disp_exit)),
         ("NOTIONAL", f"${disp_notional:,.0f}"),
         ("LEVERAGE", lev_str),
+        ("HELD",     holding_label),
     ]
     col_w = (W - 84) // len(details)
     for i, (label, value) in enumerate(details):

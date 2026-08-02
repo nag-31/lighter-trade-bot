@@ -94,6 +94,7 @@ from .telegram_commands import (
     split_message,
 )
 from .types import Event, EventKind, OpenOrder, Position, Trade
+from holding_time import holding_duration_ms
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
@@ -1038,6 +1039,14 @@ function renderClosedTrades(trades) {
     const sideLabel = ((tr.side || '').toUpperCase()) + _rkLabel;
     const levStr  = tr.leverage ? tr.leverage + 'x' : '—';
     const wrStr   = (tr.wins != null && tr.total != null && tr.total > 0) ? tr.wins + '/' + tr.total : '—';
+    const holdMs = tr.holding_duration_ms == null ? null : Number(tr.holding_duration_ms);
+    const holdStr = holdMs == null || !Number.isFinite(holdMs) ? '—' : (() => {
+      const s = Math.max(0, Math.round(holdMs / 1000));
+      if (s < 60) return s === 0 ? '<1m' : s + 's';
+      const m = Math.floor(s / 60); if (m < 60) return m + 'm';
+      const h = Math.floor(m / 60); if (h < 24) return h + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '');
+      const d = Math.floor(h / 24); return d + 'd' + (h % 24 ? ' ' + (h % 24) + 'h' : '');
+    })();
     // Prefer privacy-transformed display fields when present (HL trades).
     const timeStr = tr.ts_disp   ?? (tr.ts ? toIST(tr.ts) : '');
     const entryStr = (tr.entry_disp ?? tr.entry) ? fmtPrice(tr.entry_disp ?? tr.entry) : '—';
@@ -1065,6 +1074,7 @@ function renderClosedTrades(trades) {
     <span class="tile-detail-label">NOTIONAL</span><span class="tile-detail-val">${notStr}</span>
     <span class="tile-detail-label">LEVERAGE</span><span class="tile-detail-val">${levStr}</span>
     <span class="tile-detail-label">WIN RATE</span><span class="tile-detail-val">${wrStr}</span>
+    <span class="tile-detail-label">HOLDING TIME</span><span class="tile-detail-val">${holdStr}</span>
   </div>
   ${thumbHtml}
   ${tileFootnote}
@@ -2588,6 +2598,28 @@ async def _run() -> None:
         synth_ev_with_leverage = _copy.copy(synth_ev)
         object.__setattr__(synth_ev_with_leverage, "leverage", leverage)
 
+        lifecycle_opened_at = (
+            chart_opening_trade.timestamp if chart_opening_trade is not None else None
+        )
+        if lifecycle_opened_at is None:
+            for _row in chart_partial_rows or ():
+                try:
+                    _candidate = datetime.fromisoformat(
+                        str(_row.get("ts", "")).replace("Z", "+00:00")
+                    )
+                    if _candidate.tzinfo is None:
+                        _candidate = _candidate.replace(tzinfo=timezone.utc)
+                    lifecycle_opened_at = (
+                        _candidate if lifecycle_opened_at is None
+                        else min(lifecycle_opened_at, _candidate)
+                    )
+                except (TypeError, ValueError):
+                    continue
+        hold_ms = holding_duration_ms(lifecycle_opened_at, trade.timestamp)
+        hold_basis = "exact" if chart_opening_trade is not None else (
+            "inferred_lower_bound" if lifecycle_opened_at is not None else "unavailable"
+        )
+
         # ── PnL / pct ─────────────────────────────────────────────────────────
         is_win = None if realized_pnl is None else realized_pnl > 0
         # The win-rate record counts CLOSED TRADES: only a FULL close advances
@@ -2621,6 +2653,9 @@ async def _run() -> None:
             is_hl=src.is_hyperliquid,
             anchor_entry=anchor_entry,
             source_id=src.id,
+            opened_at=lifecycle_opened_at,
+            holding_duration_ms=hold_ms,
+            holding_duration_basis=hold_basis,
         )
 
         # V2 execution chart: keep it separate from the accounting/card path so
@@ -2743,6 +2778,9 @@ async def _run() -> None:
             "position_side": trade.position_side,
             "native_trade_id": trade.native_trade_id or str(trade.trade_id),
             "event_uid": realization_keys[-1],
+            "lifecycle_opened_at": lifecycle_opened_at.isoformat() if lifecycle_opened_at else None,
+            "holding_duration_ms": hold_ms,
+            "holding_duration_basis": hold_basis,
         }
         await save_closed_trade(DB_PATH, record)
         ledger_path = account_ledger_paths.get(src.id)
@@ -3125,6 +3163,8 @@ async def _run() -> None:
                 "side": row.get("side"),
                 "source": row.get("source"),
                 "source_id": row.get("source_id"),
+                "holding_duration_ms": row.get("holding_duration_ms"),
+                "holding_duration_basis": row.get("holding_duration_basis"),
             }
             for row in display_trades(include_open=False)
         ]

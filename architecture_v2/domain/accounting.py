@@ -108,6 +108,10 @@ def _freeze_lifecycle(
     closed_at=None,
 ) -> Lifecycle:
     closed = closed_at is not None
+    duration_ms = (
+        max(0, int(round((closed_at - position.opened_at).total_seconds() * 1000)))
+        if closed_at is not None else None
+    )
     return Lifecycle(
         lifecycle_uid=position.lifecycle_uid,
         account_id=position.account_id,
@@ -117,6 +121,8 @@ def _freeze_lifecycle(
         direction=position.direction,
         opened_at=position.opened_at,
         closed_at=closed_at,
+        holding_duration_ms=duration_ms,
+        holding_duration_basis="exact" if closed else "unavailable",
         status=LifecycleStatus.CLOSED if closed else LifecycleStatus.OPEN,
         entry_vwap=position.entry_notional / position.entry_quantity,
         exit_vwap=(

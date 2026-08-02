@@ -32,6 +32,9 @@ def _migrate_closed_trades(con: sqlite3.Connection) -> None:
         ("position_side",     "TEXT"),
         ("native_trade_id",   "TEXT"),
         ("event_uid",         "TEXT"),
+        ("lifecycle_opened_at", "TEXT"),
+        ("holding_duration_ms", "INTEGER"),
+        ("holding_duration_basis", "TEXT"),
     ]
     for col_name, col_type in new_cols:
         if col_name not in existing:
@@ -99,6 +102,9 @@ def _init_sync(path: Path) -> None:
             ,position_side     TEXT
             ,native_trade_id   TEXT
             ,event_uid         TEXT
+            ,lifecycle_opened_at TEXT
+            ,holding_duration_ms INTEGER
+            ,holding_duration_basis TEXT
         )
     """)
     _migrate_closed_trades(con)
@@ -207,7 +213,8 @@ _CLOSED_TRADE_COLUMNS = (
     "wins", "total", "card_path",
     "trade_id", "fill_ids", "realization_kind",
     "source_id", "exchange", "market_key", "position_side",
-    "native_trade_id", "event_uid",
+    "native_trade_id", "event_uid", "lifecycle_opened_at",
+    "holding_duration_ms", "holding_duration_basis",
 )
 
 

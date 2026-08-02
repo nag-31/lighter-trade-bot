@@ -44,6 +44,18 @@ function formatMoney(value) {
   return money.format(numeric(value));
 }
 
+function formatHolding(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return "—";
+  let seconds = Math.max(0, Math.round(Number(ms) / 1000));
+  if (seconds < 60) return seconds === 0 ? "<1m" : `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`;
+  const days = Math.floor(hours / 24);
+  return `${days}d${hours % 24 ? ` ${hours % 24}h` : ""}`;
+}
+
 function formatTime(value) {
   if (!value) return "Not synced yet";
   const date = new Date(value);
@@ -247,11 +259,15 @@ function openTradeInspector(trade) {
   $("#inspectMeta").textContent = `${trade.source || "Trade source"} Â· opened ${formatTime(trade.opened_at || trade.occurred_at)} Â· ${isOpen(trade) ? "ACTIVE" : String(trade.status || "CLOSED").toUpperCase()}`;
   const rows = executionRows(trade);
   const pnl = tradePnl(trade);
+  const holding = formatHolding(isOpen(trade) && trade.opened_at
+    ? Math.max(0, Date.now() - new Date(trade.opened_at).valueOf())
+    : trade.holding_duration_ms);
   $("#inspectBody").innerHTML = `
     <div class="inspect-summary">
       <div><span>Direction</span><b class="${escapeHtml(String(trade.side || "neutral").toLowerCase())}">${escapeHtml(String(trade.side || "neutral").toUpperCase())}</b></div>
       <div><span>${isOpen(trade) ? "Live PnL" : "Realized PnL"}</span><b class="${pnlClass(isOpen(trade) ? pnl.live : pnl.realized)}">${isOpen(trade) && pnl.live == null ? "Awaiting mark" : formatMoney(isOpen(trade) ? pnl.live : pnl.realized)}</b></div>
       <div><span>Trace completeness</span><b>${rows.length ? `${rows.length} events` : "No fills available"}</b></div>
+      <div><span>Holding time</span><b>${holding}${trade.holding_duration_basis === "inferred_lower_bound" ? " · lower bound" : ""}</b></div>
     </div>
     <ol class="trace-list">${rows.length ? rows.map((row, index) => `
       <li><span class="trace-index">${String(index + 1).padStart(2, "0")}</span><span><b>${escapeHtml(row.action)}</b><small>${escapeHtml(row.time ? formatTime(row.time) : "Time unavailable")}</small></span><strong>${row.price != null ? formatMoney(row.price) : "—"}</strong></li>
@@ -274,6 +290,9 @@ function renderTrades() {
     const returnPct = trade.return_pct ?? trade.pnl_pct;
     const currentPrice = currentPriceFor(trade);
     const positionValue = positionValueFor(trade);
+    const holding = formatHolding(open && trade.opened_at
+      ? Math.max(0, Date.now() - new Date(trade.opened_at).valueOf())
+      : trade.holding_duration_ms);
     return `
       <article class="trade-card ${escapeHtml(side)}">
         <div class="execution-tape" aria-hidden="true"></div>
@@ -290,6 +309,7 @@ function renderTrades() {
           <span><small>${open ? "CURRENT" : "AVG EXIT"}</small><b>${open ? (currentPrice != null ? formatMoney(currentPrice) : "Awaiting mark") : (trade.exit != null ? formatMoney(trade.exit) : "—")}</b></span>
           <span><small>POSITION VALUE</small><b>${positionValue != null ? formatMoney(positionValue) : "Awaiting mark"}</b></span>
           <span><small>${open ? "LIVE PNL" : "REALIZED PNL"}</small><b class="${pnlClass(open ? pnl.live : pnl.realized)}">${open && pnl.live == null ? "Awaiting mark" : formatMoney(open ? pnl.live : pnl.realized)}</b></span>
+          <span><small>${open ? "HELD SO FAR" : "HOLDING TIME"}</small><b>${holding}</b></span>
         </div>
         <div class="trade-meta">
           <span>${trade.fill_count || trade.executions?.length || 0} raw fills</span>
@@ -568,7 +588,7 @@ function renderV2() {
   $("#v2Chart").innerHTML = v2ChartSvg(chart);
   $("#v2StateBadge").textContent = selected?.status ? String(selected.status).toUpperCase() : "—";
   $("#v2Provenance").textContent = chart?.candle_provenance || "—";
-  $("#v2Metrics").innerHTML = selected ? [["Entry", selected.entry == null ? "—" : v2Price(selected.entry)], ["Exit", selected.exit == null ? "—" : v2Price(selected.exit)], ["Position value", selected.position_value == null ? "—" : formatMoney(selected.position_value)], ["Fills", selected.fill_count || selected.execution_count || 0], ["PnL", selected.pnl == null ? "—" : formatMoney(selected.pnl)], ["Return", selected.pnl_pct == null ? "—" : `${numeric(selected.pnl_pct).toFixed(2)}%`]].map(([label, value]) => `<div><span>${label}</span><b>${escapeHtml(value)}</b></div>`).join("") : "";
+  $("#v2Metrics").innerHTML = selected ? [["Entry", selected.entry == null ? "—" : v2Price(selected.entry)], ["Exit", selected.exit == null ? "—" : v2Price(selected.exit)], ["Position value", selected.position_value == null ? "—" : formatMoney(selected.position_value)], ["Fills", selected.fill_count || selected.execution_count || 0], ["Holding time", formatHolding(selected.holding_duration_ms)], ["PnL", selected.pnl == null ? "—" : formatMoney(selected.pnl)], ["Return", selected.pnl_pct == null ? "—" : `${numeric(selected.pnl_pct).toFixed(2)}%`]].map(([label, value]) => `<div><span>${label}</span><b>${escapeHtml(value)}</b></div>`).join("") : "";
   $("#v2ExecutionStrip").innerHTML = chart?.markers?.length ? chart.markers.map((marker, index) => `<div class="v2-execution-step"><span>${String(index + 1).padStart(2, "0")}</span><b>${escapeHtml(executionLabel(marker, selected))}</b><strong>${escapeHtml(v2Price(marker.price_vwap))}</strong><small>${escapeHtml(new Date(marker.first_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</small></div>`).join("") : `<div class="v2-execution-empty">No execution batches were serialized for this lifecycle.</div>`;
 }
 
@@ -660,6 +680,9 @@ for (const selector of ["#tradeSearch", "#tradeStatus", "#tradeSide", "#tradeJou
 for (const selector of ["#entrySearch", "#entryStatus", "#entrySide"]) {
   $(selector).addEventListener(selector === "#entrySearch" ? "input" : "change", renderDecisions);
 }
+setInterval(() => {
+  if (state.trades.some(isOpen)) renderTrades();
+}, 60000);
 $$("th[data-sort]").forEach((header) => {
   const sort = () => {
     const key = header.dataset.sort;

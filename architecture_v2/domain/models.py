@@ -157,6 +157,8 @@ class Lifecycle:
     realized_pnl: Decimal
     execution_uids: tuple[str, ...]
     realization_uids: tuple[str, ...]
+    holding_duration_ms: int | None = None
+    holding_duration_basis: str = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)

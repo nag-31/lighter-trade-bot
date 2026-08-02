@@ -13,6 +13,8 @@ from decimal import Decimal
 import re
 from typing import Any, Iterable
 
+from holding_time import holding_duration_ms
+
 from architecture_v2.domain.accounting import project_account
 from architecture_v2.domain.charts import build_trade_chart_spec, select_interval_seconds
 from architecture_v2.domain.models import Execution, ExecutionSide, PositionSide
@@ -91,6 +93,8 @@ def serialize_chart_spec(spec: Any) -> dict[str, Any]:
         "direction": spec.direction.value,
         "opened_at": spec.opened_at.isoformat(),
         "closed_at": spec.closed_at.isoformat() if spec.closed_at else None,
+        "holding_duration_ms": holding_duration_ms(spec.opened_at, spec.closed_at),
+        "holding_duration_basis": "exact" if spec.closed_at else "unavailable",
         "interval_seconds": spec.interval_seconds,
         "candles": [
             {
@@ -158,6 +162,12 @@ def build_v2_lifecycles(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
                 "status": item.get("status"),
                 "opened_at": _iso(item.get("opened_at")),
                 "closed_at": _iso(item.get("closed_at")),
+                "holding_duration_ms": item.get("holding_duration_ms")
+                    if item.get("holding_duration_ms") is not None
+                    else holding_duration_ms(item.get("opened_at"), item.get("closed_at")),
+                "holding_duration_basis": item.get("holding_duration_basis") or (
+                    "exact" if item.get("closed_at") else "unavailable"
+                ),
                 "entry": item.get("entry_vwap"),
                 "exit": item.get("exit_vwap"),
                 "size": item.get("max_size"),

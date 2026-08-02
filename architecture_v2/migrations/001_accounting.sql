@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS v2_lifecycles (
     direction TEXT NOT NULL,
     opened_at TEXT NOT NULL,
     closed_at TEXT,
+    holding_duration_ms INTEGER,
+    holding_duration_basis TEXT NOT NULL DEFAULT 'unavailable',
     status TEXT NOT NULL,
     entry_vwap TEXT NOT NULL,
     exit_vwap TEXT,

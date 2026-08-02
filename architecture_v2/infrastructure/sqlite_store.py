@@ -23,7 +23,7 @@ from architecture_v2.domain.models import (
 )
 
 
-MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "001_accounting.sql"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 DEFAULT_PORTFOLIO_ID = "all"
 
 
@@ -87,9 +87,25 @@ class SqliteV2Store:
         return con
 
     def init(self) -> None:
-        script = MIGRATION.read_text(encoding="utf-8")
         with self.connect() as con:
-            con.executescript(script)
+            first = MIGRATIONS_DIR / "001_accounting.sql"
+            con.executescript(first.read_text(encoding="utf-8"))
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(v2_lifecycles)")}
+            if "holding_duration_ms" not in columns:
+                con.execute("ALTER TABLE v2_lifecycles ADD COLUMN holding_duration_ms INTEGER")
+            if "holding_duration_basis" not in columns:
+                con.execute("ALTER TABLE v2_lifecycles ADD COLUMN holding_duration_basis TEXT NOT NULL DEFAULT 'unavailable'")
+            con.execute(
+                """UPDATE v2_lifecycles SET holding_duration_ms =
+                   CAST(MAX(0, (julianday(closed_at)-julianday(opened_at))*86400000) AS INTEGER),
+                   holding_duration_basis = 'exact'
+                   WHERE closed_at IS NOT NULL AND holding_duration_ms IS NULL"""
+            )
+            con.executescript((MIGRATIONS_DIR / "002_holding_time.sql").read_text(encoding="utf-8"))
+            con.execute(
+                "INSERT INTO v2_schema_meta(key, value) VALUES('holding_time_schema', '2') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
             now = _now()
             con.execute(
                 """
@@ -244,11 +260,12 @@ class SqliteV2Store:
                 INSERT INTO v2_lifecycles(
                     lifecycle_uid, account_id, position_key, market_key,
                     position_side, direction, opened_at, closed_at, status,
+                    holding_duration_ms, holding_duration_basis,
                     entry_vwap, exit_vwap, max_quantity, closed_quantity,
                     gross_pnl, fees, funding, realized_pnl,
                     execution_uids_json, realization_uids_json,
                     accounting_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.lifecycle_uid,
@@ -260,6 +277,8 @@ class SqliteV2Store:
                     item.opened_at.isoformat(),
                     item.closed_at.isoformat() if item.closed_at else None,
                     item.status.value,
+                    item.holding_duration_ms,
+                    item.holding_duration_basis,
                     str(item.entry_vwap),
                     str(item.exit_vwap) if item.exit_vwap is not None else None,
                     str(item.max_quantity),
@@ -415,6 +434,8 @@ class SqliteV2Store:
                     direction=PositionDirection(row["direction"]),
                     opened_at=_time(row["opened_at"]),  # type: ignore[arg-type]
                     closed_at=_time(row["closed_at"]),
+                    holding_duration_ms=row["holding_duration_ms"],
+                    holding_duration_basis=row["holding_duration_basis"] or "unavailable",
                     status=LifecycleStatus(row["status"]),
                     entry_vwap=Decimal(row["entry_vwap"]),
                     exit_vwap=(

@@ -245,6 +245,9 @@ def reconstruct_record(
         "position_side": fill.position_side,
         "native_trade_id": fill.native_trade_id or str(fill.trade_id),
         "event_uid": fill.event_uid(),
+        "lifecycle_opened_at": None,
+        "holding_duration_ms": None,
+        "holding_duration_basis": "unavailable",
     }
 
 
