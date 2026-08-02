@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .lifecycles import reconstruct_lifecycles
+from .marks import PublicMarkProvider
 from .store import CommandStore, fingerprint, iso, parse_time
 
 
@@ -51,6 +52,9 @@ def _read_rows(path: Path, sql: str) -> list[sqlite3.Row]:
         con.close()
 
 
+LIVE_POSITION_MAX_AGE_SECONDS = 180
+
+
 def _pool_names(config_path: Path) -> dict[str, dict[str, str]]:
     if not config_path.exists():
         return {}
@@ -78,6 +82,7 @@ class WorkspaceIngestor:
         self.lighter = workspace / "lighter-trade-bot"
         self.speculation = workspace / "speculation-alert-bot"
         self.hack = workspace / "hack-alert-bot"
+        self.public_marks = PublicMarkProvider()
 
     def sync(self) -> dict[str, int]:
         run_id = self.store.start_sync()
@@ -281,7 +286,13 @@ class WorkspaceIngestor:
         return self.store.replace_trade_lifecycles(lifecycles)
 
     def _positions(self) -> int:
-        """Reconstruct current positions from the last event for each market."""
+        """Reconstruct positions, then merge the dashboard's live marks.
+
+        Fill events remain the source of lifecycle history.  The dashboard's
+        exchange reconciler publishes a short-lived local snapshot containing
+        current size, entry, and exchange-reported unrealized PnL; merging it
+        here prevents historical event rows from being mistaken for live marks.
+        """
         rows = _read_rows(
             self.lighter / "data" / "events.db",
             "SELECT id, ts, payload FROM events ORDER BY id",
@@ -305,15 +316,22 @@ class WorkspaceIngestor:
             )
             if not symbol:
                 continue
-            key = f"{source}:{symbol}"
+            key_prefix = f"{source}:{symbol}"
             if not after or _float(after.get("size")) in (None, 0):
-                latest.pop(key, None)
+                for key in list(latest):
+                    if key == key_prefix or key.startswith(f"{key_prefix}:"):
+                        latest.pop(key, None)
                 continue
+            side = str(after.get("side") or "unknown").lower()
+            for key in list(latest):
+                if key == key_prefix or key.startswith(f"{key_prefix}:"):
+                    latest.pop(key, None)
+            key = f"{key_prefix}:{side}"
             latest[key] = {
                 "position_key": key,
                 "source": source,
                 "symbol": symbol,
-                "side": str(after.get("side") or "unknown").lower(),
+                "side": side,
                 "size": abs(float(after["size"])),
                 "entry": _float(after.get("avg_entry_price")),
                 "unrealized_pnl": _float(after.get("unrealized_pnl")),
@@ -321,7 +339,91 @@ class WorkspaceIngestor:
                 "updated_at": iso(parse_time(row["ts"])),
                 "metadata": {"event_id": row["id"], "event_kind": payload.get("kind")},
             }
+
+        for key, live in self._read_live_positions().items():
+            current = latest.get(key)
+            if current is None:
+                latest[key] = live
+                continue
+            current.update(
+                {
+                    "size": live["size"],
+                    "entry": live.get("entry"),
+                    "unrealized_pnl": live.get("unrealized_pnl"),
+                    "liquidation_price": live.get("liquidation_price"),
+                    "updated_at": live["updated_at"],
+                }
+            )
+            current["metadata"].update(live.get("metadata") or {})
+
+        mark_rows = [
+            row for row in latest.values()
+            if row.get("unrealized_pnl") is None
+        ]
+        for key, mark in self.public_marks.fetch(mark_rows).items():
+            row = latest.get(key)
+            if row is None:
+                continue
+            entry = _float(row.get("entry"))
+            size = _float(row.get("size"))
+            if entry is None or size in (None, 0):
+                continue
+            direction = 1 if str(row.get("side") or "").lower() == "long" else -1
+            row["unrealized_pnl"] = (mark.price - entry) * size * direction
+            row["metadata"].update(
+                {
+                    "mark_price": mark.price,
+                    "mark_source": mark.source,
+                    "mark_captured_at": mark.captured_at,
+                    "pnl_basis": "public_futures_mark",
+                }
+            )
         return self.store.replace_positions(latest.values())
+
+    def _read_live_positions(self) -> dict[str, dict[str, Any]]:
+        """Read a fresh local exchange snapshot published by the dashboard."""
+        path = self.lighter / "data" / "live_positions.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            captured_at = parse_time(payload["captured_at"])
+            age = (datetime.now(timezone.utc) - captured_at).total_seconds()
+            if age > LIVE_POSITION_MAX_AGE_SECONDS:
+                return {}
+            if age < -30:
+                return {}
+            rows = payload.get("positions") or []
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or "unknown")
+            symbol = str(row.get("symbol") or "")
+            side = str(row.get("side") or "unknown").lower()
+            size = _float(row.get("size"))
+            if not symbol or size in (None, 0):
+                continue
+            key = f"{source}:{symbol}:{side}"
+            result[key] = {
+                "position_key": key,
+                "source": source,
+                "symbol": symbol,
+                "side": side,
+                "size": abs(size),
+                "entry": _float(row.get("entry")),
+                "unrealized_pnl": _float(row.get("unrealized_pnl")),
+                "liquidation_price": _float(row.get("liquidation_price")),
+                "updated_at": str(row.get("updated_at") or payload["captured_at"]),
+                "metadata": {
+                    "mark_source": "dashboard_exchange_snapshot",
+                    "mark_captured_at": payload["captured_at"],
+                },
+            }
+        return result
 
     def _market_outcomes(self) -> int:
         db = self.speculation / "data" / "candles.db"

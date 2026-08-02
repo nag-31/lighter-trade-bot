@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -837,3 +838,59 @@ def test_positions_expose_current_mark_and_usd_value_without_changing_accounting
     listed = store.list_positions()[0]
     assert listed["current_price"] == pytest.approx(110)
     assert listed["position_value"] == pytest.approx(220)
+
+
+def test_journal_positions_merge_fresh_exchange_marks_from_dashboard_snapshot(
+    tmp_path: Path,
+) -> None:
+    from command_center.ingest import WorkspaceIngestor
+
+    workspace = tmp_path / "workspace"
+    events_path = workspace / "lighter-trade-bot" / "data" / "events.db"
+    events_path.parent.mkdir(parents=True)
+    with sqlite3.connect(events_path) as con:
+        con.execute("CREATE TABLE events (id INTEGER, ts TEXT, payload TEXT)")
+        timestamp = iso()
+        con.execute(
+            "INSERT INTO events VALUES (?, ?, ?)",
+            (
+                1,
+                timestamp,
+                json.dumps(
+                    {
+                        "kind": "OPEN",
+                        "trade": {"source": "HL", "market_symbol": "BTC"},
+                        "position_after": {
+                            "source": "HL", "market_symbol": "BTC",
+                            "side": "long", "size": "1", "avg_entry_price": "100",
+                        },
+                    }
+                ),
+            ),
+        )
+
+    (events_path.parent / "live_positions.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "captured_at": timestamp,
+                "positions": [
+                    {
+                        "source": "HL", "symbol": "BTC", "side": "long",
+                        "size": "1", "entry": "100", "unrealized_pnl": "10",
+                        "updated_at": timestamp,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = CommandStore(tmp_path / "command.db")
+    store.init()
+    ingestor = WorkspaceIngestor(store, workspace)
+    assert ingestor._positions() == 1
+    listed = store.list_positions()[0]
+    assert listed["unrealized_pnl"] == pytest.approx(10)
+    assert listed["current_price"] == pytest.approx(110)
+    assert listed["position_value"] == pytest.approx(110)

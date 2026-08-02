@@ -113,6 +113,7 @@ def _plain_telegram_text(text: str) -> str:
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 DB_PATH = DATA_DIR / "events.db"
+LIVE_POSITIONS_PATH = DATA_DIR / "live_positions.json"
 PIDFILE = Path(os.environ.get("LIGHTERBOT_PIDFILE") or (
     DATA_DIR / "lighterbot.pid" if os.name == "nt" else "/tmp/lighterbot.pid"
 ))
@@ -148,6 +149,64 @@ class _SecretRedactionFilter(logging.Filter):
 def _safe_telegram_error(exc: BaseException) -> str:
     """Describe a Telegram failure without rendering token-bearing request URLs."""
     return f"{type(exc).__name__}: Telegram request failed"
+
+
+def _write_live_position_snapshot(
+    sources: list[Source],
+    positions_by_source: dict[str, dict[int, Position]],
+) -> None:
+    """Publish raw exchange position marks for local Journal consumers.
+
+    The public dashboard applies privacy transforms before sending positions to
+    browsers.  The Journal needs the untransformed exchange basis, so it reads
+    this local, atomically-written snapshot instead of coupling to the public
+    websocket payload.  Missing exchange uPnL remains explicit as ``null``.
+    """
+    captured_at = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        for position in positions_by_source.get(source.id, {}).values():
+            if not position.size:
+                continue
+            rows.append(
+                {
+                    "source": source.name,
+                    "source_id": source.id,
+                    "market_id": position.market_id,
+                    "symbol": position.market_symbol,
+                    "side": position.side,
+                    "size": str(position.size),
+                    "entry": str(position.avg_entry_price),
+                    "unrealized_pnl": (
+                        str(position.unrealized_pnl)
+                        if position.unrealized_pnl is not None else None
+                    ),
+                    "liquidation_price": (
+                        str(position.liquidation_px)
+                        if position.liquidation_px is not None else None
+                    ),
+                    "updated_at": captured_at,
+                }
+            )
+    payload = {"version": 1, "captured_at": captured_at, "positions": rows}
+    temporary = LIVE_POSITIONS_PATH.with_name(
+        f"{LIVE_POSITIONS_PATH.name}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+        )
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, LIVE_POSITIONS_PATH)
+    except OSError:
+        log.warning("could not publish local live position snapshot", exc_info=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _telegram_retry_after(body: Any) -> float | None:
@@ -1778,6 +1837,7 @@ async def _run() -> None:
     # Kept separate from src.tracker (fill-based classifier) so the reconciler
     # doesn't corrupt event classification when it seeds positions before fills arrive.
     _dash_positions: dict[str, dict[int, Position]] = {}
+    _write_live_position_snapshot(sources, _dash_positions)
 
     # Positions for which the reconciler sent an OPEN alert before the fill arrived.
     # The fill-based OPEN/SIZE_CHANGE handler skips alerting for these keys so the
@@ -1849,6 +1909,7 @@ async def _run() -> None:
             init_pos = {mid: p for mid, p in init_pos.items() if not s.is_excluded(p.market_symbol)}
             s.tracker.seed(init_pos)
             _dash_positions[s.id] = init_pos
+            _write_live_position_snapshot(sources, _dash_positions)
             log.info("[%s] seeded with %d positions", s.name, len(init_pos))
             # Restore fill deduplication across restarts. This prevents a REST
             # replay from turning an old fill into a fresh Telegram alert.
@@ -1925,6 +1986,7 @@ async def _run() -> None:
         }
         src.tracker.seed(init_pos)
         _dash_positions[src.id] = init_pos
+        _write_live_position_snapshot(sources, _dash_positions)
         health.mark_up(f"source:{src.id}", detail=src.name)
         await hub.broadcast(snapshot_payload("snapshot"))
 
@@ -3120,6 +3182,7 @@ async def _run() -> None:
                 position_result = await runtimes[src.id].fetch_positions()
                 if not position_result.authoritative:
                     _dash_positions[src.id] = position_result.value
+                    _write_live_position_snapshot(sources, _dash_positions)
                     runtime = runtimes[src.id]
                     stale_from = runtime.last_success_at or runtime.created_at
                     stale_age = (
@@ -3470,6 +3533,7 @@ async def _run() -> None:
 
                 # ── 6. Advance dashboard snapshot ────────────────────────────────────
                 _dash_positions[src.id] = actual
+                _write_live_position_snapshot(sources, _dash_positions)
                 health.mark_up(
                     f"source:{src.id}",
                     detail=src.name,
@@ -4935,6 +4999,7 @@ async def _run() -> None:
         by_id.pop(src.id, None)
         runtimes.pop(src.id, None)
         _dash_positions.pop(src.id, None)
+        _write_live_position_snapshot(sources, _dash_positions)
         _open_orders.pop(src.id, None)
         for suffix in ("", ":ws", ":rest", ":positions"):
             health.remove(f"source:{src.id}{suffix}")
