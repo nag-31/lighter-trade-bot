@@ -35,6 +35,18 @@ Precise handoff log for agents working on Crypto Scientist.
 
 ## Change log
 
+### 2026-08-03 - source rename and NK pool removal deployed
+
+- Deployed the tracked `config.yaml` from commit `f030f04` to the GCP VM.
+- Renamed `hl-main` to `HL Swing Wallet` without changing its stable ID.
+- Removed the `lighter-main` / `My NK pool` source from the active config; its
+  existing database history was not deleted.
+- Backup: `/home/ADMIN/backups/config-rename-20260803T182348Z`.
+- Restarted `lighterbot.service`, `command-center.service`,
+  `trade-journal.service`, and `apps-hub.service`; all are active.
+- Post-restart health checks: dashboard, Command Center, Journal, and Hub all
+  returned HTTP 200.
+
 ### 2026-08-02 - chart integration implemented
 
 - Added `src/execution_chart.py`, a read-only legacy-to-V2 chart adapter.
