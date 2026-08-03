@@ -146,11 +146,6 @@ settings:
 
 sources:
   - type: lighter
-    id: lighter-main
-    name: "My NK pool"
-    pool_id: 281474976684763
-
-  - type: lighter
     id: lighter-wallet
     name: "Lighter Wallet"
     address_env: LIGHTER_ADDRESS
