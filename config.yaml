@@ -158,7 +158,7 @@ sources:
 
   - type: hyperliquid
     id: hl-main
-    name: "HL"
+    name: "HL Swing Wallet"
     address_env: HL_ADDRESS
     min_notional_usd: 1000
     exclude_symbols: ["FARTCOIN"]
