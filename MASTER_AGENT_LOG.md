@@ -2,19 +2,35 @@
 
 Precise handoff log for agents working on Crypto Scientist.
 
-## Current status - 2026-08-02
+## Current status - 2026-08-04
 
 - Chart integration and V2 source are deployed on the VM at commit
   `2bf745a6b23a52f4357e7ee8c07dc5c335767c8b`.
 - Four production services were restarted and verified healthy:
   `lighterbot.service`, `command-center.service`, `apps-hub.service`, and
   `trade-journal.service`.
-- V2 tests on the VM: 54 passed.
-- Local full repository suite: 968 passed, with 294 pre-existing aiohttp
-  warnings.
+- Prior inert VM V2 source verification: 54 passed.
+- Latest local V2 suite: 64 passed; full repository suite: 1001 passed, with 294 pre-existing aiohttp warnings.
 - Full-close PnL cards now send a Telegram album containing the PnL card and an
   execution-only BUY/SELL chart.
-- No database migrations or V2 consumer cutovers have been performed.
+- Production remains on the prior inert V2 source; no database migrations, V2 alert activation, or consumer cutovers have been performed.
+
+## Architecture V2 boundary - 2026-08-04
+
+- Implemented the isolated V2 account/catalog boundary in commits `b27eed0` through `57739f7`.
+- Added immutable per-account ledger storage, central account state/label history,
+  the fixed `2026-06-01T00:00:00Z` report cutoff, LIVE/BACKFILL/REPAIR/SHADOW
+  run policy, deterministic projection hashes, persisted shadow comparisons,
+  rollout gates, and read-only Dashboard/Journal adapters.
+- Initialized local `data/catalog.db` from the existing account-ledger metadata.
+  It records `HL` -> `HL Swing Wallet` label history and keeps `My NK pool`
+  ingestion/alerts/portfolio disabled while retaining historical visibility.
+- Catalog integrity check: `ok`; four account records and five label-history rows.
+- Raw account ledgers, events, Journal, portfolio, and runtime snapshots were not
+  rewritten. No production migration, deploy, alert activation, or consumer cutover
+  occurred.
+- Verification: V2 **64 passed**; repository **1001 passed** with 294 existing
+  aiohttp `NotAppKeyWarning` warnings.
 
 ## Deployment evidence
 
@@ -63,3 +79,9 @@ Precise handoff log for agents working on Crypto Scientist.
 - Restarted all four application services.
 - All four health endpoints returned HTTP 200.
 - Database migrations: none; post-deployment integrity: `ok` for all three DBs.
+
+### 2026-08-04 - review handoff added
+
+- Added `AGENT_CODE_REVIEW_INSTRUCTIONS.md`.
+- The file explains the system, recent chart work, review questions, test
+  commands, safety boundaries, and the required bug-report format.
