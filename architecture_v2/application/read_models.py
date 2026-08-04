@@ -91,6 +91,9 @@ def read_journal(
     account_ids: set[str] | frozenset[str] | None = None,
 ) -> JournalReadModel:
     """Build Journal lifecycle links using immutable Tracker UIDs."""
+    source = catalog or store.catalog
+    visible = {item.account_id for item in source.list_accounts(historical_visible=True)}
+    selected = visible if account_ids is None else visible.intersection(account_ids)
     lifecycles = tuple(
         JournalLifecycleReadModel(
             lifecycle_uid=item.lifecycle_uid,
@@ -105,9 +108,9 @@ def read_journal(
             execution_uids=item.execution_uids,
             realization_uids=item.realization_uids,
         )
-        for item in store.list_lifecycles(account_ids=account_ids)
+        for item in store.list_lifecycles(account_ids=selected)
     )
     return JournalReadModel(
         lifecycles=lifecycles,
-        realizations=tuple(store.list_realizations(account_ids=account_ids)),
+        realizations=tuple(store.list_realizations(account_ids=selected)),
     )
