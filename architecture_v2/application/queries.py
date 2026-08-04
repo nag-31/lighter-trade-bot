@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from architecture_v2.application.portfolio import project_portfolio
+from architecture_v2.domain.policy import ProjectionWindow
 from architecture_v2.domain.reports import (
     AccountingPeriodReport,
     build_period_report,
@@ -23,7 +24,13 @@ class AccountingQueryService:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         timezone: str = "UTC",
+        window: ProjectionWindow | None = None,
     ) -> AccountingPeriodReport:
+        selected_window = window or ProjectionWindow(
+            report_start=start_at or ProjectionWindow.default().report_start,
+            report_end=end_at,
+            timezone=timezone,
+        )
         account_ids = self.store.list_included_accounts(portfolio_id)
         executions = self.store.list_executions(account_ids=account_ids)
         portfolio = project_portfolio(
@@ -32,7 +39,7 @@ class AccountingQueryService:
         )
         return build_period_report(
             portfolio,
-            start_at=start_at,
-            end_at=end_at,
-            timezone=timezone,
+            start_at=selected_window.report_start,
+            end_at=selected_window.report_end,
+            timezone=selected_window.timezone,
         )

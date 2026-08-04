@@ -1,8 +1,8 @@
 # Architecture V2 Implementation Status
 
-Status: foundation and an opt-in Journal read consumer are implemented,
-regression-tested, and remain reversible; no production import, migration, or
-default consumer cutover
+Status: foundation, account/catalog boundaries, immutable per-account ledgers,
+run evidence, and read-only Dashboard/Journal adapters are implemented and
+regression-tested; no production import, migration, or default consumer cutover
 
 Last updated: 2026-08-04
 
@@ -21,7 +21,7 @@ flowchart LR
     ST --> AP["One-account projector"]
     AP --> RL["Realizations<br/>fill-time PnL"]
     AP --> LC["Lifecycles<br/>close-time outcomes"]
-    AP --> CP["Checkpoint + outbox"]
+    AP --> CP["Checkpoint + run evidence + outbox"]
     RL --> PH["Portfolio composition"]
     LC --> PH
     PH --> RP["AccountingPeriodReport"]
@@ -47,13 +47,18 @@ recalculate PnL.
 | `application/portfolio.py` | account projection composition only |
 | `domain/reports.py` | common period report with separate accounting bases |
 | `migrations/001_accounting.sql` | additive, namespaced V2 schema |
-| `infrastructure/sqlite_store.py` | atomic ingestion, rebuild, membership, checkpoint, and outbox repository |
+| `infrastructure/sqlite_store.py` | atomic ingestion, rebuild, membership, cutoff/run manifest, shadow evidence, and outbox repository |
+| `infrastructure/catalog_store.py` | central identity, independent account state, label history, and portfolio membership |
+| `infrastructure/account_ledger_store.py` | one append-only exchange-fact SQLite ledger per account |
+| `infrastructure/verification.py` | non-destructive SQLite backup, restore, hash, and integrity evidence |
 | `application/queries.py` | one portfolio period-query handler |
 | `adapters/runtime_trade.py` | current runtime shape to immutable execution boundary |
 | `domain/charts.py` | shared chart DTO, interval selection, and marker batching |
 | `tracker/static_chart.py` | deterministic static chart renderer |
 | `trade_journal/v2_consumer.py` | read-only lifecycle-to-V2 chart adapter for the opt-in Journal view |
 | `application/evaluations.py` | projection invariants and read-only shadow metric differences |
+| `application/read_models.py` | immutable Dashboard and Journal read-only snapshots |
+| `domain/policy.py` / `domain/projections.py` | cutoff, run-mode, account-state, lifecycle policy, and deterministic hash contracts |
 
 ## Accounting guarantees covered by tests
 
@@ -86,7 +91,7 @@ Run only V2:
   --basetemp data\pytest-tmp\v2
 ```
 
-Result on 2026-07-30: **54 passed**.
+Result on 2026-08-04: **59 passed** (including the architecture-boundary and evidence tests).
 
 Run the repository:
 
@@ -95,7 +100,7 @@ Run the repository:
   --basetemp data\pytest-tmp\full-v2
 ```
 
-Result on 2026-07-30: **967 passed**, with 294 pre-existing aiohttp
+Result on 2026-08-04: **996 passed**, with 294 pre-existing aiohttp
 `NotAppKeyWarning` warnings from portfolio-app tests.
 
 ## VM source deployment
@@ -138,15 +143,17 @@ rollback scope are in
 - no chart artifact cache or Telegram media-group outbox extension;
 - no service or consumer activation of V2.
 
-The following architecture contracts are now specified but remain intentionally
-unimplemented until the next approved engineering slice:
+The architecture contracts are now implemented in the isolated V2 boundary:
 
-- central account catalog with account-state flags and display-label history;
-- separate `context_start` versus `report_start` cutoff metadata;
-- explicit LIVE/BACKFILL/REPAIR/SHADOW run mode and alert policy;
-- persisted deterministic shadow-comparison evidence and projection hashes;
-- versioned lifecycle-feature projections for holding-time analytics;
-- restore-tested migration and rollback evidence bundles.
+- `CatalogStore` owns independent ingestion, alert, portfolio, and historical visibility flags plus label history;
+- `AccountLedgerStore` keeps one append-only exchange-fact SQLite file per account;
+- `ProjectionWindow` separates context reconstruction from the fixed `2026-06-01T00:00:00Z` report boundary;
+- `RunMode` prevents BACKFILL/REPAIR/SHADOW runs from creating integration or notification events;
+- run manifests persist input/projection hashes, boundaries, row counts, and alert counts;
+- classified shadow comparisons are persisted and queryable by run;
+- backup/restore helpers verify SQLite integrity and hashes before rollback evidence is accepted.
+
+Lifecycle holding time is persisted for closed lifecycles and exposed through the Journal read model. Additional MFE/MAE and time-series feature columns remain a future projection version and do not alter the immutable ledger.
 
 ## Exchange-basis and cutoff hardening
 
@@ -192,7 +199,7 @@ calculate the canonical all-account view for Telegram commands.
 
 ## Next safe slice
 
-1. Create anonymized immutable fixtures from the backed-up production snapshot.
+1. Create anonymized immutable fixtures from the backed-up production snapshot and run the persisted shadow comparison.
 2. Add source-specific normalization adapters without changing exchange clients.
 3. Run old/V2 comparisons by account, symbol, day, and lifecycle; persist
    evidence with snapshot hash and accounting version.

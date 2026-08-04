@@ -11,6 +11,14 @@ from typing import Iterable
 from architecture_v2 import ACCOUNTING_VERSION
 from architecture_v2.domain.accounting import project_account
 from architecture_v2.domain.identity import require_identity, stable_uid
+from architecture_v2.domain.policy import (
+    ProjectionRunManifest,
+    ProjectionRunPolicy,
+    ProjectionWindow,
+    RunMode,
+)
+from architecture_v2.domain.projections import execution_snapshot_hash, projection_hash
+from architecture_v2.infrastructure.catalog_store import CatalogStore
 from architecture_v2.domain.models import (
     AccountProjection,
     Execution,
@@ -72,11 +80,16 @@ class SqliteV2Store:
             "v2_lifecycles",
             "v2_projection_checkpoints",
             "v2_integration_outbox",
+            "v2_projection_runs",
+            "v2_shadow_comparisons",
         }
     )
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, catalog_path: str | Path | None = None):
         self.path = Path(path)
+        self.catalog = CatalogStore(
+            catalog_path or self.path.with_name(f"{self.path.stem}.catalog.db")
+        )
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +100,7 @@ class SqliteV2Store:
         return con
 
     def init(self) -> None:
+        self.catalog.init()
         with self.connect() as con:
             first = MIGRATIONS_DIR / "001_accounting.sql"
             con.executescript(first.read_text(encoding="utf-8"))
@@ -102,6 +116,7 @@ class SqliteV2Store:
                    WHERE closed_at IS NOT NULL AND holding_duration_ms IS NULL"""
             )
             con.executescript((MIGRATIONS_DIR / "002_holding_time.sql").read_text(encoding="utf-8"))
+            con.executescript((MIGRATIONS_DIR / "003_run_evidence.sql").read_text(encoding="utf-8"))
             con.execute(
                 "INSERT INTO v2_schema_meta(key, value) VALUES('holding_time_schema', '2') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
@@ -293,8 +308,33 @@ class SqliteV2Store:
                 ),
             )
 
-    def ingest_execution(self, execution: Execution) -> bool:
-        """Atomically append one execution, rebuild its account, and enqueue feed."""
+    def ingest_execution(
+        self,
+        execution: Execution,
+        *,
+        run_policy: ProjectionRunPolicy | None = None,
+        window: ProjectionWindow | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        """Append one execution, rebuild its account, and record run evidence.
+
+        ``BACKFILL``, ``REPAIR``, and ``SHADOW`` still update the isolated V2
+        projection, but they cannot create integration/notification events.
+        """
+        policy = run_policy or ProjectionRunPolicy()
+        projection_window = window or ProjectionWindow.default()
+        catalog_account = self.catalog.get_account(execution.account_id)
+        if catalog_account is None:
+            self.catalog.register_account(
+                execution.account_id,
+                exchange=execution.exchange,
+                label=execution.account_id,
+            )
+            catalog_account = self.catalog.get_account(execution.account_id)
+        if catalog_account is not None and not catalog_account.state.ingestion_enabled:
+            raise ValueError(f"ingestion disabled for account: {execution.account_id}")
+        if catalog_account is not None and not catalog_account.state.alerts_enabled:
+            policy = ProjectionRunPolicy(mode=policy.mode, alerts_enabled=False)
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             self._ensure_account(con, execution)
@@ -319,6 +359,12 @@ class SqliteV2Store:
             self._replace_projection(con, projection)
             last = projection.executions[-1]
             now = _now()
+            input_hash = execution_snapshot_hash(account_executions)
+            output_hash = projection_hash(projection)
+            evidence_run_id = run_id or stable_uid(
+                "projection_run", execution.account_id, execution.execution_uid,
+                policy.mode.value, input_hash, output_hash,
+            )
             con.execute(
                 """
                 INSERT INTO v2_projection_checkpoints(
@@ -339,31 +385,145 @@ class SqliteV2Store:
                     now,
                 ),
             )
-            event_uid = stable_uid(
-                "projection_event",
-                execution.execution_uid,
-                ACCOUNTING_VERSION,
+            if policy.alerts_allowed:
+                event_uid = stable_uid(
+                    "projection_event",
+                    execution.execution_uid,
+                    ACCOUNTING_VERSION,
+                )
+                payload = json.dumps(
+                    {
+                        "account_id": execution.account_id,
+                        "execution_uid": execution.execution_uid,
+                        "accounting_version": ACCOUNTING_VERSION,
+                        "last_execution_uid": last.execution_uid,
+                        "run_id": evidence_run_id,
+                        "mode": policy.mode.value,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                con.execute(
+                    """
+                    INSERT INTO v2_integration_outbox(
+                        event_uid, topic, payload_json, created_at
+                    ) VALUES (?, 'account_projection_updated', ?, ?)
+                    """,
+                    (event_uid, payload, now),
+                )
+            manifest = ProjectionRunManifest(
+                run_id=evidence_run_id,
+                mode=policy.mode,
+                accounting_version=ACCOUNTING_VERSION,
+                input_snapshot_hash=input_hash,
+                projection_hash=output_hash,
+                window=projection_window,
+                rows_read=len(account_executions),
+                rows_written=len(projection.realizations) + len(projection.lifecycles),
+                alerts_created=1 if policy.alerts_allowed else 0,
             )
-            payload = json.dumps(
-                {
-                    "account_id": execution.account_id,
-                    "execution_uid": execution.execution_uid,
-                    "accounting_version": ACCOUNTING_VERSION,
-                    "last_execution_uid": last.execution_uid,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            metadata = projection_window.as_metadata()
             con.execute(
-                """
-                INSERT INTO v2_integration_outbox(
-                    event_uid, topic, payload_json, created_at
-                ) VALUES (?, 'account_projection_updated', ?, ?)
-                """,
-                (event_uid, payload, now),
+                """INSERT OR REPLACE INTO v2_projection_runs(
+                   run_id, account_id, mode, accounting_version, context_start, report_start,
+                   report_end, as_of, timezone, input_snapshot_hash, projection_hash,
+                   rows_read, rows_written, alerts_created, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    manifest.run_id, execution.account_id, manifest.mode.value, manifest.accounting_version,
+                    metadata["context_start"] or None, metadata["report_start"],
+                    metadata["report_end"] or None, metadata["as_of"] or None,
+                    metadata["timezone"], manifest.input_snapshot_hash,
+                    manifest.projection_hash, manifest.rows_read, manifest.rows_written,
+                    manifest.alerts_created, manifest.status, now,
+                ),
             )
         return True
 
+    def latest_projection_run(self, account_id: str | None = None) -> ProjectionRunManifest | None:
+        """Return the newest persisted run manifest (read-only evidence query)."""
+        with self.connect() as con:
+            if account_id is None:
+                row = con.execute(
+                    "SELECT * FROM v2_projection_runs ORDER BY created_at DESC, run_id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT * FROM v2_projection_runs WHERE account_id=? ORDER BY created_at DESC, run_id DESC LIMIT 1",
+                    (account_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        return ProjectionRunManifest(
+            run_id=row["run_id"], mode=RunMode(row["mode"]),
+            accounting_version=row["accounting_version"],
+            input_snapshot_hash=row["input_snapshot_hash"],
+            projection_hash=row["projection_hash"],
+            window=ProjectionWindow(
+                context_start=_time(row["context_start"]),
+                report_start=_time(row["report_start"]),
+                report_end=_time(row["report_end"]),
+                as_of=_time(row["as_of"]), timezone=row["timezone"],
+            ),
+            rows_read=row["rows_read"], rows_written=row["rows_written"],
+            alerts_created=row["alerts_created"], status=row["status"],
+        )
+
+    def record_shadow_comparisons(
+        self,
+        run_id: str,
+        comparisons,
+        *,
+        account_id: str,
+    ) -> int:
+        """Persist classified legacy/V2 differences without changing consumers."""
+        with self.connect() as con:
+            if not con.execute(
+                "SELECT 1 FROM v2_projection_runs WHERE run_id=?", (run_id,)
+            ).fetchone():
+                raise ValueError(f"unknown projection run: {run_id}")
+            inserted = 0
+            for index, item in enumerate(comparisons):
+                if isinstance(item, dict):
+                    dimension = str(item.get("dimension") or item.get("metric") or "metric")
+                    subject_uid = str(item.get("subject_uid") or item.get("metric") or index)
+                    classification = str(item.get("classification") or "UNEXPLAINED")
+                    legacy_value = item.get("legacy_value")
+                    v2_value = item.get("v2_value")
+                else:
+                    dimension = str(getattr(item, "dimension", getattr(item, "metric", "metric")))
+                    subject_uid = str(getattr(item, "subject_uid", getattr(item, "metric", index)))
+                    classification = str(getattr(item, "classification", "UNEXPLAINED"))
+                    legacy_value = getattr(item, "legacy_value", None)
+                    v2_value = getattr(item, "v2_value", None)
+                if classification not in {
+                    "MATCH", "EXPECTED_IDENTITY_REKEY", "EXPECTED_CUTOFF_POLICY",
+                    "EXPECTED_PNL_BASIS", "UNEXPLAINED",
+                }:
+                    raise ValueError(f"unsupported shadow classification: {classification}")
+                comparison_id = stable_uid("shadow_comparison", run_id, account_id, dimension, subject_uid)
+                cursor = con.execute(
+                    """INSERT OR REPLACE INTO v2_shadow_comparisons(
+                       comparison_id, run_id, account_id, dimension, subject_uid,
+                       classification, legacy_value, v2_value, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        comparison_id, run_id, account_id, dimension, subject_uid,
+                        classification, json.dumps(legacy_value, default=str, sort_keys=True),
+                        json.dumps(v2_value, default=str, sort_keys=True), _now(),
+                    ),
+                )
+                inserted += int(cursor.rowcount == 1)
+        return inserted
+
+    def shadow_summary(self, run_id: str) -> dict[str, int]:
+        with self.connect() as con:
+            rows = con.execute(
+                """SELECT classification, COUNT(*) AS count
+                   FROM v2_shadow_comparisons WHERE run_id=? GROUP BY classification""",
+                (run_id,),
+            ).fetchall()
+        return {row["classification"]: int(row["count"]) for row in rows}
     def list_executions(
         self,
         *,
@@ -502,7 +662,7 @@ class SqliteV2Store:
 
     def list_included_accounts(self, portfolio_id: str) -> set[str]:
         with self.connect() as con:
-            return {
+            ids = {
                 row["account_id"]
                 for row in con.execute(
                     """
@@ -512,6 +672,23 @@ class SqliteV2Store:
                     (portfolio_id,),
                 )
             }
+        if portfolio_id == DEFAULT_PORTFOLIO_ID:
+            return {
+                account_id
+                for account_id in ids
+                if (
+                    (catalog := self.catalog.get_account(account_id)) is None
+                    or catalog.state.portfolio_included
+                )
+            }
+        return ids
+
+    def list_visible_accounts(self) -> tuple[str, ...]:
+        """Return accounts allowed to appear in historical/read-only views."""
+        return tuple(
+            account.account_id
+            for account in self.catalog.list_accounts(historical_visible=True)
+        )
 
     def get_checkpoint(self, account_id: str) -> ProjectionCheckpoint | None:
         with self.connect() as con:
