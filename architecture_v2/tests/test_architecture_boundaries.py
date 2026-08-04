@@ -180,3 +180,11 @@ def test_shadow_comparison_evidence_is_persisted_by_run(tmp_path):
         account_id="hl-main",
     ) == 1
     assert store.shadow_summary(run.run_id) == {"MATCH": 1}
+
+def test_journal_honors_historical_visibility(tmp_path):
+    store = SqliteV2Store(tmp_path / "v2.db")
+    store.init()
+    store.ingest_execution(execution("open"))
+    store.catalog.set_state("hl-main", historical_visible=False)
+    assert read_journal(store).lifecycles == ()
+    assert read_journal(store, account_ids={"hl-main"}).realizations == ()
