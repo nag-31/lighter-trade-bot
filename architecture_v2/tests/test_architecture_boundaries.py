@@ -137,3 +137,20 @@ def test_rollout_gate_requires_shadow_parity_and_restore_evidence(tmp_path):
         consumer_approved=True,
     )
     assert passed.passed
+
+def test_catalog_alert_and_ingestion_controls_are_independent(tmp_path):
+    store = SqliteV2Store(tmp_path / "v2.db")
+    store.init()
+    store.catalog.register_account(
+        "hl-main", exchange="hyperliquid", label="HL",
+        state=AccountState(alerts_enabled=False),
+    )
+    assert store.ingest_execution(execution("silent"))
+    assert store.pending_outbox() == []
+    store.catalog.set_state("hl-main", ingestion_enabled=False)
+    try:
+        store.ingest_execution(execution("blocked"))
+    except ValueError as exc:
+        assert "ingestion disabled" in str(exc)
+    else:
+        raise AssertionError("disabled ingestion must reject new facts")
