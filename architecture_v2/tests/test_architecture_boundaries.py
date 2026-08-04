@@ -154,3 +154,28 @@ def test_catalog_alert_and_ingestion_controls_are_independent(tmp_path):
         assert "ingestion disabled" in str(exc)
     else:
         raise AssertionError("disabled ingestion must reject new facts")
+
+def test_report_cutoff_excludes_pre_cutoff_close_but_keeps_context(tmp_path):
+    store = SqliteV2Store(tmp_path / "v2.db")
+    store.init()
+    store.ingest_execution(execution("old-open", at=datetime(2026, 5, 30, tzinfo=UTC)))
+    store.ingest_execution(execution("old-close", at=datetime(2026, 5, 31, tzinfo=UTC), side=ExecutionSide.SELL))
+    store.ingest_execution(execution("boundary-open", at=datetime(2026, 5, 31, 23, tzinfo=UTC)))
+    store.ingest_execution(execution("boundary-close", at=datetime(2026, 6, 2, tzinfo=UTC), side=ExecutionSide.SELL))
+    report = AccountingQueryService(store).period("all")
+    assert report.realized_pnl == Decimal("10")
+    assert report.trades_closed == 1
+
+
+def test_shadow_comparison_evidence_is_persisted_by_run(tmp_path):
+    store = SqliteV2Store(tmp_path / "v2.db")
+    store.init()
+    store.ingest_execution(execution("1"), run_policy=ProjectionRunPolicy(mode=RunMode.SHADOW))
+    run = store.latest_projection_run("hl-main")
+    assert run is not None
+    assert store.record_shadow_comparisons(
+        run.run_id,
+        [{"dimension": "realized_pnl", "subject_uid": "day:2026-07-01", "classification": "MATCH", "legacy_value": "0", "v2_value": "0"}],
+        account_id="hl-main",
+    ) == 1
+    assert store.shadow_summary(run.run_id) == {"MATCH": 1}
