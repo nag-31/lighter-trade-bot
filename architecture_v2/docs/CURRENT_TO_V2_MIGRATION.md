@@ -1,10 +1,36 @@
 # Current-to-V2 Migration Map
 
-Status: migration design with first isolated implementation slice complete
+Status: migration design with first isolated implementation slice complete;
+architecture decisions ratified 2026-08-04
+
+The authoritative account, label, cutoff, run-mode, lifecycle-feature, and
+rollback contracts are in
+[`ARCHITECTURE_DECISIONS_2026-08-04.md`](ARCHITECTURE_DECISIONS_2026-08-04.md).
 
 The redesign is not a full rewrite. It is a staged replacement of the
 accounting path while preserving working ingestion, supervision, delivery, and
 presentation code.
+
+The migration target is one immutable ledger per account plus a central catalog.
+The catalog is the only cross-account discovery and membership boundary; it does
+not duplicate the account fill ledger.
+
+## 0. Architecture gates before integration
+
+The following are prerequisites, not optional polish:
+
+1. Account state must distinguish ingestion, alerts, portfolio membership, and
+   historical visibility.
+2. Display-label changes must resolve through valid-time label history and must
+   never create a new account identity.
+3. Every report must carry `context_start`, `report_start`, `report_end`,
+   `as_of`, timezone, accounting version, and incomplete-account metadata.
+4. Every projection run must declare LIVE, BACKFILL, REPAIR, or SHADOW mode;
+   only LIVE can create alert-outbox rows.
+5. Shadow results must be persisted with snapshot hash, projection hash,
+   comparison dimensions, tolerances, and classified differences.
+6. Restore, integrity, parity, and rollback evidence must exist before a
+   consumer flag changes.
 
 ## 1. What changes and what stays
 
@@ -199,10 +225,18 @@ V2_SHADOW_WRITES=true
 V2_ACCOUNTING_READS=false
 V2_JOURNAL_FEED=false
 V2_COMPARE_REPORTS=true
+V2_RUN_MODE=SHADOW
+V2_CONTEXT_START=<earliest reconstruction boundary>
+V2_REPORT_START=2026-06-01T00:00:00Z
+V2_REPORT_END=<exclusive optional boundary>
+V2_ALERTS_ENABLED=false
 ```
 
 Flags are changed one capability at a time. A single master “rewrite on/off”
 flag is avoided because it makes rollback and diagnosis too coarse.
+
+`V2_ALERTS_ENABLED` cannot override a non-LIVE run mode. The effective policy
+is `alerts_allowed = (run_mode == LIVE) AND V2_ALERTS_ENABLED`.
 
 ## 7. What must not happen
 

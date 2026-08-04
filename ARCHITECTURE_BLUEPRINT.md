@@ -1,5 +1,13 @@
 # Crypto Scientist Architecture Blueprint
 
+> **Architecture decision update (2026-08-04):** The account-boundary and
+> rollout rules in
+> [`architecture_v2/docs/ARCHITECTURE_DECISIONS_2026-08-04.md`](architecture_v2/docs/ARCHITECTURE_DECISIONS_2026-08-04.md)
+> are authoritative where this older blueprint conflicts with the per-account
+> immutable-ledger direction. Account databases are physically partitioned with
+> a central catalog, and source removal is distinct from historical visibility,
+> portfolio membership, ingestion, and alerts.
+
 Status: approved design; isolated phases 1 and the initial phase 2 foundation
 are implemented and tested locally. No production cutover is active.
 
@@ -201,7 +209,24 @@ AccountingPeriodReport
 This report prevents each consumer from inventing its own filtering and
 grouping order.
 
-### 4.3 Mandatory invariants
+### 4.3 Holding time and lifecycle analytics
+
+Holding time belongs to a lifecycle projection, not to an individual fill.
+Closed/reversed lifecycles persist integer `holding_duration_ms` with an
+explicit exactness basis; open lifecycles retain a NULL stored duration and
+derive elapsed time at query time. Scale-ins and partial exits never reset the
+clock. Derived features such as time-to-first-reduce, MFE/MAE, and PnL per hour
+belong in a versioned lifecycle-feature projection with completeness metadata.
+
+### 4.4 Cutoff and replay invariants
+
+The report boundary remains `2026-06-01T00:00:00Z`. A projection may read an
+earlier `context_start` to reconstruct a position already open at the boundary,
+but only fills in `[report_start, report_end)` contribute visible PnL, trade
+counts, or alerts. Every run declares `LIVE`, `BACKFILL`, `REPAIR`, or `SHADOW`;
+only LIVE may create notification-outbox rows.
+
+### 4.5 Mandatory invariants
 
 1. An `execution_uid` is ingested at most once.
 2. A `realization_uid` contributes to realized PnL at most once.
@@ -498,11 +523,15 @@ incomplete/stale accounts.
 Recommended. It centralizes rules, makes rebuilding possible, and makes
 dashboard/Telegram parity testable.
 
-### Choice B: logical account partitions, not one database file per wallet
+### Choice B: per-account immutable ledgers plus a central catalog
 
-Recommended for the current single VM. It provides the user's “one base per
-address” as a strict logical boundary without multiplying migrations, backups,
-connections, and partial-failure cases.
+The original blueprint preferred logical partitions in one database. The
+current decision is to keep one immutable ledger database per account and a
+small central catalog for account identity, labels, memberships, checkpoints,
+and cross-account query metadata. This matches the exchange-fact ownership
+boundary and isolates account backup/repair failures. A deployment may
+temporarily co-locate files operationally, but the application contract remains
+account-scoped and never relies on a display name or global row number.
 
 ### Choice C: durable SQLite outbox, not a message broker
 

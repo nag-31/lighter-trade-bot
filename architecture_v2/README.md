@@ -10,6 +10,10 @@ strangler migration, not a full-code rewrite.
 The researched PnL-card execution chart extension is documented in
 [`docs/EXECUTION_CHART_DESIGN.md`](docs/EXECUTION_CHART_DESIGN.md).
 
+The current account/catalog, label-history, cutoff, run-mode, lifecycle-feature,
+shadow-comparison, and rollback decisions are documented in
+[`docs/ARCHITECTURE_DECISIONS_2026-08-04.md`](docs/ARCHITECTURE_DECISIONS_2026-08-04.md).
+
 The existing production application remains outside this directory and is not
 modified or replaced until V2 passes its migration, shadow-comparison, and
 deployment gates.

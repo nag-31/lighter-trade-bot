@@ -4,7 +4,12 @@ Status: foundation and an opt-in Journal read consumer are implemented,
 regression-tested, and remain reversible; no production import, migration, or
 default consumer cutover
 
-Last updated: 2026-08-02
+Last updated: 2026-08-04
+
+The architecture decisions for the next slice are recorded in
+[`ARCHITECTURE_DECISIONS_2026-08-04.md`](ARCHITECTURE_DECISIONS_2026-08-04.md).
+That document is planning authority only; it does not activate a production
+write path or consumer cutover.
 
 ## Delivered slice
 
@@ -132,6 +137,16 @@ rollback scope are in
 - no native Hyperliquid candle adapter or approved Lighter candle fallback;
 - no chart artifact cache or Telegram media-group outbox extension;
 - no service or consumer activation of V2.
+
+The following architecture contracts are now specified but remain intentionally
+unimplemented until the next approved engineering slice:
+
+- central account catalog with account-state flags and display-label history;
+- separate `context_start` versus `report_start` cutoff metadata;
+- explicit LIVE/BACKFILL/REPAIR/SHADOW run mode and alert policy;
+- persisted deterministic shadow-comparison evidence and projection hashes;
+- versioned lifecycle-feature projections for holding-time analytics;
+- restore-tested migration and rollback evidence bundles.
 
 ## Exchange-basis and cutoff hardening
 
