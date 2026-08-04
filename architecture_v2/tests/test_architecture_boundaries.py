@@ -3,6 +3,7 @@ from decimal import Decimal
 import sqlite3
 
 from architecture_v2.application.read_models import read_dashboard, read_journal
+from architecture_v2.application.queries import AccountingQueryService
 from architecture_v2.domain.models import Execution, ExecutionSide, PositionSide
 from architecture_v2.domain.policy import (
     AccountState,
