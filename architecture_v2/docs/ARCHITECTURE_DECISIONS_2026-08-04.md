@@ -1,6 +1,6 @@
 # Crypto Scientist Architecture Decisions — 2026-08-04
 
-Status: architecture-only decision record. No runtime code, production schema,
+Status: architecture decision record for the isolated V2 runtime. No production schema,
 consumer cutover, or deployment is authorized by this document.
 
 This record resolves the remaining ambiguity between the original V2 blueprint,
