@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from architecture_v2.domain.identity import require_identity
+from architecture_v2.domain.identity import require_identity, stable_uid
 from architecture_v2.domain.policy import AccountLabel, AccountState
 
 
@@ -49,6 +49,18 @@ class CatalogAccount:
     state: AccountState
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AccountStateChange:
+    change_id: str
+    account_id: str
+    field_name: str
+    old_value: bool | None
+    new_value: bool
+    changed_at: datetime
+    changed_by: str
+    change_reason: str
 
 
 class CatalogStore:
@@ -94,6 +106,22 @@ class CatalogStore:
                 );
                 CREATE INDEX IF NOT EXISTS ix_account_labels_lookup
                     ON account_labels(account_id, valid_from, valid_until);
+                CREATE TABLE IF NOT EXISTS account_state_history (
+                    change_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL CHECK (field_name IN (
+                        'ingestion_enabled', 'alerts_enabled',
+                        'portfolio_included', 'historical_visible'
+                    )),
+                    old_value INTEGER CHECK (old_value IS NULL OR old_value IN (0, 1)),
+                    new_value INTEGER NOT NULL CHECK (new_value IN (0, 1)),
+                    changed_at TEXT NOT NULL,
+                    changed_by TEXT NOT NULL,
+                    change_reason TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (account_id) REFERENCES catalog_accounts(account_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_account_state_history_lookup
+                    ON account_state_history(account_id, changed_at, change_id);
                 CREATE TABLE IF NOT EXISTS catalog_portfolios (
                     portfolio_id TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL,
@@ -110,10 +138,32 @@ class CatalogStore:
                     FOREIGN KEY (portfolio_id) REFERENCES catalog_portfolios(portfolio_id),
                     FOREIGN KEY (account_id) REFERENCES catalog_accounts(account_id)
                 );
-                INSERT INTO catalog_meta(key, value) VALUES ('schema_version', '1')
+                INSERT INTO catalog_meta(key, value) VALUES ('schema_version', '2')
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
                 """
             )
+            for row in con.execute("SELECT * FROM catalog_accounts"):
+                exists = con.execute(
+                    "SELECT 1 FROM account_state_history WHERE account_id=? LIMIT 1",
+                    (row["account_id"],),
+                ).fetchone()
+                if exists is not None:
+                    continue
+                created_at = _time(row["created_at"])
+                for field_name in (
+                    "ingestion_enabled", "alerts_enabled",
+                    "portfolio_included", "historical_visible",
+                ):
+                    self._record_state_change_con(
+                        con,
+                        account_id=row["account_id"],
+                        field_name=field_name,
+                        old_value=None,
+                        new_value=bool(row[field_name]),
+                        changed_at=created_at,
+                        changed_by="migration",
+                        change_reason="initialize account state history",
+                    )
 
     @staticmethod
     def _account(row: sqlite3.Row) -> CatalogAccount:
@@ -149,6 +199,9 @@ class CatalogStore:
         chosen = state or AccountState()
         when = _iso(current)
         with self.connect() as con:
+            existed = con.execute(
+                "SELECT 1 FROM catalog_accounts WHERE account_id=?", (account,)
+            ).fetchone() is not None
             con.execute(
                 """
                 INSERT INTO catalog_accounts(
@@ -164,6 +217,21 @@ class CatalogStore:
                     int(chosen.portfolio_included), int(chosen.historical_visible), when, when,
                 ),
             )
+            if not existed:
+                for field_name in (
+                    "ingestion_enabled", "alerts_enabled",
+                    "portfolio_included", "historical_visible",
+                ):
+                    self._record_state_change_con(
+                        con,
+                        account_id=account,
+                        field_name=field_name,
+                        old_value=None,
+                        new_value=getattr(chosen, field_name),
+                        changed_at=current,
+                        changed_by=changed_by,
+                        change_reason=change_reason,
+                    )
             existing = con.execute(
                 "SELECT 1 FROM account_labels WHERE account_id=? AND valid_until IS NULL",
                 (account,),
@@ -224,27 +292,117 @@ class CatalogStore:
             self._rename_con(con, account, label, current, changed_by, change_reason)
             con.execute("UPDATE catalog_accounts SET updated_at=? WHERE account_id=?", (_iso(current), account))
 
-    def set_state(self, account_id: str, *, at: datetime | None = None, **changes: bool) -> CatalogAccount:
+    @staticmethod
+    def _record_state_change_con(
+        con: sqlite3.Connection,
+        *,
+        account_id: str,
+        field_name: str,
+        old_value: bool | None,
+        new_value: bool,
+        changed_at: datetime,
+        changed_by: str,
+        change_reason: str,
+    ) -> None:
+        change_id = stable_uid(
+            "account_state_change", account_id, field_name,
+            _iso(changed_at), old_value, new_value,
+        )
+        con.execute(
+            """INSERT OR IGNORE INTO account_state_history(
+               change_id, account_id, field_name, old_value, new_value,
+               changed_at, changed_by, change_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                change_id, account_id, field_name,
+                None if old_value is None else int(old_value), int(new_value),
+                _iso(changed_at), changed_by, change_reason,
+            ),
+        )
+
+    def set_state(
+        self,
+        account_id: str,
+        *,
+        at: datetime | None = None,
+        changed_by: str = "system",
+        change_reason: str = "",
+        ingestion_enabled: bool | None = None,
+        alerts_enabled: bool | None = None,
+        portfolio_included: bool | None = None,
+        historical_visible: bool | None = None,
+    ) -> CatalogAccount:
         account = require_identity(account_id, "account_id")
-        allowed = {"ingestion_enabled", "alerts_enabled", "portfolio_included", "historical_visible"}
-        unknown = set(changes) - allowed
-        if unknown:
-            raise ValueError(f"unknown account state field(s): {', '.join(sorted(unknown))}")
+        changes = {
+            key: value
+            for key, value in {
+                "ingestion_enabled": ingestion_enabled,
+                "alerts_enabled": alerts_enabled,
+                "portfolio_included": portfolio_included,
+                "historical_visible": historical_visible,
+            }.items()
+            if value is not None
+        }
         if not changes:
             return self.get_account(account)  # type: ignore[return-value]
         if any(not isinstance(value, bool) for value in changes.values()):
             raise TypeError("account state values must be bool")
         current = at or _now()
-        assignments = ", ".join(f"{key}=?" for key in sorted(changes))
-        values = [int(changes[key]) for key in sorted(changes)] + [_iso(current), account]
         with self.connect() as con:
-            cursor = con.execute(
+            row = con.execute(
+                "SELECT * FROM catalog_accounts WHERE account_id=?", (account,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown account: {account}")
+            actual_changes = {
+                key: value
+                for key, value in changes.items()
+                if bool(row[key]) != value
+            }
+            if not actual_changes:
+                return self.get_account(account)  # type: ignore[return-value]
+            assignments = ", ".join(f"{key}=?" for key in sorted(actual_changes))
+            values = [int(actual_changes[key]) for key in sorted(actual_changes)] + [
+                _iso(current), account,
+            ]
+            con.execute(
                 f"UPDATE catalog_accounts SET {assignments}, updated_at=? WHERE account_id=?",
                 values,
             )
-            if cursor.rowcount != 1:
-                raise ValueError(f"unknown account: {account}")
+            for field_name, new_value in sorted(actual_changes.items()):
+                self._record_state_change_con(
+                    con,
+                    account_id=account,
+                    field_name=field_name,
+                    old_value=bool(row[field_name]),
+                    new_value=new_value,
+                    changed_at=current,
+                    changed_by=changed_by,
+                    change_reason=change_reason,
+                )
         return self.get_account(account)  # type: ignore[return-value]
+
+    def state_history(self, account_id: str) -> tuple[AccountStateChange, ...]:
+        account = require_identity(account_id, "account_id")
+        with self.connect() as con:
+            rows = con.execute(
+                """SELECT * FROM account_state_history WHERE account_id=?
+                   ORDER BY changed_at, change_id""",
+                (account,),
+            ).fetchall()
+        return tuple(
+            AccountStateChange(
+                change_id=row["change_id"],
+                account_id=row["account_id"],
+                field_name=row["field_name"],
+                old_value=(bool(row["old_value"]) if row["old_value"] is not None else None),
+                new_value=bool(row["new_value"]),
+                changed_at=_time(row["changed_at"]),
+                changed_by=row["changed_by"],
+                change_reason=row["change_reason"],
+            )
+            for row in rows
+        )
 
     def get_account(self, account_id: str) -> CatalogAccount | None:
         account = require_identity(account_id, "account_id")

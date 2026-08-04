@@ -10,7 +10,7 @@ Precise handoff log for agents working on Crypto Scientist.
   `lighterbot.service`, `command-center.service`, `apps-hub.service`, and
   `trade-journal.service`.
 - Prior inert VM V2 source verification: 54 passed.
-- Latest local V2 suite: 64 passed; full repository suite: 1001 passed, with 294 pre-existing aiohttp warnings.
+- Latest local V2 suite: 69 passed; full repository suite: 1006 passed, with 294 pre-existing aiohttp warnings.
 - Full-close PnL cards now send a Telegram album containing the PnL card and an
   execution-only BUY/SELL chart.
 - Production remains on the prior inert V2 source; no database migrations, V2 alert activation, or consumer cutovers have been performed.
@@ -25,11 +25,11 @@ Precise handoff log for agents working on Crypto Scientist.
 - Initialized local `data/catalog.db` from the existing account-ledger metadata.
   It records `HL` -> `HL Swing Wallet` label history and keeps `My NK pool`
   ingestion/alerts/portfolio disabled while retaining historical visibility.
-- Catalog integrity check: `ok`; four account records and five label-history rows.
+- Catalog integrity check: `ok`; schema version 2, four account records, five label-history rows, and 16 initial account-state audit rows.
 - Raw account ledgers, events, Journal, portfolio, and runtime snapshots were not
   rewritten. No production migration, deploy, alert activation, or consumer cutover
   occurred.
-- Verification: V2 **64 passed**; repository **1001 passed** with 294 existing
+- Verification: V2 **69 passed**; repository **1006 passed** with 294 existing
   aiohttp `NotAppKeyWarning` warnings.
 
 ## Deployment evidence
@@ -85,3 +85,17 @@ Precise handoff log for agents working on Crypto Scientist.
 - Added `AGENT_CODE_REVIEW_INSTRUCTIONS.md`.
 - The file explains the system, recent chart work, review questions, test
   commands, safety boundaries, and the required bug-report format.
+
+### 2026-08-04 - V2 ingestion and audit evidence hardened
+
+- Added account-state history with actor, reason, timestamp, and old/new values.
+- Added ledger-first ingestion coordination, ledger/projection drift detection,
+  and projection-only repair from immutable account facts.
+- Recorded LIVE/BACKFILL/REPAIR/SHADOW provenance on fill observations.
+- Made projection-run manifests and shadow comparisons immutable and
+  idempotent; conflicting evidence IDs are rejected instead of overwritten.
+- Added five focused architecture-hardening tests.
+- Verification: V2 **69 passed**; full repository **1006 passed**, with 294
+  pre-existing aiohttp warnings.
+- Production deployment, consumer cutover, alerts, and raw account ledgers were
+  unchanged.

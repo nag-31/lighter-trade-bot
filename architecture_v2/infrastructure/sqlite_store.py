@@ -331,7 +331,11 @@ class SqliteV2Store:
                 label=execution.account_id,
             )
             catalog_account = self.catalog.get_account(execution.account_id)
-        if catalog_account is not None and not catalog_account.state.ingestion_enabled:
+        if (
+            catalog_account is not None
+            and not catalog_account.state.ingestion_enabled
+            and policy.mode not in {RunMode.REPAIR, RunMode.SHADOW}
+        ):
             raise ValueError(f"ingestion disabled for account: {execution.account_id}")
         if catalog_account is not None and not catalog_account.state.alerts_enabled:
             policy = ProjectionRunPolicy(mode=policy.mode, alerts_enabled=False)
@@ -423,21 +427,36 @@ class SqliteV2Store:
                 alerts_created=1 if policy.alerts_allowed else 0,
             )
             metadata = projection_window.as_metadata()
-            con.execute(
-                """INSERT OR REPLACE INTO v2_projection_runs(
+            run_values = (
+                manifest.run_id, execution.account_id, manifest.mode.value,
+                manifest.accounting_version, metadata["context_start"] or None,
+                metadata["report_start"], metadata["report_end"] or None,
+                metadata["as_of"] or None, metadata["timezone"],
+                manifest.input_snapshot_hash, manifest.projection_hash,
+                manifest.rows_read, manifest.rows_written,
+                manifest.alerts_created, manifest.status, now,
+            )
+            cursor = con.execute(
+                """INSERT OR IGNORE INTO v2_projection_runs(
                    run_id, account_id, mode, accounting_version, context_start, report_start,
                    report_end, as_of, timezone, input_snapshot_hash, projection_hash,
                    rows_read, rows_written, alerts_created, status, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    manifest.run_id, execution.account_id, manifest.mode.value, manifest.accounting_version,
-                    metadata["context_start"] or None, metadata["report_start"],
-                    metadata["report_end"] or None, metadata["as_of"] or None,
-                    metadata["timezone"], manifest.input_snapshot_hash,
-                    manifest.projection_hash, manifest.rows_read, manifest.rows_written,
-                    manifest.alerts_created, manifest.status, now,
-                ),
+                run_values,
             )
+            if cursor.rowcount == 0:
+                existing = con.execute(
+                    "SELECT * FROM v2_projection_runs WHERE run_id=?",
+                    (manifest.run_id,),
+                ).fetchone()
+                columns = (
+                    "run_id", "account_id", "mode", "accounting_version",
+                    "context_start", "report_start", "report_end", "as_of",
+                    "timezone", "input_snapshot_hash", "projection_hash",
+                    "rows_read", "rows_written", "alerts_created", "status",
+                )
+                if existing is None or tuple(existing[key] for key in columns) != run_values[:-1]:
+                    raise ValueError(f"projection run ID collision: {manifest.run_id}")
         return True
 
     def latest_projection_run(self, account_id: str | None = None) -> ProjectionRunManifest | None:
@@ -478,10 +497,16 @@ class SqliteV2Store:
     ) -> int:
         """Persist classified legacy/V2 differences without changing consumers."""
         with self.connect() as con:
-            if not con.execute(
-                "SELECT 1 FROM v2_projection_runs WHERE run_id=?", (run_id,)
-            ).fetchone():
+            run = con.execute(
+                "SELECT account_id, mode FROM v2_projection_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
                 raise ValueError(f"unknown projection run: {run_id}")
+            if run["account_id"] != account_id:
+                raise ValueError("shadow comparison account does not match projection run")
+            if run["mode"] != RunMode.SHADOW.value:
+                raise ValueError("shadow comparisons require a SHADOW projection run")
             inserted = 0
             for index, item in enumerate(comparisons):
                 if isinstance(item, dict):
@@ -502,17 +527,33 @@ class SqliteV2Store:
                 }:
                     raise ValueError(f"unsupported shadow classification: {classification}")
                 comparison_id = stable_uid("shadow_comparison", run_id, account_id, dimension, subject_uid)
+                legacy_json = json.dumps(legacy_value, default=str, sort_keys=True)
+                v2_json = json.dumps(v2_value, default=str, sort_keys=True)
                 cursor = con.execute(
-                    """INSERT OR REPLACE INTO v2_shadow_comparisons(
+                    """INSERT OR IGNORE INTO v2_shadow_comparisons(
                        comparison_id, run_id, account_id, dimension, subject_uid,
                        classification, legacy_value, v2_value, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         comparison_id, run_id, account_id, dimension, subject_uid,
-                        classification, json.dumps(legacy_value, default=str, sort_keys=True),
-                        json.dumps(v2_value, default=str, sort_keys=True), _now(),
+                        classification, legacy_json, v2_json, _now(),
                     ),
                 )
+                if cursor.rowcount == 0:
+                    existing = con.execute(
+                        "SELECT * FROM v2_shadow_comparisons WHERE comparison_id=?",
+                        (comparison_id,),
+                    ).fetchone()
+                    expected = (
+                        run_id, account_id, dimension, subject_uid,
+                        classification, legacy_json, v2_json,
+                    )
+                    columns = (
+                        "run_id", "account_id", "dimension", "subject_uid",
+                        "classification", "legacy_value", "v2_value",
+                    )
+                    if existing is None or tuple(existing[key] for key in columns) != expected:
+                        raise ValueError(f"shadow comparison ID collision: {comparison_id}")
                 inserted += int(cursor.rowcount == 1)
         return inserted
 
@@ -524,6 +565,8 @@ class SqliteV2Store:
                 (run_id,),
             ).fetchall()
         return {row["classification"]: int(row["count"]) for row in rows}
+
+
     def list_executions(
         self,
         *,

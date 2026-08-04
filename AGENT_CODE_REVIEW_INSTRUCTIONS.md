@@ -57,11 +57,15 @@ The isolated V2 implementation now includes:
 - `architecture_v2/infrastructure/account_ledger_store.py`: one append-only
   exchange-fact SQLite ledger per account;
 - `architecture_v2/infrastructure/catalog_store.py`: central account identity,
-  independent ingestion/alert/portfolio/historical flags, and label history;
+  independent ingestion/alert/portfolio/historical flags, label history, and
+  auditable account-state transitions;
+- `architecture_v2/application/ingestion.py`: ledger-first write coordination,
+  drift audit, and projection repair;
 - `architecture_v2/domain/policy.py`: `ProjectionWindow` with the fixed
   `2026-06-01T00:00:00Z` report boundary and LIVE/BACKFILL/REPAIR/SHADOW policy;
 - `architecture_v2/domain/projections.py` and `sqlite_store.py`: deterministic
-  input/projection hashes, versioned run manifests, and persisted shadow evidence;
+  input/projection hashes, immutable versioned run manifests, and immutable
+  persisted shadow evidence;
 - `application/read_models.py`: read-only Dashboard and Journal snapshots;
 - `infrastructure/verification.py` and `rollout.py`: backup/restore integrity
   checks and non-activating rollout gates.
@@ -101,6 +105,10 @@ enable consumers.
 - Are scale-ins, scale-outs, reversals, and same-timestamp fills ordered safely?
 - Can an unknown PnL value silently become a false zero?
 - Can restart/reconnect/backfill create duplicate alerts or duplicate rows?
+- Can a projection failure lose the raw fill, or can drift remain invisible?
+- Can repair introduce an execution absent from the immutable account ledger?
+- Can a retry overwrite a projection manifest or classified shadow comparison?
+- Does every account-state change retain who changed it, why, and old/new values?
 
 ### Telegram and outbox correctness
 

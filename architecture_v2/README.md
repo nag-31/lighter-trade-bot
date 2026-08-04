@@ -32,6 +32,10 @@ The first local implementation slice is complete and tested:
   realizations, lifecycles, checkpoints, and an integration outbox;
 - atomic append-and-reproject ingestion with replay idempotency and late-fill
   rebuilding;
+- ledger-first ingestion coordination with explicit projection-lag errors,
+  drift audit, and projection-only repair from immutable account facts;
+- auditable account-state history and immutable/idempotent run and shadow
+  evidence;
 - a structural adapter for the current runtime trade shape;
 - a shared `TradeChartSpec`, lifecycle-aware marker batching, interval
   selection, and deterministic Pillow PNG rendering;

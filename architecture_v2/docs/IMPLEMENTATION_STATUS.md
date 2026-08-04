@@ -50,6 +50,7 @@ recalculate PnL.
 | `infrastructure/sqlite_store.py` | atomic ingestion, rebuild, membership, cutoff/run manifest, shadow evidence, and outbox repository |
 | `infrastructure/catalog_store.py` | central identity, independent account state, label history, and portfolio membership |
 | `infrastructure/account_ledger_store.py` | one append-only exchange-fact SQLite ledger per account |
+| `application/ingestion.py` | ledger-first coordination, account drift audit, and projection repair |
 | `infrastructure/verification.py` | non-destructive SQLite backup, restore, hash, and integrity evidence |
 | `application/queries.py` | one portfolio period-query handler |
 | `adapters/runtime_trade.py` | current runtime shape to immutable execution boundary |
@@ -64,6 +65,13 @@ recalculate PnL.
 
 - A repeated execution is stored and projected once.
 - A conflicting payload with the same UID is rejected.
+- Raw exchange facts commit before rebuildable projections; projection lag is
+  detectable and repairable from the account ledger.
+- Account-state changes retain actor, reason, timestamp, and old/new values.
+- Projection runs and shadow comparisons are immutable evidence: identical
+  retries are idempotent and conflicting ID reuse is rejected.
+- Fill observations retain whether they arrived through LIVE, BACKFILL,
+  REPAIR, or SHADOW processing.
 - Late/out-of-order fills rebuild only their account in event-time order.
 - Accounts are projected independently, then composed.
 - Removing an account from a portfolio changes the aggregate without deleting
@@ -91,7 +99,9 @@ Run only V2:
   --basetemp data\pytest-tmp\v2
 ```
 
-Result on 2026-08-04: **64 passed** (including the architecture-boundary, cutoff, shadow, rollout-gate, and Journal-visibility evidence tests).
+Result on 2026-08-04: **69 passed** (including architecture-boundary,
+ledger-first recovery, state-audit, immutable-evidence, cutoff, shadow,
+rollout-gate, and Journal-visibility tests).
 
 Run the repository:
 
@@ -100,7 +110,7 @@ Run the repository:
   --basetemp data\pytest-tmp\full-v2
 ```
 
-Result on 2026-08-04: **1001 passed**, with 294 pre-existing aiohttp
+Result on 2026-08-04: **1006 passed**, with 294 pre-existing aiohttp
 `NotAppKeyWarning` warnings from portfolio-app tests.
 
 ## VM source deployment
@@ -145,12 +155,14 @@ rollback scope are in
 
 The architecture contracts are now implemented in the isolated V2 boundary:
 
-- `CatalogStore` owns independent ingestion, alert, portfolio, and historical visibility flags plus label history;
-- `AccountLedgerStore` keeps one append-only exchange-fact SQLite file per account;
+- `CatalogStore` owns independent ingestion, alert, portfolio, and historical visibility flags plus label and account-state audit history;
+- `AccountLedgerStore` keeps one append-only exchange-fact SQLite file per account and records ingestion run-mode provenance;
+- `V2IngestionService` commits raw facts first, reports projection lag, audits ledger/projection drift, and repairs missing projection rows from the ledger;
 - `ProjectionWindow` separates context reconstruction from the fixed `2026-06-01T00:00:00Z` report boundary;
 - `RunMode` prevents BACKFILL/REPAIR/SHADOW runs from creating integration or notification events;
 - run manifests persist input/projection hashes, boundaries, row counts, and alert counts;
-- classified shadow comparisons are persisted and queryable by run;
+- projection manifests and classified shadow comparisons are immutable,
+  idempotent evidence and queryable by run;
 - backup/restore helpers verify SQLite integrity and hashes before rollback evidence is accepted.
 
 Lifecycle holding time is persisted for closed lifecycles and exposed through the Journal read model. Additional MFE/MAE and time-series feature columns remain a future projection version and do not alter the immutable ledger.

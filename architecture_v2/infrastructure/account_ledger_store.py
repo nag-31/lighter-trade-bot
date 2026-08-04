@@ -83,6 +83,7 @@ class AccountLedgerStore:
                     observation_id TEXT PRIMARY KEY,
                     execution_uid TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
+                    run_mode TEXT NOT NULL DEFAULT 'LIVE',
                     payload_hash TEXT NOT NULL,
                     raw_json TEXT NOT NULL,
                     FOREIGN KEY (execution_uid) REFERENCES exchange_fills(execution_uid)
@@ -100,9 +101,17 @@ class AccountLedgerStore:
                 (account_id, exchange, label or account_id, now, now),
             )
             con.execute(
-                """INSERT INTO ledger_meta(key, value) VALUES ('schema_version', '1')
+                """INSERT INTO ledger_meta(key, value) VALUES ('schema_version', '2')
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value"""
             )
+            observation_columns = {
+                row["name"] for row in con.execute("PRAGMA table_info(fill_observations)")
+            }
+            if "run_mode" not in observation_columns:
+                con.execute(
+                    "ALTER TABLE fill_observations ADD COLUMN "
+                    "run_mode TEXT NOT NULL DEFAULT 'LIVE'"
+                )
         return self.path(account_id)
 
     def append(
@@ -144,9 +153,13 @@ class AccountLedgerStore:
                     raise ValueError(f"execution UID collision: {execution.execution_uid}")
                 con.execute(
                     """INSERT OR IGNORE INTO fill_observations(
-                       observation_id, execution_uid, observed_at, payload_hash, raw_json)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (observation_id, execution.execution_uid, observed, _hash(payload), raw_json),
+                       observation_id, execution_uid, observed_at, run_mode,
+                       payload_hash, raw_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        observation_id, execution.execution_uid, observed,
+                        mode.value, _hash(payload), raw_json,
+                    ),
                 )
                 return False
             con.execute(
@@ -165,9 +178,13 @@ class AccountLedgerStore:
             )
             con.execute(
                 """INSERT INTO fill_observations(
-                   observation_id, execution_uid, observed_at, payload_hash, raw_json)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (observation_id, execution.execution_uid, observed, _hash(payload), raw_json),
+                   observation_id, execution_uid, observed_at, run_mode,
+                   payload_hash, raw_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    observation_id, execution.execution_uid, observed,
+                    mode.value, _hash(payload), raw_json,
+                ),
             )
         return True
 
