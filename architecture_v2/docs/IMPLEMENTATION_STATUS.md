@@ -91,7 +91,7 @@ Run only V2:
   --basetemp data\pytest-tmp\v2
 ```
 
-Result on 2026-08-04: **63 passed** (including the architecture-boundary, cutoff, shadow, and rollout-gate evidence tests).
+Result on 2026-08-04: **64 passed** (including the architecture-boundary, cutoff, shadow, rollout-gate, and Journal-visibility evidence tests).
 
 Run the repository:
 
@@ -100,7 +100,7 @@ Run the repository:
   --basetemp data\pytest-tmp\full-v2
 ```
 
-Result on 2026-08-04: **1000 passed**, with 294 pre-existing aiohttp
+Result on 2026-08-04: **1001 passed**, with 294 pre-existing aiohttp
 `NotAppKeyWarning` warnings from portfolio-app tests.
 
 ## VM source deployment
