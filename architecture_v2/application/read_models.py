@@ -89,6 +89,7 @@ def read_journal(
     store: SqliteV2Store,
     *,
     account_ids: set[str] | frozenset[str] | None = None,
+    catalog: CatalogStore | None = None,
 ) -> JournalReadModel:
     """Build Journal lifecycle links using immutable Tracker UIDs."""
     source = catalog or store.catalog
