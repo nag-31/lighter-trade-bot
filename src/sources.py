@@ -105,6 +105,9 @@ class BotSettings:
     # Open orders dashboard panel
     open_orders_enabled: bool = True
 
+    # Optional lifecycle execution-chart PNG attachment; cards/text remain enabled.
+    execution_chart_enabled: bool = False
+
     # Stats: compute over ALL closed trades, not just the last max_closed_trades
     stats_full_history: bool = True
 
@@ -247,6 +250,7 @@ def load_settings(path: str | Path = "config.yaml") -> BotSettings:
         privacy_disclose_footnote   = _bool("privacy_disclose_footnote",  True),
         privacy_secret_key          = privacy_secret,
         open_orders_enabled         = _bool("open_orders_enabled",        True),
+        execution_chart_enabled     = _bool("execution_chart_enabled",    False),
         stats_full_history          = _bool("stats_full_history",         True),
         stats_start_date            = _str_or_none("stats_start_date"),
         stats_end_date              = _str_or_none("stats_end_date"),

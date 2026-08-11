@@ -84,6 +84,7 @@ from .telegram_commands import (
     format_leaderboard,
     format_help,
     format_orders,
+    format_open_interest,
     format_positions,
     format_public_status,
     format_risk,
@@ -1441,11 +1442,15 @@ function connect() {
     if (data.type === "snapshot") {
       renderPayload(data);
       if (data.recent_events.length) {
-        document.getElementById("last").textContent = "last event " + data.recent_events[0].trade.timestamp;
+        const lastEv = data.recent_events[0];
+        const lastTs = (lastEv._disp && lastEv._disp.ts) || lastEv.trade.timestamp;
+        document.getElementById("last").textContent = "last event " + lastTs;
       }
     } else if (data.type === "event") {
       renderPayload(data);
-      document.getElementById("last").textContent = "last event " + data.event.trade.timestamp;
+      const ev = data.event && data.event.trade ? data.event : (data.recent_events && data.recent_events[0]);
+      const evTs = (ev && ev._disp && ev._disp.ts) || (ev && ev.trade && ev.trade.timestamp) || "";
+      document.getElementById("last").textContent = "last event " + evTs;
     }
   };
 }
@@ -2009,6 +2014,75 @@ async def _run() -> None:
         """
         return _privacy_anchor.get(src.id, {}).get(market_id) or fallback_entry
 
+    def _recent_event_payload(item: Any) -> dict:
+        """Serialize one recent event for the PUBLIC payload.
+
+        The events table is internet-reachable, so HL events must carry their
+        ``_disp`` privacy fields here — per event item, not as a payload-root
+        extra (the JS reads ``e._disp`` per row and falls back to ``t.price``
+        when it is missing, which used to leak REAL Hyperliquid prices/sizes).
+        Lighter / non-HL events pass through unchanged (their values are
+        intentionally public). Any transform failure fails CLOSED: the real
+        numbers are removed from the serialized trade dict too, so the JS
+        fallback has nothing real to show.
+        """
+        d = _to_jsonable(item)
+        if not isinstance(d, dict):
+            return d
+        trade = d.get("trade")
+        if not isinstance(trade, dict):
+            return d
+        sid = str(trade.get("source_id") or "")
+        src = by_id.get(sid)
+        if src is None or not src.is_hyperliquid:
+            return d
+        try:
+            mid = int(trade.get("market_id") or 0)
+            price = Decimal(str(trade.get("price") or 0))
+            size = Decimal(str(trade.get("size") or 0))
+            ts = str(trade.get("timestamp") or "")
+            ae = _anchor(src, mid, price)
+            dv = disp_view(
+                privacy, True,
+                src.id,
+                str(trade.get("market_symbol") or ""),
+                str(trade.get("side") or ""),
+                ae,
+                entry=price,
+                size=size,
+                notional=size * price,
+                ts=ts,
+                now=datetime.now(timezone.utc),
+            )
+            d["_disp"] = {
+                "price": str(dv.get("entry", price)),
+                "size": str(dv.get("size", size)),
+                "notional": str(dv.get("notional", size * price)),
+                "ts": dv.get("ts", ts),
+                "footnote": dv.get("footnote", ""),
+            }
+            # Strip the REAL numbers from the serialized trade dict so a raw
+            # WS reader cannot recover true HL values from the payload even
+            # though the JS renders the *_disp fields.
+            for key, disp_key in (
+                ("price", "price"),
+                ("size", "size"),
+            ):
+                if d["_disp"].get(disp_key) is not None:
+                    trade[key] = d["_disp"][disp_key]
+        except Exception:
+            # Fail CLOSED — never leak a real HL value to a browser.
+            for key in ("price", "size", "notional", "timestamp"):
+                trade.pop(key, None)
+            d["_disp"] = {
+                "price": None,
+                "size": None,
+                "notional": None,
+                "ts": None,
+                "footnote": "",
+            }
+        return d
+
     # --- Telegram ---
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_channel = os.environ.get("TELEGRAM_CHANNEL_ID", "")
@@ -2564,6 +2638,9 @@ async def _run() -> None:
             f"{src.id}|{trade.market_id}|{trade.position_side}|{fid}"
             for fid in (fill_ids or [trade.trade_id])
         ]
+        # Drop unusable keys (no native/trade id) so two different fills with
+        # missing ids cannot share one placeholder key and falsely dedup.
+        realization_keys = [key for key in realization_keys if not key.endswith("|None")]
         if realization_keys:
             if all(key in _recorded_realizations for key in realization_keys):
                 log.info(
@@ -2571,6 +2648,12 @@ async def _run() -> None:
                     src.name, kind, trade.market_symbol,
                 )
                 return None
+            # Claim the ids BEFORE any await. The fill consumer and the
+            # reconciler's silent-close backstop run as concurrent tasks; if
+            # both pass the check above, both would insert an in-memory row and
+            # double-count this fill's PnL in stats until restart. A synchronous
+            # claim makes the guard atomic (no await between check and set).
+            _recorded_realizations.update(realization_keys)
 
         # ── Build a synthetic Event-like for generate_pnl_card ────────────────
         # We need an Event whose position_before is the pre-reduce/pre-close
@@ -2663,7 +2746,7 @@ async def _run() -> None:
         chart_bytes: bytes | None = None
         chart_candles = ()
         chart_candle_provenance = "execution-only"
-        if kind == "FULL" and card_bytes:
+        if cfg.execution_chart_enabled and kind == "FULL" and card_bytes:
             try:
                 # Prefer the actual opening fill and scale-out timestamps for
                 # the OHLC window. If the opening fill is unavailable after a
@@ -2777,7 +2860,12 @@ async def _run() -> None:
             "market_key": f"{trade.market_id}:{trade.position_side}",
             "position_side": trade.position_side,
             "native_trade_id": trade.native_trade_id or str(trade.trade_id),
-            "event_uid": realization_keys[-1],
+            "event_uid": (
+                realization_keys[-1]
+                if realization_keys
+                else f"{src.id}|{trade.market_id}|{trade.position_side}|"
+                       f"{trade.native_trade_id or trade.trade_id or 'no-id'}"
+            ),
             "lifecycle_opened_at": lifecycle_opened_at.isoformat() if lifecycle_opened_at else None,
             "holding_duration_ms": hold_ms,
             "holding_duration_basis": hold_basis,
@@ -3181,7 +3269,7 @@ async def _run() -> None:
             ],
             "positions": all_positions(),
             "open_orders": all_open_orders(),
-            "recent_events": recent_events[:cfg.max_recent_events],
+            "recent_events": [_recent_event_payload(e) for e in recent_events[:cfg.max_recent_events]],
             "tg_alerts": _tg_alerts[:TG_ALERTS_MAX],
             # UI payload is always capped; the full list is kept in-memory for stats.
             # Aggregated into one entry per round-trip (in-progress positions
@@ -3681,29 +3769,10 @@ async def _run() -> None:
                 del recent_events[cfg.max_recent_events:]
                 # Build a display block for HL events so the JS renderer uses
                 # privacy-fuzzed values without doing any math itself.
-                _ev_extra: dict = {"event": ev}
-                if src.is_hyperliquid:
-                    _ev_ae = _anchor(src, ev.trade.market_id, ev.trade.price)
-                    _ev_dv = disp_view(
-                        privacy, True,
-                        src.id, ev.trade.market_symbol, ev.trade.side, _ev_ae,
-                        entry=ev.trade.price,
-                        size=ev.trade.size,
-                        notional=ev.trade.size * ev.trade.price,
-                        ts=ev.trade.timestamp.isoformat(),
-                        now=datetime.now(timezone.utc),
-                    )
-                    # Attach as _disp on the event object in recent_events so
-                    # snapshot broadcasts also carry it for newly-added events.
-                    # Since Event is a frozen dataclass we attach to the broadcast
-                    # dict directly rather than mutating the object.
-                    _ev_extra["_disp"] = {
-                        "price": str(_ev_dv.get("entry", ev.trade.price)),
-                        "size":  str(_ev_dv.get("size",  ev.trade.size)),
-                        "notional": str(_ev_dv.get("notional", ev.trade.size * ev.trade.price)),
-                        "ts": _ev_dv.get("ts", ev.trade.timestamp.isoformat()),
-                        "footnote": _ev_dv.get("footnote", ""),
-                    }
+                # _recent_event_payload attaches the per-event _disp dict (the JS
+                # reads e._disp per row); the payload-root _disp extra below is
+                # harmless legacy kept for backward-compat with old dashboards.
+                _ev_extra: dict = {"event": _recent_event_payload(ev)}
                 await hub.broadcast(snapshot_payload("event", _ev_extra))
                 await save_event(
                     DB_PATH,
@@ -3962,9 +4031,12 @@ async def _run() -> None:
                     )
 
                     if cfg.alert_on_close:
-                        # Find the record just inserted (newest-first, index 0)
-                        _close_record = closed_trades[0] if closed_trades else {}
-                        _close_card_path = _close_record.get("card_path")
+                        # Use the card path returned by record_realization.  The
+                        # reconciler's silent-close backstop can run concurrently
+                        # and insert its own row at index 0 during the awaits
+                        # above, so reading closed_trades[0] here could pick up
+                        # the WRONG coin's card (or None).
+                        _close_card_path = (_close_result or {}).get("card_path")
                         _execution_chart_bytes = (
                             _close_result or {}
                         ).get("chart_bytes")
@@ -4366,6 +4438,7 @@ async def _run() -> None:
     # ── Community + owner Telegram commands ──────────────────────────────────
     _community_telegram_commands = [
         {"command": "positions", "description": "Live open positions"},
+        {"command": "oi", "description": "Total open interest"},
         {"command": "trades", "description": "Recent completed trades"},
         {"command": "latest", "description": "Latest completed trades"},
         {"command": "pnl", "description": "PnL for today, 7d, 30d or all"},
@@ -4604,6 +4677,9 @@ async def _run() -> None:
             return
         if command == "positions":
             await reply(format_positions(all_positions(), " ".join(args)))
+            return
+        if command in {"oi", "openinterest"}:
+            await reply(format_open_interest(all_positions(), " ".join(args)))
             return
         if command == "orders":
             await reply(format_orders(all_open_orders(), " ".join(args)))

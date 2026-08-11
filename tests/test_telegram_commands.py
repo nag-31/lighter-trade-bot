@@ -9,6 +9,7 @@ from src.telegram_commands import (
     format_health,
     format_help,
     format_leaderboard,
+    format_open_interest,
     format_orders,
     format_positions,
     format_public_status,
@@ -89,6 +90,38 @@ def test_community_and_owner_command_permissions_are_separate():
         assert not command_is_allowed(command, is_owner=False)
         assert command_is_allowed(command, is_owner=True)
     assert not command_is_allowed("shutdown", is_owner=True)
+    assert command_is_allowed("oi", is_owner=False)
+    assert command_is_allowed("openinterest", is_owner=False)
+
+
+def test_open_interest_totals_all_positions_and_filters_source():
+    rows = [
+        {
+            "source": "HL",
+            "source_id": "hl-main",
+            "side": "long",
+            "notional_usd": "700",
+            "unrealized_pnl": "10",
+        },
+        {
+            "source": "Lighter",
+            "source_id": "lighter-wallet",
+            "side": "short",
+            "notional_usd": "300",
+            "unrealized_pnl": "-2",
+        },
+    ]
+
+    result = format_open_interest(rows)
+    assert "Positions: <b>2</b>" in result
+    assert "Gross: <b>$1,000.00</b>" in result
+    assert "Long: <b>$700.00</b>" in result
+    assert "Short: <b>$300.00</b>" in result
+    assert "Combined uPnL: <b>+$8.00</b>" in result
+
+    filtered = format_open_interest(rows, "HL")
+    assert "Positions: <b>1</b>" in filtered
+    assert "Gross: <b>$700.00</b>" in filtered
 
 
 def test_help_exposes_owner_tools_only_to_owner():

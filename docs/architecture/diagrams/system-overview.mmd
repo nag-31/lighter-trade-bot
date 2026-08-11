@@ -1,0 +1,60 @@
+flowchart TB
+    subgraph EX["Exchanges / Sources"]
+        HL["Hyperliquid wallet(s)<br/>HL_ADDRESS / HL_ADDRESS_2"]
+        LT["Lighter wallet<br/>LIGHTER_ADDRESS"]
+        BN["Binance (disabled)<br/>HTTP 451 geo-block"]
+    end
+
+    subgraph TRK["Trade Tracker (python -m src.dashboard · :8080)"]
+        WS["WS producer<br/>real-time fills"]
+        REST["REST safety poll<br/>60s gap-fill"]
+        REC["Position reconciler<br/>30s API truth"]
+        Q["asyncio.Queue<br/>single consumer"]
+        TR["PositionTracker<br/>fill classifier"]
+        RR["record_realization()<br/>per-fill PnL rows"]
+        DB[("events.db<br/>+ per-account ledgers")]
+        DASH["Public dashboard<br/>Chart.js + WS push"]
+        PRIV["Privacy transform<br/>HL fuzzy fingerprint"]
+    end
+
+    subgraph TG["Telegram bot"]
+        CARDS["PnL cards +<br/>execution charts"]
+        ALERTS["Open/close/reduce alerts"]
+        DIGEST["Session digest +<br/>daily recap"]
+        CMDS["Commands:<br/>/positions /pnl /stats …"]
+    end
+
+    subgraph V2["architecture_v2 (isolated, inert)"]
+        DOM["domain/ accounting engine"]
+        INFRA["sqlite_store + ledgers + outbox"]
+        CHART["static_chart + plotly<br/>deterministic PNG"]
+    end
+
+    HL --> WS
+    LT --> WS
+    BN -.disabled.-> WS
+    HL --> REST
+    LT --> REST
+    HL --> REC
+
+    WS --> Q
+    REST --> Q
+    REC --> TR
+    Q --> TR
+    TR --> RR
+    RR --> DB
+    RR --> PRIV
+    PRIV --> CARDS
+    PRIV --> ALERTS
+    ALERTS --> DIGEST
+    DASH --> CMDS
+    DB --> DASH
+    TR --> DASH
+
+    CARDS --> TG
+    ALERTS --> TG
+    DIGEST --> TG
+    CMDS --> TG
+
+    RR -.chart only.-> CHART
+    TRK -.isolated source.-> V2

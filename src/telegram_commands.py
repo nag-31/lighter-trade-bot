@@ -14,7 +14,7 @@ COMMUNITY_COMMANDS = frozenset(
     {
         "start", "help", "commands", "about", "status", "positions",
         "trades", "latest", "pnl", "today", "weekly", "stats",
-        "performance", "coin", "leaderboard",
+        "performance", "coin", "leaderboard", "oi", "openinterest",
     }
 )
 OWNER_COMMANDS = frozenset(
@@ -183,6 +183,7 @@ def format_help(*, owner: bool = False) -> str:
         "Crypto Scientist tracker commands",
         "",
         "/positions [source] — live positions",
+        "/oi [source] — total open interest across live positions",
         "/trades [n] [source] — completed trades",
         "/latest [n] — latest completed trades",
         "/pnl [today|7d|30d|all] [source] — performance",
@@ -295,6 +296,29 @@ def format_positions(rows: list[dict], source: str = "") -> str:
         )
     return "\n".join(lines)
 
+
+def format_open_interest(rows: list[dict], source: str = "") -> str:
+    """Format gross open interest across the currently tracked positions."""
+    selected = [row for row in rows if _source_matches(row, source)]
+    title = f"TOTAL OPEN INTEREST{f' · {_text(source)}' if source else ''}"
+    if not selected:
+        return f"📐 <b>{title}</b>\nNo matching open positions."
+    notionals = [(_num(row.get("notional_usd")) or 0.0, row) for row in selected]
+    total = sum(value for value, _row in notionals)
+    long_total = sum(
+        value for value, row in notionals if str(row.get("side")).lower() == "long"
+    )
+    short_total = sum(
+        value for value, row in notionals if str(row.get("side")).lower() == "short"
+    )
+    upnl = sum(_num(row.get("unrealized_pnl")) or 0.0 for row in selected)
+    return "\n".join([
+        f"📐 <b>{title}</b>",
+        f"Positions: <b>{len(selected)}</b>",
+        f"Gross: <b>{_money(total)}</b>",
+        f"🟢 Long: <b>{_money(long_total)}</b> · 🔴 Short: <b>{_money(short_total)}</b>",
+        _pnl(upnl, "Combined uPnL"),
+    ])
 
 def format_orders(rows: list[dict], source: str = "") -> str:
     selected = [row for row in rows if _source_matches(row, source)]

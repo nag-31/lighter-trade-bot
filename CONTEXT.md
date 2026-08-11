@@ -3,8 +3,12 @@
 > Living context file. Survives chat compaction. Update it when decisions change.
 > Narrative history lives in [BUILD_STORY.md](BUILD_STORY.md); this file is the
 > "where we are right now + the rules that must never be broken" snapshot.
+>
+> Architecture docs (human + agent) live in [docs/architecture/](docs/architecture/).
+> Easy folder for you, detailed folder for the agent, PNG diagrams in
+> `docs/architecture/diagrams/`.
 
-Last updated: 2026-06-07
+Last updated: 2026-08-04
 
 ---
 
@@ -129,6 +133,25 @@ Every problem reported during the build, newest at the bottom. Status: ✅ fixed
     (d) **Searchable close cards** — caption now carries "COIN SIDE · ±$PnL"
     (+ footer URL) instead of just the URL, so the channel is searchable by
     ticker. PnL-exact is allowed by the privacy posture; no price/size in caption.
+24. ✅ **Dashboard events table leaked REAL HL prices/sizes** (P1 privacy). The
+    JS reads `e._disp` per event row and falls back to `t.price` when missing,
+    but `_disp` was attached to the payload root, never to each event item —
+    so every HL event on the public dashboard (and the raw /ws payload) showed
+    real prices. → `_recent_event_payload()` serializes each event with a
+    per-row `_disp` AND strips real numbers from the serialized trade dict
+    (fail-closed on error). "Last event" label prefers `_disp.ts`. Fixed 2026-08-04.
+25. ✅ **Close alert could send the WRONG coin's card** (P2 race). After
+    `await record_realization(...)` the consumer read `closed_trades[0]`, but
+    the reconciler's silent-close backstop can insert its own row at index 0
+    during those awaits. → close alert now uses the card path returned by
+    `record_realization`. Fixed 2026-08-04.
+26. ✅ **record_realization TOCTOU race double-counted PnL** (P2). The fill
+    consumer and the reconciler's silent-close backstop run concurrently; both
+    could pass the `_recorded_realizations` check before either awaited → two
+    in-memory `closed_trades` rows for one fill (double-counted stats until
+    restart). → fill-id keys claimed synchronously before any await; `|None`
+    placeholder keys dropped; `event_uid` fallback guarded. Fixed 2026-08-04.
+    (3 regression tests added.)
 
 ---
 

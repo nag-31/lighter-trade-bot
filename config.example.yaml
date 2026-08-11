@@ -1,6 +1,9 @@
 filters:
   min_notional_usd: 1000
 
+settings:
+  execution_chart_enabled: false  # PnL cards remain; lifecycle PNG attachments are off
+
 recaps:
   daily_utc_hour: 23
   weekly_day: sunday   # UTC

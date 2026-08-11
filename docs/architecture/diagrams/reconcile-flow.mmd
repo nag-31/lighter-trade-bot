@@ -1,0 +1,38 @@
+flowchart TB
+    START([Fill arrives]) --> DEDUP{"In seen_tids?"}
+    DEDUP -- yes --> SKIP1[skip: WS replay / REST overlap]
+    DEDUP -- no --> CURSOR[advance source cursor]
+    CURSOR --> BACKFILL{"ts before session start?"}
+    BACKFILL -- yes --> SKIP2[suppress alert; still append ledger]
+    BACKFILL -- no --> CLASS[tracker.apply: Event kind]
+
+    CLASS --> |OPEN| OPENALERT[format_event to TG]
+    CLASS --> |SIZE_CHANGE| PEND[accumulate _pending]
+    PEND --> FLUSH[flush_aggregate after window]
+    FLUSH --> GATE{"net_added is at least min_notional?"}
+    GATE -- yes --> ADDALERT[TG Added alert]
+    GATE -- no --> QUIET1[record only, no alert]
+
+    CLASS --> |REDUCE| PENDR[accumulate _pending_reduces]
+    PENDR --> FLUSHR[flush_reduce_aggregate]
+    FLUSHR --> RR1[record_realization PARTIAL]
+    FLUSHR --> GATER{"net_reduced is at least min?"}
+    GATER -- yes --> REDALERT[TG Reduced alert]
+    GATER -- no --> QUIET2[realization still recorded]
+
+    CLASS --> |CLOSE| FLUSHR2[flush pending reduces to PARTIAL rows]
+    FLUSHR2 --> RT[round-trip total = partials + close]
+    RT --> EXQ{"HL source?"}
+    EXQ -- yes --> EXF[fetch_realizing_fills: exchange-truth re-sum]
+    EXF --> CARD[record_realization FULL with card_pnl_override]
+    EXQ -- no --> CARD
+    CARD --> ALBUM[TG media group: card + execution chart]
+    CARD --> CLAIM[claim fill_ids atomically before awaits]
+
+    SKIP1 --> END([done])
+    SKIP2 --> END
+    QUIET1 --> END
+    QUIET2 --> END
+    ADDALERT --> END
+    REDALERT --> END
+    ALBUM --> END

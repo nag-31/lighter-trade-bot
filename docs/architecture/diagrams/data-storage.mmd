@@ -1,0 +1,19 @@
+flowchart LR
+    subgraph SHARED["data/ (shared storage)"]
+        EVENTS[(events.db<br/>events + closed_trades<br/>tg_alerts + cursors<br/>notification_outbox + canonical)]
+        ACCOUNTS[(accounts/<br/>one .db per account:<br/>exchange_fills immutable<br/>pnl_realizations rebuildable)]
+        CARDS[/cards/<br/>PnL card PNGs<br/>served at /cards//]
+        LIVE[/live_positions.json<br/>journal position snapshot/]
+        STATE[/state.json<br/>paused flag + twitter counter/]
+    end
+
+    subgraph OTHER["Other apps — own DBs"]
+        JDB[(trading_journal.db)]
+        CDB[(command_center.db)]
+        PDB[(portfolio.db)]
+    end
+
+    EVENTS --- ACCOUNTS
+    ACCOUNTS --> LIVE
+    EVENTS --> CARDS
+    EVENTS --> STATE

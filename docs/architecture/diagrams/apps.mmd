@@ -1,0 +1,28 @@
+flowchart LR
+    subgraph TRK["Trade Tracker · :8080"]
+        A["src/dashboard.py<br/>fills → alerts → dashboard"]
+    end
+    subgraph TJ["Trade Journal · :8811"]
+        B["trade_journal/app.py<br/>lifecycle review, notes, PnL"]
+    end
+    subgraph CC["Command Center · :8810"]
+        C["command_center/app.py<br/>signals, hypotheses, outcomes"]
+    end
+    subgraph HUB["App Hub · :8800"]
+        D["apps_hub/access_page.py<br/>links + shallow health"]
+    end
+    subgraph PF["Portfolio apps"]
+        E["src/portfolio_app.py<br/>+ fetcher/defi/db"]
+    end
+    subgraph V2["architecture_v2 · inert"]
+        F["isolated accounting + charts"]
+    end
+
+    TRK -. read-only position feed .-> TJ
+    TRK -. snapshot .-> V2
+    HUB -. links/health .-> TRK
+    HUB -. links/health .-> TJ
+    HUB -. links/health .-> CC
+    HUB -. links/health .-> PF
+
+    style V2 fill:#1b2430,stroke:#4b5563,color:#9ca3af

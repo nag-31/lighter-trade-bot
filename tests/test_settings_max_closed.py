@@ -77,3 +77,16 @@ class TestMaxClosedTradesFromConfig:
         )
         s = load_settings(cfg)
         assert s.max_closed_trades == 0
+
+
+class TestExecutionChartToggle:
+    def test_defaults_to_disabled(self):
+        assert BotSettings().execution_chart_enabled is False
+
+    def test_parses_explicit_true(self, tmp_path: Path):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "settings:\n  execution_chart_enabled: true\n",
+            encoding="utf-8",
+        )
+        assert load_settings(cfg).execution_chart_enabled is True

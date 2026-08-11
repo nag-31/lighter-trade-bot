@@ -99,3 +99,43 @@ Precise handoff log for agents working on Crypto Scientist.
   pre-existing aiohttp warnings.
 - Production deployment, consumer cutover, alerts, and raw account ledgers were
   unchanged.
+
+### 2026-08-04 - bug hunt + architecture documentation
+
+- Reviewed `src/dashboard.py`, `execution_chart.py`, `pnl_card.py`, `db.py`,
+  `stats.py`, `sources.py`, `architecture_v2/`, and the peripheral apps.
+- Baseline: full suite 1006 passed.
+- Fixed 3 bugs:
+  1. [P1] HL privacy leak in the dashboard events table (real prices/sizes sent
+     to browsers; per-row `_disp` missing). Added `_recent_event_payload()`.
+  2. [P2] `closed_trades[0]` race after `await record_realization` � close card
+     could be a different coin's. Now uses the returned `card_path`.
+  3. [P2] TOCTOU in `record_realization` dedup � consumer + reconciler could
+     both record the same fill (duplicate in-memory rows, double-counted PnL).
+     Keys are now claimed synchronously before any await.
+- Added 3 regression tests in `tests/test_dashboard_contract.py`.
+- Verification: full repository **1009 passed**; `py_compile` clean on
+  `src/dashboard.py` and `src/execution_chart.py`.
+- Created `docs/architecture/`:
+  - `easy/` � human-facing overview, checklist, config, privacy.
+  - `detailed/` � module map, accounting rules, data flow, invariants,
+    V2 status, bug-hunt report.
+  - `diagrams/` � 6 Mermaid diagrams rendered to PNG (system overview, trade
+    lifecycle, data storage, apps, reconcile flow, privacy flow).
+- No production changes; V2 remains inert; no restart performed.
+
+### 2026-08-11 - execution charts made optional and open-interest command added
+
+- Added `settings.execution_chart_enabled`, defaulting to `false`. Full-close
+  Telegram alerts continue to send the existing PnL card/text; entry/exit chart
+  PNG generation and media attachment are skipped unless explicitly enabled.
+- Added community commands `/oi` and `/openinterest`. They report gross open
+  interest across all currently tracked positions, split into long/short
+  notional, with position count and combined unrealized PnL. An optional source
+  argument (for example `/oi HL`) applies the same source filter as `/positions`.
+- Added focused regression coverage for command permissions/totals, dispatch,
+  and the chart toggle/menu registration. Focused tests: **44 passed**; final
+  command/dashboard menu checks: **33 passed**. Full repository suite:
+  **1013 passed**, with 294 existing aiohttp `NotAppKeyWarning` warnings.
+- Local source/config/tests only; no VM deployment, service restart, alert send,
+  or database mutation was performed.

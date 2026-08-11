@@ -61,6 +61,7 @@ settings:
   max_closed_trades: 200       # closed trades shown in the UI history grid
   stats_full_history: true     # analytics computed over ALL closed trades, not just last-N
   open_orders_enabled: true    # show the resting/open-orders dashboard panel
+  execution_chart_enabled: false  # keep PnL cards; disable entry/exit PNG attachments
 
   # -- Stats display window -------------------------------------------------
   # Scope which closed trades the dashboard shows WITHOUT importing full history.

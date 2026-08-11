@@ -113,7 +113,7 @@ def test_full_close_chart_alert_uses_media_group_with_card_fallback():
     # attach:// names must match the multipart file keys, and failures must
     # preserve the card alert through the existing photo sender.
     required_fragments = (
-        'if kind == "FULL" and card_bytes:',
+        'if cfg.execution_chart_enabled and kind == "FULL" and card_bytes:',
         'await tg_send_media_group(',
         '"sendMediaGroup"',
         '"attach://pnl_card"',
@@ -124,6 +124,19 @@ def test_full_close_chart_alert_uses_media_group_with_card_fallback():
     )
     for fragment in required_fragments:
         assert fragment in source
+
+
+def test_execution_chart_toggle_keeps_card_path_available():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'if cfg.execution_chart_enabled and kind == "FULL" and card_bytes:' in source
+    assert 'if kind == "FULL" and card_bytes:' not in source.split(
+        'if cfg.execution_chart_enabled and kind == "FULL" and card_bytes:', 1
+    )[0]
+    assert 'if command in {"oi", "openinterest"}:' in source
+    assert '{"command": "oi", "description": "Total open interest"}' in source
 
 
 def test_discussion_commands_reply_in_place_with_shared_anti_spam_gate():
@@ -143,3 +156,75 @@ def test_telegram_html_is_detected_and_plain_alert_log_remains_readable():
 
     assert _uses_telegram_html(rich)
     assert _plain_telegram_text(rich) == "🟢 LONG · P&L: +$12.50"
+
+def test_events_payload_serializes_per_event_disp_and_strips_real_hl_values():
+    """The recent-events feed is internet-reachable: HL events must carry a
+    per-row _disp dict and must NOT leave real price/size in the serialized
+    trade dict (the JS falls back to t.price when _disp is missing)."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    # snapshot_payload builds each recent event via the privacy-aware helper.
+    assert '[_recent_event_payload(e) for e in recent_events[:cfg.max_recent_events]]' in source
+    # The helper strips the REAL numbers from the serialized trade dict.
+    assert "trade[key] = d[\"_disp\"][disp_key]" in source
+    # Fail-closed path removes real values too.
+    assert "trade.pop(key, None)" in source
+    # The JS prefers _disp and only falls back to t.price when absent.
+    assert "disp.price ?? t.price" in source
+    # The event broadcast uses the same serialized (safe) event.
+    assert '{"event": _recent_event_payload(ev)}' in source
+
+
+def test_close_alert_uses_record_realization_card_path_not_shared_list_head():
+    """The reconciler's silent-close backstop runs concurrently with the fill
+    consumer; reading closed_trades[0] after an await can pick up another
+    coin's card. The close alert must use the card path returned by
+    record_realization instead."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert '(_close_result or {}).get("card_path")' in source
+    assert "_close_record = closed_trades[0] if closed_trades else {}" not in source
+
+
+def test_record_realization_claims_dedup_keys_before_any_await():
+    """record_realization runs in concurrent tasks (fill consumer + reconciler
+    silent-close backstop). The dedup keys must be claimed synchronously before
+    any await so two tasks cannot both pass the guard and insert a duplicate
+    in-memory row (double-counted PnL until restart)."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_recorded_realizations.update(realization_keys)" in source
+    # The claim must happen at the top (dedup guard) AND after the DB write;
+    # the key property is that no await sits between the membership check and
+    # the claim. We assert the claim appears in the guard block by checking
+    # the guard is immediately followed by an update call.
+    guard_start = source.index("if all(key in _recorded_realizations for key in realization_keys):")
+    claim_end = source.index("_recorded_realizations.update(realization_keys)", guard_start)
+    segment = source[guard_start:claim_end]
+    # No async/await allowed between the membership check and the claim.
+    assert "await " not in segment
+
+def test_record_realization_claims_dedup_keys_before_any_await():
+    """record_realization runs in concurrent tasks (fill consumer + reconciler
+    silent-close backstop). The dedup keys must be claimed synchronously before
+    any await so two tasks cannot both pass the guard and insert a duplicate
+    in-memory row (double-counted PnL until restart)."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_recorded_realizations.update(realization_keys)" in source
+    guard_start = source.index("if all(key in _recorded_realizations for key in realization_keys):")
+    # The FIRST update call after the guard must be the synchronous claim (in
+    # the dedup-guard block), not the one after the DB write. Between the
+    # membership check and that claim there must be no real await statement.
+    first_update = source.index("_recorded_realizations.update(realization_keys)", guard_start)
+    segment = source[guard_start:first_update]
+    assert "return None" in segment  # guard still skips when all recorded
+    assert not any(line.strip().startswith("await ") for line in segment.splitlines())

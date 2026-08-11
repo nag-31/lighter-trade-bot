@@ -1,0 +1,47 @@
+sequenceDiagram
+    autonumber
+    participant EX as Exchange
+    participant WS as WS / REST producer
+    participant C as Consumer (single task)
+    participant TR as PositionTracker
+    participant RR as record_realization()
+    participant DB as events.db + ledgers
+    participant TG as Telegram
+
+    EX->>WS: fill event
+    WS->>C: Trade (source_id, market_id, side, size, price)
+
+    alt duplicate (WS replay / REST overlap)
+        C-->>C: seen_tids dedup → skip
+    else pre-session backfill
+        C-->>C: cursor advanced, alert suppressed
+    end
+
+    C->>TR: tracker.apply(trade)
+    TR-->>C: Event (OPEN / SIZE_CHANGE / REDUCE / CLOSE)
+
+    alt OPEN
+        C->>TG: format_event → "Opened …"
+    else SIZE_CHANGE (add)
+        C->>C: accumulate into _pending window
+        C-->>TG: digest → "Added …" (aggregated)
+    else REDUCE (partial close)
+        C->>C: accumulate into _pending_reduces window
+        C->>RR: record_realization(kind=PARTIAL)
+        RR->>DB: closed_trades row (this fill's pnl)
+        C-->>TG: digest → "Reduced …"
+    else CLOSE (full close)
+        C->>C: flush pending reduces → PARTIAL rows
+        C->>C: round-trip total = partials + close
+        opt HL only
+            C->>EX: fetch_realizing_fills (exchange-truth re-sum)
+            EX-->>C: closedPnl ground truth
+        end
+        C->>RR: record_realization(kind=FULL, card_pnl_override)
+        RR->>DB: closed_trades row (FULL)
+        RR->>TG: PnL card PNG + execution chart (album)
+        RR->>DB: _recorded_realizations claim (dedup)
+    end
+
+    C->>DB: save_event + source cursor + account ledger
+    C-->>DASH: broadcast snapshot (privacy-transformed)

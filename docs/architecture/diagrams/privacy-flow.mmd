@@ -1,0 +1,20 @@
+flowchart LR
+    REAL["REAL values (internal)<br/>price, size, notional, timestamp"]
+    PRIV["PrivacyParams<br/>enabled + HMAC secret<br/>mag, quanta, sigfigs"]
+    ANCHOR["frozen anchor entry<br/>seeded at OPEN per source/market"]
+
+    subgraph OUT["Public surfaces (HL only)"]
+        TG["Telegram alerts + cards"]
+        DASH["Dashboard grid"]
+        EV["Events table"]
+        ORD["Open orders"]
+    end
+
+    REAL --> F["price_factor f = HMAC(secret, source|sym|side|bucket)"]
+    ANCHOR --> F
+    PRIV --> F
+    F --> OUT
+
+    PNL["PnL $, %, win-rate"] -. stays EXACT .-> OUT
+
+    style PNL fill:#0f3d2e,stroke:#22c55e
