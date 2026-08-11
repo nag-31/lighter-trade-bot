@@ -139,3 +139,22 @@ Precise handoff log for agents working on Crypto Scientist.
   **1013 passed**, with 294 existing aiohttp `NotAppKeyWarning` warnings.
 - Local source/config/tests only; no VM deployment, service restart, alert send,
   or database mutation was performed.
+### 2026-08-12 - chart attachments disabled and open-interest command deployed
+
+- Pushed commit `12de4d377da24416c48b2f0eb55ab0714e4d4982` to
+  `origin/codex/architecture-v2`.
+- Deployed the runtime files (`config.yaml`, `holding_time.py`,
+  `src/dashboard.py`, `src/sources.py`, and `src/telegram_commands.py`) to the
+  GCP VM at `/home/ADMIN/apps/lighter-trade-bot`.
+- Backup-first deployment evidence:
+  `/home/ADMIN/apps/deploy-backups/execution-chart-off-20260811T202234Z`.
+  The three production SQLite backups passed `PRAGMA integrity_check = ok`.
+- Restarted `lighterbot.service`, `command-center.service`,
+  `apps-hub.service`, and `trade-journal.service`; all are active.
+- Post-deploy health: tracker `8080/healthz`, Command Center `8810/health`,
+  Trade Journal `8811/health`, and App Hub `8800/api/status` all returned HTTP
+  200. Runtime settings reported `EXECUTION_CHART_ENABLED=False`; the `/oi`
+  formatter imported successfully. Database migrations: none.
+- Two earlier attempts rolled back automatically before the successful run: one
+  had a verification working-directory error, and one exposed the missing
+  `holding_time.py` helper. No database writes were made by those attempts.
