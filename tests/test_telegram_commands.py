@@ -10,6 +10,7 @@ from src.telegram_commands import (
     format_help,
     format_leaderboard,
     format_open_interest,
+    format_current_upnl,
     format_orders,
     format_positions,
     format_public_status,
@@ -18,6 +19,7 @@ from src.telegram_commands import (
     format_trades,
     parse_command,
     parse_count_and_source,
+    parse_position_filters,
     split_message,
 )
 
@@ -92,6 +94,8 @@ def test_community_and_owner_command_permissions_are_separate():
     assert not command_is_allowed("shutdown", is_owner=True)
     assert command_is_allowed("oi", is_owner=False)
     assert command_is_allowed("openinterest", is_owner=False)
+    assert command_is_allowed("upnl", is_owner=False)
+    assert command_is_allowed("livepnl", is_owner=False)
 
 
 def test_open_interest_totals_all_positions_and_filters_source():
@@ -124,11 +128,58 @@ def test_open_interest_totals_all_positions_and_filters_source():
     assert "Gross: <b>$700.00</b>" in filtered
 
 
+def test_current_upnl_and_position_filters_support_side_and_wallet():
+    rows = [
+        {
+            "source": "HL Swing Wallet",
+            "source_id": "hl-main",
+            "side": "long",
+            "notional_usd": "700",
+            "unrealized_pnl": "10",
+        },
+        {
+            "source": "Lighter Wallet",
+            "source_id": "lighter-wallet",
+            "side": "short",
+            "notional_usd": "300",
+            "unrealized_pnl": "-2",
+        },
+        {
+            "source": "HL Swing Wallet",
+            "source_id": "hl-main",
+            "side": "short",
+            "notional_usd": "100",
+            "unrealized_pnl": "99",
+            "stale": True,
+        },
+    ]
+
+    assert parse_position_filters(["long", "HL", "Swing", "Wallet"]) == (
+        "long",
+        "HL Swing Wallet",
+    )
+    assert parse_position_filters(["Lighter", "short"]) == ("short", "Lighter")
+
+    result = format_current_upnl(rows)
+    assert "Positions: <b>2</b>" in result
+    assert "Current uPnL: <b>+$8.00</b>" in result
+    assert "Stale excluded: <b>1</b>" in result
+
+    filtered = format_current_upnl(rows, "HL", "long")
+    assert "Positions: <b>1</b>" in filtered
+    assert "Current uPnL: <b>+$10.00</b>" in filtered
+
+    oi = format_open_interest(rows, "Lighter", "short")
+    assert "Positions: <b>1</b>" in oi
+    assert "Gross: <b>$300.00</b>" in oi
+
+
 def test_help_exposes_owner_tools_only_to_owner():
     community = format_help(owner=False)
     owner = format_help(owner=True)
 
     assert "/coin BTC" in community
+    assert "/upnl [long|short] [wallet]" in community
     assert "/leaderboard" in community
     assert "/dashboard" not in community
     assert "/health" not in community

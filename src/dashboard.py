@@ -85,6 +85,7 @@ from .telegram_commands import (
     format_help,
     format_orders,
     format_open_interest,
+    format_current_upnl,
     format_positions,
     format_public_status,
     format_risk,
@@ -92,6 +93,7 @@ from .telegram_commands import (
     format_trades,
     parse_command,
     parse_count_and_source,
+    parse_position_filters,
     split_message,
 )
 from .types import Event, EventKind, OpenOrder, Position, Trade
@@ -628,7 +630,10 @@ INDEX_HTML = """<!doctype html>
   .wallet-chip input { accent-color:#60a5fa; }
   .wallet-picker button { background:#13161b; color:#9ca3af; border:1px solid #374151; border-radius:5px; padding:5px 8px; font:inherit; font-size:10px; cursor:pointer; }
   .wallet-picker button:hover { color:#fff; border-color:#60a5fa; }
-  .live-pnl-strip { display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; margin:0 0 16px; }
+  .side-picker { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .side-picker button { background:#13161b; color:#9ca3af; border:1px solid #374151; border-radius:999px; padding:5px 9px; font:inherit; font-size:10px; cursor:pointer; }
+  .side-picker button:hover, .side-picker button.active { color:#fff; border-color:#60a5fa; background:#172337; }
+  .live-pnl-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin:0 0 16px; }
   .live-pnl-card { background:#13161b; border:1px solid #1f242c; border-radius:8px; padding:11px 14px; }
   .live-pnl-card span { display:block; color:#6b7280; font-size:9px; text-transform:uppercase; letter-spacing:.7px; }
   .live-pnl-card b { display:block; margin-top:4px; color:#fff; font-size:18px; font-variant-numeric:tabular-nums; }
@@ -648,11 +653,19 @@ INDEX_HTML = """<!doctype html>
   <div class="wallet-picker" id="source-filter" role="group" aria-label="Wallets">
     <span class="wallet-picker-label">Wallets</span>
   </div>
+  <div class="side-picker" id="side-filter" role="group" aria-label="Position direction">
+    <span class="wallet-picker-label">Direction</span>
+    <button type="button" data-side-filter="" class="active">All</button>
+    <button type="button" data-side-filter="long">Long</button>
+    <button type="button" data-side-filter="short">Short</button>
+  </div>
   <span id="stats-cutoff-note" style="align-self:center;color:#6b7280;font-size:10px">PnL window: 2026-06-01 UTC</span>
 </div>
 <div class="live-pnl-strip" aria-label="Filtered live portfolio totals">
-  <div class="live-pnl-card"><span>Aggregate live P&amp;L</span><b id="live-pnl-total">â€”</b><small id="live-pnl-note">fresh open positions</small></div>
-  <div class="live-pnl-card"><span>Open notional</span><b id="live-notional-total">â€”</b><small>current filter</small></div>
+  <div class="live-pnl-card"><span>Current uPnL</span><b id="live-pnl-total">—</b><small id="live-pnl-note">fresh open positions</small></div>
+  <div class="live-pnl-card"><span>Long uPnL</span><b id="live-pnl-long">—</b><small>selected fresh positions</small></div>
+  <div class="live-pnl-card"><span>Short uPnL</span><b id="live-pnl-short">—</b><small>selected fresh positions</small></div>
+  <div class="live-pnl-card"><span>Open notional</span><b id="live-notional-total">—</b><small>current filter</small></div>
   <div class="live-pnl-card"><span>Active positions</span><b id="live-position-count">0</b><small>across tracked markets</small></div>
   <div class="live-pnl-card"><span>Active accounts</span><b id="live-account-count">0</b><small>with open risk</small></div>
 </div>
@@ -759,8 +772,10 @@ const esc = s => String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;"
 let _latestPayload = null;
 const _exchangeFilter = document.getElementById("exchange-filter");
 const _sourceFilter = document.getElementById("source-filter");
+const _sideFilter = document.getElementById("side-filter");
 // null means all wallets; a Set means the explicitly selected wallet IDs.
 let _walletSelection = null;
+let _sideSelection = "";
 const selectedWalletIds = () => _walletSelection;
 function initSortableTables() {
   document.querySelectorAll("table").forEach(table => {
@@ -838,7 +853,8 @@ initSortableTables();
 const filterRows = rows => (rows || []).filter(row => {
   const identity = row && row.trade ? row.trade : row;
   return (!_exchangeFilter.value || identity.exchange === _exchangeFilter.value) &&
-    (_walletSelection === null || _walletSelection.has(identity.source_id));
+    (_walletSelection === null || _walletSelection.has(identity.source_id)) &&
+    (!_sideSelection || String(identity.side || "").toLowerCase() === _sideSelection);
 });
 const fmtPnl = v => {
   if (v == null || v === "") return "—";
@@ -874,10 +890,14 @@ function renderLivePnl(positions) {
   const rows = filtered.filter(p => !p.stale);
   const staleCount = filtered.length - rows.length;
   const pnl = rows.reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
+  const longPnl = rows.filter(p => String(p.side || "").toLowerCase() === "long").reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
+  const shortPnl = rows.filter(p => String(p.side || "").toLowerCase() === "short").reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
   const notional = rows.reduce((sum, p) => sum + (
     Number(p.notional_usd) || (Number(p.size) * Number(p.avg_entry_price)) || 0
   ), 0);
   document.getElementById("live-pnl-total").innerHTML = fmtPnl(pnl);
+  document.getElementById("live-pnl-long").innerHTML = fmtPnl(longPnl);
+  document.getElementById("live-pnl-short").innerHTML = fmtPnl(shortPnl);
   document.getElementById("live-notional-total").textContent = fmtUsd(notional);
   document.getElementById("live-position-count").textContent = String(rows.length);
   document.getElementById("live-account-count").textContent =
@@ -1016,6 +1036,18 @@ function renderPayload(data) {
   if (data.stats) renderStats(statsForSelection(data));
   if (data.health) renderHealth(data.health);
 }
+function updateSideFilterButtons() {
+  _sideFilter.querySelectorAll("button[data-side-filter]").forEach(button => {
+    button.classList.toggle("active", button.dataset.sideFilter === _sideSelection);
+  });
+}
+_sideFilter.addEventListener("click", event => {
+  const button = event.target.closest("button[data-side-filter]");
+  if (!button) return;
+  _sideSelection = button.dataset.sideFilter || "";
+  updateSideFilterButtons();
+  if (_latestPayload) renderPayload(_latestPayload);
+});
 _exchangeFilter.addEventListener("change", () => {
   if (_latestPayload) renderPayload(_latestPayload);
 });
@@ -4439,6 +4471,7 @@ async def _run() -> None:
     _community_telegram_commands = [
         {"command": "positions", "description": "Live open positions"},
         {"command": "oi", "description": "Total open interest"},
+        {"command": "upnl", "description": "Current unrealized PnL"},
         {"command": "trades", "description": "Recent completed trades"},
         {"command": "latest", "description": "Latest completed trades"},
         {"command": "pnl", "description": "PnL for today, 7d, 30d or all"},
@@ -4676,10 +4709,16 @@ async def _run() -> None:
             )
             return
         if command == "positions":
-            await reply(format_positions(all_positions(), " ".join(args)))
+            side, source_query = parse_position_filters(args)
+            await reply(format_positions(all_positions(), source_query, side))
             return
         if command in {"oi", "openinterest"}:
-            await reply(format_open_interest(all_positions(), " ".join(args)))
+            side, source_query = parse_position_filters(args)
+            await reply(format_open_interest(all_positions(), source_query, side))
+            return
+        if command in {"upnl", "livepnl"}:
+            side, source_query = parse_position_filters(args)
+            await reply(format_current_upnl(all_positions(), source_query, side))
             return
         if command == "orders":
             await reply(format_orders(all_open_orders(), " ".join(args)))
@@ -4758,7 +4797,8 @@ async def _run() -> None:
             await reply(format_leaderboard(summary, window))
             return
         if command == "risk":
-            await reply(format_risk(all_positions(), " ".join(args)))
+            side, source_query = parse_position_filters(args)
+            await reply(format_risk(all_positions(), source_query, side))
             return
         if command == "sources":
             details = [

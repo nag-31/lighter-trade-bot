@@ -14,7 +14,7 @@ COMMUNITY_COMMANDS = frozenset(
     {
         "start", "help", "commands", "about", "status", "positions",
         "trades", "latest", "pnl", "today", "weekly", "stats",
-        "performance", "coin", "leaderboard", "oi", "openinterest",
+        "performance", "coin", "leaderboard", "oi", "openinterest", "upnl", "livepnl",
     }
 )
 OWNER_COMMANDS = frozenset(
@@ -87,6 +87,20 @@ def parse_count_and_source(
             pass
     count = max(1, min(MAX_LIST_ROWS, count))
     return count, " ".join(rest).strip()
+
+
+def parse_position_filters(args: list[str] | tuple[str, ...] | str) -> tuple[str, str]:
+    """Extract an optional side token and preserve the remaining wallet query."""
+    tokens = str(args or "").split() if isinstance(args, str) else list(args)
+    side = ""
+    source_tokens: list[str] = []
+    for token in tokens:
+        value = str(token or "").strip().lower()
+        if value in {"long", "short"} and not side:
+            side = value
+        elif value not in {"all", "any"}:
+            source_tokens.append(str(token))
+    return side, " ".join(source_tokens).strip()
 
 
 def split_message(text: str, limit: int = MAX_TELEGRAM_TEXT) -> list[str]:
@@ -164,6 +178,21 @@ def _pnl(value: Any, label: str = "P&amp;L") -> str:
     return f"{marker} {label}: <b>{_money(value, signed=True)}</b>"
 
 
+def _position_matches(row: dict, source: str = "", side: str = "") -> bool:
+    wanted_side = str(side or "").lower().strip()
+    actual_side = str(row.get("side") or "").lower().strip()
+    return (not wanted_side or actual_side == wanted_side) and _source_matches(row, source)
+
+
+def _filter_title(base: str, source: str = "", side: str = "") -> str:
+    suffix = []
+    if side:
+        suffix.append(side.upper())
+    if source:
+        suffix.append(_text(source))
+    return f"{base}{' · ' + ' · '.join(suffix) if suffix else ''}"
+
+
 def _source_matches(row: dict, query: str) -> bool:
     if not query:
         return True
@@ -182,8 +211,9 @@ def format_help(*, owner: bool = False) -> str:
     lines = [
         "Crypto Scientist tracker commands",
         "",
-        "/positions [source] — live positions",
-        "/oi [source] — total open interest across live positions",
+        "/positions [long|short] [wallet] — live positions",
+        "/oi [long|short] [wallet] — total open interest",
+        "/upnl [long|short] [wallet] — current unrealized P&L",
         "/trades [n] [source] — completed trades",
         "/latest [n] — latest completed trades",
         "/pnl [today|7d|30d|all] [source] — performance",
@@ -213,7 +243,7 @@ def format_help(*, owner: bool = False) -> str:
     lines.extend(
         [
             "",
-            "Examples: /coin BTC 7d · /trades 5 HL · /positions lighter",
+            "Examples: /upnl long HL · /oi short Lighter · /positions HL Swing Wallet",
             "Lists are capped at 25. Prices and sizes may be privacy-adjusted.",
         ]
     )
@@ -267,10 +297,9 @@ def format_leaderboard(stats: dict, window: str) -> str:
     return "\n".join(lines)
 
 
-def format_positions(rows: list[dict], source: str = "") -> str:
-    selected = [row for row in rows if _source_matches(row, source)]
-    source_title = f" · {_text(source)}" if source else ""
-    title = f"OPEN POSITIONS{source_title}"
+def format_positions(rows: list[dict], source: str = "", side: str = "") -> str:
+    selected = [row for row in rows if _position_matches(row, source, side)]
+    title = _filter_title("OPEN POSITIONS", source, side)
     if not selected:
         return f"📊 <b>{title}</b>\nNo matching open positions."
     lines = [f"📊 <b>{title} · {len(selected)}</b>"]
@@ -297,10 +326,10 @@ def format_positions(rows: list[dict], source: str = "") -> str:
     return "\n".join(lines)
 
 
-def format_open_interest(rows: list[dict], source: str = "") -> str:
+def format_open_interest(rows: list[dict], source: str = "", side: str = "") -> str:
     """Format gross open interest across the currently tracked positions."""
-    selected = [row for row in rows if _source_matches(row, source)]
-    title = f"TOTAL OPEN INTEREST{f' · {_text(source)}' if source else ''}"
+    selected = [row for row in rows if _position_matches(row, source, side)]
+    title = _filter_title("TOTAL OPEN INTEREST", source, side)
     if not selected:
         return f"📐 <b>{title}</b>\nNo matching open positions."
     notionals = [(_num(row.get("notional_usd")) or 0.0, row) for row in selected]
@@ -319,6 +348,41 @@ def format_open_interest(rows: list[dict], source: str = "") -> str:
         f"🟢 Long: <b>{_money(long_total)}</b> · 🔴 Short: <b>{_money(short_total)}</b>",
         _pnl(upnl, "Combined uPnL"),
     ])
+
+
+def format_current_upnl(rows: list[dict], source: str = "", side: str = "") -> str:
+    """Format current unrealized PnL from fresh open-position snapshots."""
+    selected = [row for row in rows if _position_matches(row, source, side)]
+    fresh = [row for row in selected if not row.get("stale")]
+    title = _filter_title("CURRENT uPnL", source, side)
+    if not fresh:
+        return f"📈 <b>{title}</b>\nNo fresh matching open positions."
+    upnl = sum(_num(row.get("unrealized_pnl")) or 0.0 for row in fresh)
+    long_upnl = sum(
+        _num(row.get("unrealized_pnl")) or 0.0
+        for row in fresh
+        if str(row.get("side")).lower() == "long"
+    )
+    short_upnl = sum(
+        _num(row.get("unrealized_pnl")) or 0.0
+        for row in fresh
+        if str(row.get("side")).lower() == "short"
+    )
+    wallets = {
+        str(row.get("source_id") or row.get("source") or "?") for row in fresh
+    }
+    lines = [
+        f"📈 <b>{title}</b>",
+        f"Positions: <b>{len(fresh)}</b>",
+        _pnl(upnl, "Current uPnL"),
+        f"🟢 Long: <b>{_money(long_upnl, signed=True)}</b> · 🔴 Short: <b>{_money(short_upnl, signed=True)}</b>",
+        f"Wallets: <b>{len(wallets)}</b>",
+    ]
+    stale_count = len(selected) - len(fresh)
+    if stale_count:
+        lines.append(f"Stale excluded: <b>{stale_count}</b>")
+    return "\n".join(lines)
+
 
 def format_orders(rows: list[dict], source: str = "") -> str:
     selected = [row for row in rows if _source_matches(row, source)]
@@ -406,9 +470,9 @@ def format_fills(rows: list[dict], count: int, source: str = "") -> str:
     return "\n".join(lines)
 
 
-def format_risk(rows: list[dict], source: str = "") -> str:
-    selected = [row for row in rows if _source_matches(row, source)]
-    title = f"RISK SNAPSHOT{f' · {_text(source)}' if source else ''}"
+def format_risk(rows: list[dict], source: str = "", side: str = "") -> str:
+    selected = [row for row in rows if _position_matches(row, source, side)]
+    title = _filter_title("RISK SNAPSHOT", source, side)
     if not selected:
         return f"🛡 <b>{title}</b>\nNo matching open positions."
     notionals = [(_num(row.get("notional_usd")) or 0.0, row) for row in selected]

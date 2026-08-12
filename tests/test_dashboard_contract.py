@@ -82,6 +82,7 @@ def test_address_tracker_shows_filter_aware_aggregate_live_pnl():
     assert "function renderLivePnl(positions)" in INDEX_HTML
     assert "const rows = filtered.filter(p => !p.stale);" in INDEX_HTML
     assert "renderLivePnl(data.positions);" in INDEX_HTML
+    assert 'String(identity.side || "").toLowerCase() === _sideSelection' in INDEX_HTML
 
 
 def test_dashboard_wallet_filter_supports_multiple_accounts_and_cutoff_analytics():
@@ -91,6 +92,12 @@ def test_dashboard_wallet_filter_supports_multiple_accounts_and_cutoff_analytics
     assert "let _walletSelection = null;" in INDEX_HTML
     assert "analytics_trades" in INDEX_HTML
     assert "stats_cutoff" in INDEX_HTML
+    assert 'id="side-filter"' in INDEX_HTML
+    assert 'data-side-filter="long"' in INDEX_HTML
+    assert 'data-side-filter="short"' in INDEX_HTML
+    assert 'id="live-pnl-long"' in INDEX_HTML
+    assert 'id="live-pnl-short"' in INDEX_HTML
+    assert 'let _sideSelection = "";' in INDEX_HTML
 
 
 def test_telegram_alert_paths_never_append_configured_source_website():
@@ -136,6 +143,7 @@ def test_execution_chart_toggle_keeps_card_path_available():
         'if cfg.execution_chart_enabled and kind == "FULL" and card_bytes:', 1
     )[0]
     assert 'if command in {"oi", "openinterest"}:' in source
+    assert 'if command in {"upnl", "livepnl"}:' in source
     assert '{"command": "oi", "description": "Total open interest"}' in source
 
 
