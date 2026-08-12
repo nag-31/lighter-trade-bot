@@ -158,3 +158,24 @@ Precise handoff log for agents working on Crypto Scientist.
 - Two earlier attempts rolled back automatically before the successful run: one
   had a verification working-directory error, and one exposed the missing
   `holding_time.py` helper. No database writes were made by those attempts.
+### 2026-08-12 - current uPnL filters and dashboard breakdown deployed
+
+- Pushed commit `4143ea6` to `origin/codex/architecture-v2`.
+- Added community commands `/upnl` and `/livepnl`; both accept optional
+  `long`/`short` and wallet/source tokens. `/positions`, `/oi`,
+  `/openinterest`, and owner `/risk` now accept the same side/wallet filters.
+- Added dashboard Direction controls (All/Long/Short) alongside multi-wallet
+  selection. Current uPnL, Long uPnL, Short uPnL, notional, positions, and
+  account cards now recompute from the active wallet/direction filter.
+- Local verification: full repository **1014 passed**, with 294 existing
+  aiohttp `NotAppKeyWarning` warnings.
+- Deployed runtime commit `4143ea6` to the GCP VM and restarted
+  `lighterbot.service`, `command-center.service`, `apps-hub.service`, and
+  `trade-journal.service`; all are active.
+- Backup-first evidence:
+  `/home/ADMIN/apps/deploy-backups/execution-chart-off-20260812T154016Z`.
+  All three production SQLite backups and post-deploy databases passed
+  `PRAGMA integrity_check = ok`; no migrations were performed.
+- Post-deploy health: tracker `8080/healthz`, Command Center `8810/health`,
+  Trade Journal `8811/health`, and App Hub `8800/api/status` all returned HTTP
+  200. Live dashboard HTML and deployed formatter smoke checks passed.
