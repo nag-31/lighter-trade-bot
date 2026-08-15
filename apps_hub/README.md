@@ -10,6 +10,8 @@ Then open http://127.0.0.1:8800/.
 
 The applications have explicit boundaries:
 
+- **Naga Portfolio** at http://127.0.0.1:8088/ is the public professional
+  portfolio, Crypto Scientist case study, and downloadable pitch deck.
 - **Signal Research** at http://127.0.0.1:8810/ owns market signals,
   hypotheses, forward outcomes, and weekly edge review.
 - **Trade Journal** at http://127.0.0.1:8811/ owns lifecycle review, reasons,

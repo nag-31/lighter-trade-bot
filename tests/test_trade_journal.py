@@ -112,6 +112,9 @@ def test_v2_ui_contract_is_present_in_static_assets() -> None:
 
 def test_hub_keeps_tracker_journal_and_tvl_as_separate_links() -> None:
     source = (ROOT / "apps_hub" / "access_page.py").read_text(encoding="utf-8")
+    assert 'AppLink("enkapital", "Naga Portfolio"' in source
+    assert '_app_url("enkapital", 8088)' in source
+    assert 'downloadable pitch deck' in source
     assert 'AppLink("trade-journal"' in source
     assert '_app_url("journal", 8811)' in source
     assert 'AppLink("tracker"' in source

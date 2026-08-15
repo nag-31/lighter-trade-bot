@@ -95,8 +95,8 @@ def test_dashboard_wallet_filter_supports_multiple_accounts_and_cutoff_analytics
     assert 'id="side-filter"' in INDEX_HTML
     assert 'data-side-filter="long"' in INDEX_HTML
     assert 'data-side-filter="short"' in INDEX_HTML
-    assert 'id="live-pnl-long"' in INDEX_HTML
-    assert 'id="live-pnl-short"' in INDEX_HTML
+    assert 'id="live-pnl-long"' not in INDEX_HTML
+    assert 'id="live-pnl-short"' not in INDEX_HTML
     assert 'let _sideSelection = "";' in INDEX_HTML
 
 

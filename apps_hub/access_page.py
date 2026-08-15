@@ -32,6 +32,7 @@ def _app_url(subdomain: str, local_port: int) -> str:
 
 
 APPS: tuple[AppLink, ...] = (
+    AppLink("enkapital", "Naga Portfolio", "Professional trading-systems portfolio featuring Crypto Scientist, architecture evidence, selected work, and a downloadable pitch deck.", _app_url("enkapital", 8088), "http://127.0.0.1:8088/", "Website", "Public portfolio for hiring, collaboration, and product walkthroughs."),
     AppLink("command-center", "Signal Research", "Market signals, counterfactual outcomes, research queue, and weekly edge review.", _app_url("command", 8810), "http://127.0.0.1:8810/health", "Research", "Signal research only. Trading records live in the separate Trade Journal."),
     AppLink("trade-journal", "Trade Journal", "Position-level execution review with grouped fills, partial exits, reasons, notes, and live or realized PnL.", _app_url("journal", 8811), "http://127.0.0.1:8811/health", "Trading", "One lifecycle record follows the full position instead of treating its last fill as the trade."),
     AppLink("portfolio", "Portfolio Overview", "Guest portfolio workspace for checking multi-wallet balances across EVM chains, Lighter, Hyperliquid, LIT staking, and pool deposits.", _app_url("portfolio", 8790), "http://127.0.0.1:8790/api/config", "Portfolio", "Guest data stays in this browser and is not saved to the VM."),
@@ -42,7 +43,6 @@ APPS: tuple[AppLink, ...] = (
     AppLink("importer", "Futures PnL Importer", "Upload exchange exports and analyze them entirely in your browser.", _app_url("importer", 5180), "http://127.0.0.1:5180/", "Analytics", "Uploaded files remain in your browser and are not sent to the VM."),
     AppLink("hack-alert", "TVL & Protocol Monitor", "TVL-drop monitoring, anomaly detection, incident correlation, and provider health across major lending markets.", _app_url("hack", 8788), "http://127.0.0.1:8788/health/live", "Risk", "Own service and database; its alerts are not copied into Signal Research or the Trade Journal."),
     AppLink("bot", "Full-Fledged Bot", "Replay-first alerts dashboard with event history and notification controls.", _app_url("bot", 18080), "http://127.0.0.1:18080/health", "Trading", "Runs as a separate service with its own health view."),
-    AppLink("enkapital", "eNKapital Website", "The eNKapital public website and strategy pages.", _app_url("enkapital", 8088), "http://127.0.0.1:8088/", "Website", "Static site served from the deployed workspace copy."),
 )
 
 def _cards() -> str:

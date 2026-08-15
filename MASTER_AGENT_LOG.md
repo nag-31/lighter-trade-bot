@@ -179,3 +179,28 @@ Precise handoff log for agents working on Crypto Scientist.
 - Post-deploy health: tracker `8080/healthz`, Command Center `8810/health`,
   Trade Journal `8811/health`, and App Hub `8800/api/status` all returned HTTP
   200. Live dashboard HTML and deployed formatter smoke checks passed.
+
+### 2026-08-16 - professional portfolio, App Hub link, and simplified uPnL deployed
+
+- Deployed the professional Naga Portfolio static site and downloadable
+  nine-slide pitch deck to `https://enkapital.8-231-102-153.sslip.io/`.
+- Replaced the old App Hub website entry with a prominent **Naga Portfolio**
+  card that links to the live site and describes the Crypto Scientist case
+  study and pitch deck.
+- Removed the redundant Long uPnL and Short uPnL summary cards from the Trade
+  Tracker. The single Current uPnL card remains filter-aware; Direction and
+  wallet filters continue to provide long/short and account-specific views.
+- Focused local verification: `tests/test_dashboard_contract.py` and
+  `tests/test_trade_journal.py`, **22 passed**.
+- Final full repository verification: **1014 passed**, with 294 existing aiohttp
+  `NotAppKeyWarning` warnings.
+- Backup-first production evidence:
+  `/home/ADMIN/backups/portfolio-hub-upnl-20260815T200438Z`. The previous static
+  site directory remains available at
+  `/home/ADMIN/apps/eNKapital/eNKapital-main/eNKapital-main.predeploy-20260815T200438Z`.
+- Restarted only `enkapital-site.service`, `apps-hub.service`, and
+  `lighterbot.service`; all are active. No database migration or runtime data
+  replacement was performed.
+- Public HTTPS verification returned HTTP 200 for the portfolio, App Hub,
+  Trade Tracker, and pitch-deck download. Live HTML confirms the Naga Portfolio
+  Hub link, one Current uPnL card, and absence of the Long/Short summary cards.

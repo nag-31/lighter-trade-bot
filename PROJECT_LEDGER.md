@@ -1,6 +1,6 @@
 # Crypto Scientist Project Ledger
 
-Last updated: 2026-07-31 (Asia/Calcutta)
+Last updated: 2026-08-16 (Asia/Calcutta)
 
 ## Purpose
 
@@ -78,6 +78,8 @@ workspace scan or lifecycle rebuild.
 ### Product and access
 
 - Build a useful Crypto Scientist app hub and deploy it to the VM.
+- Link the professional Naga Portfolio and downloadable pitch deck from the
+  main App Hub.
 - Protect private apps with the shared password.
 - Include access to the Private Portfolio Tracker.
 - Keep Trade Tracker accessible as its own app; do not merge it into another app.
@@ -105,6 +107,9 @@ workspace scan or lifecycle rebuild.
 - Back up production data before architectural or accounting changes.
 - Keep baseline data for before/after comparison.
 - Show aggregate live PnL in the address/account-filtered Trade Tracker.
+- Keep one filter-aware Current uPnL dashboard card; do not repeat separate
+  Long and Short uPnL cards when the Direction control already provides those
+  views.
 - Keep lifecycle review and time-bucket accounting separate:
   - the Journal may show the full lifecycle PnL across every partial exit;
   - daily/weekly/monthly PnL must book each realization fill exactly once at
@@ -308,6 +313,28 @@ Post-deployment VM-to-local pull completed at `20260730T094630Z`. Local
 snapshots of production. Provenance and exact hashes are stored in
 `.vm-state/current.json`; the immediately previous local state is stored in
 `.local-backups/vm-sync-20260730T094630Z`.
+
+## 2026-08-16 portfolio and uPnL deployment
+
+- Published the professional Naga Portfolio and downloadable pitch deck at
+  `https://enkapital.8-231-102-153.sslip.io/`.
+- Updated the main App Hub at `https://hub.8-231-102-153.sslip.io/` to expose
+  the portfolio as its first card.
+- Simplified the Trade Tracker summary to one filter-aware Current uPnL card.
+  Direction and wallet controls still select the underlying positions; the
+  redundant Long/Short summary cards were removed.
+- Focused verification passed: **22 tests** across dashboard contracts and Hub/
+  Journal integration.
+- Final full repository verification passed: **1014 tests**, with 294 existing
+  aiohttp `NotAppKeyWarning` warnings.
+- Production backup:
+  `/home/ADMIN/backups/portfolio-hub-upnl-20260815T200438Z`.
+- Static-site rollback directory:
+  `/home/ADMIN/apps/eNKapital/eNKapital-main/eNKapital-main.predeploy-20260815T200438Z`.
+- Restarted `enkapital-site.service`, `apps-hub.service`, and
+  `lighterbot.service`; all are active. No database files or schemas changed.
+- Public HTTPS checks returned 200 for the portfolio, Hub, dashboard, and deck
+  download, and live HTML contract checks confirmed the intended UI state.
 
 ## Git publication workflow
 

@@ -663,8 +663,6 @@ INDEX_HTML = """<!doctype html>
 </div>
 <div class="live-pnl-strip" aria-label="Filtered live portfolio totals">
   <div class="live-pnl-card"><span>Current uPnL</span><b id="live-pnl-total">—</b><small id="live-pnl-note">fresh open positions</small></div>
-  <div class="live-pnl-card"><span>Long uPnL</span><b id="live-pnl-long">—</b><small>selected fresh positions</small></div>
-  <div class="live-pnl-card"><span>Short uPnL</span><b id="live-pnl-short">—</b><small>selected fresh positions</small></div>
   <div class="live-pnl-card"><span>Open notional</span><b id="live-notional-total">—</b><small>current filter</small></div>
   <div class="live-pnl-card"><span>Active positions</span><b id="live-position-count">0</b><small>across tracked markets</small></div>
   <div class="live-pnl-card"><span>Active accounts</span><b id="live-account-count">0</b><small>with open risk</small></div>
@@ -890,14 +888,10 @@ function renderLivePnl(positions) {
   const rows = filtered.filter(p => !p.stale);
   const staleCount = filtered.length - rows.length;
   const pnl = rows.reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
-  const longPnl = rows.filter(p => String(p.side || "").toLowerCase() === "long").reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
-  const shortPnl = rows.filter(p => String(p.side || "").toLowerCase() === "short").reduce((sum, p) => sum + (Number(p.unrealized_pnl) || 0), 0);
   const notional = rows.reduce((sum, p) => sum + (
     Number(p.notional_usd) || (Number(p.size) * Number(p.avg_entry_price)) || 0
   ), 0);
   document.getElementById("live-pnl-total").innerHTML = fmtPnl(pnl);
-  document.getElementById("live-pnl-long").innerHTML = fmtPnl(longPnl);
-  document.getElementById("live-pnl-short").innerHTML = fmtPnl(shortPnl);
   document.getElementById("live-notional-total").textContent = fmtUsd(notional);
   document.getElementById("live-position-count").textContent = String(rows.length);
   document.getElementById("live-account-count").textContent =

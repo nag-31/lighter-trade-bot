@@ -16,6 +16,9 @@ The current release includes:
   Binance sources;
 - live positions, open orders, fills, alerts, health, account filters, sorting,
   and filter-aware aggregate unrealized PnL;
+- a filter-aware dashboard summary that shows one Current uPnL total rather
+  than redundant Long/Short uPnL cards; side analysis remains available through
+  the Direction filter and Telegram command filters;
 - idempotent execution and alert handling designed to suppress reconnect and
   historical-backfill spam;
 - position-level realization recording with partial/full close information;
@@ -27,6 +30,8 @@ The current release includes:
   outcomes, and weekly edge review;
 - standalone TVL & Protocol Monitor integration through the App Hub without
   copying its database into Signal Research or the Journal;
+- a public professional portfolio and downloadable trading-systems pitch deck,
+  linked as **Naga Portfolio** from the App Hub;
 - guest and private portfolio applications;
 - an explicit VM-to-local snapshot workflow with integrity checks and
   provenance;
